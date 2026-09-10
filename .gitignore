@@ -1,0 +1,26 @@
+# Secrets — never commit
+.env
+.env.local
+*.pem
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime / paper-trading artifacts (keep the folder, drop the files)
+data/logs/*
+!data/logs/.gitkeep
+*.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

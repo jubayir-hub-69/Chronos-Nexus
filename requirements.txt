@@ -1,0 +1,22 @@
+# Chronos-Nexus — Bitget AI Base Camp Hackathon S2
+# Track: Agentic Trading  |  Mode: Bitget Paper Trading ONLY  |  Chain: Arbitrum Sepolia (421614)
+# Python 3.10+
+
+# --- Terminal UI ---
+rich>=13.9.4
+
+# --- LLM cortex: Google Gemini (GEMINI_MODEL=auto) ---
+# google-genai is current; google-generativeai is EOL but kept as fallback.
+google-genai>=1.0.0
+google-generativeai>=0.8.5
+python-dotenv>=1.1.0
+
+# --- Web3: Arbitrum Sepolia on-chain Proof of Thought ---
+web3>=7.8.0
+
+# --- Exchange: Bitget Demo / Paper Trading. Never point this at live keys. ---
+ccxt>=4.4.80
+
+# --- Config / contracts between agents ---
+pydantic>=2.10.6
+pydantic-settings>=2.8.0
