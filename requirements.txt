@@ -20,3 +20,7 @@ ccxt>=4.4.80
 # --- Config / contracts between agents ---
 pydantic>=2.10.6
 pydantic-settings>=2.8.0
+
+# --- Live financial wire (RSS) ---
+feedparser>=6.0.11
+requests>=2.32.3

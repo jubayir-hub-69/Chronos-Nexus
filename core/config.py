@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from core.retry import call_with_backoff
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ENV_PATH = PROJECT_ROOT / ".env"
 
@@ -100,8 +102,16 @@ def _list_models_legacy(api_key: str) -> list[str]:
 
 def _list_models_new(api_key: str) -> list[str]:
     from google import genai
+    from google.genai import types
 
-    client = genai.Client(api_key=api_key)
+    try:
+        http_opts = types.HttpOptions(
+            timeout=15_000,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        )
+    except Exception:
+        http_opts = {"timeout": 15_000}
+    client = genai.Client(api_key=api_key, http_options=http_opts)
     names: list[str] = []
     for model in client.models.list():
         actions = list(getattr(model, "supported_actions", []) or [])
@@ -116,7 +126,7 @@ def list_gemini_models(api_key: str) -> list[str]:
     # Current SDK first — google-generativeai is end-of-life and emits FutureWarning.
     for loader in (_list_models_new, _list_models_legacy):
         try:
-            return loader(api_key)
+            return call_with_backoff(lambda fn=loader: fn(api_key), label=f"gemini.{loader.__name__}")
         except ImportError as exc:
             errors.append(str(exc))
         except Exception as exc:
@@ -174,6 +184,9 @@ class Settings(BaseSettings):
 
     paper_notional_usdt: float = Field(default=15.0, ge=1.0, le=100.0)
 
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
     resolved_gemini_model: str = ""
     gemini_discovery_source: str = ""
     gemini_catalog: list[str] = Field(default_factory=list)
@@ -218,6 +231,8 @@ class Settings(BaseSettings):
             "arb_chain": str(self.arbitrum_sepolia_chain_id),
             "arb_rpc": self.arbitrum_sepolia_rpc,
             "arb_key": mask_secret(self.arbitrum_private_key),
+            "telegram": "armed" if (self.telegram_bot_token and self.telegram_chat_id) else "disarmed",
+            "telegram_token": mask_secret(self.telegram_bot_token),
         }
 
 

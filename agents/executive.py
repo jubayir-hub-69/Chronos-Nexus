@@ -6,7 +6,8 @@ import hashlib
 import json
 from typing import Any
 
-from core.llm import GeminiCortex
+from core.llm import API_TIMEOUT_VETO, GeminiCortex
+from core.memory import BoardMemory
 from core.schemas import AnalystBrief, AttestationResult, BoardDecision, RiskReport
 from connectors.arbitrum import ArbitrumSepolia
 from connectors.bitget_paper import BitgetPaperConnector
@@ -16,21 +17,25 @@ CALLSIGN = "CHAIRMAN"
 _SYSTEM = """You are CHAIRMAN, the Executive Agent on Chronos-Nexus.
 You listen to ORACLE (Analyst) and SENTINEL (Risk). You do not override a VETO.
 You produce a single paper-trading decision for Bitget Demo.
+You receive BOARD MEMORY of the last 5 paper cycles. Do not talk the desk into
+repeating an identical failed side+symbol on the same news cluster.
 
 Output JSON only with keys:
   action, consensus, reasoning
 - action: EXECUTE | STAND_DOWN
 - consensus: UNANIMOUS | MAJORITY | VETOED
 Hard rules the Python chair will also enforce:
-- VETO → STAND_DOWN / VETOED
+- VETO → STAND_DOWN / VETOED (including Illiquid Market / High Spread)
+- No live last price → STAND_DOWN / DEGRADED
 - CLEAR or REDUCE → EXECUTE (REDUCE already cut size; it is not a veto)
 - The Demo symbol may be a proxy (e.g. BTC/USDT) when rTokens are not listed on Bitget Demo. That is a venue constraint, not a reason to stand down.
 """
 
 
 class ExecutiveAgent:
-    def __init__(self, cortex: GeminiCortex) -> None:
+    def __init__(self, cortex: GeminiCortex, memory: BoardMemory | None = None) -> None:
         self.cortex = cortex
+        self.memory = memory
         self.callsign = CALLSIGN
 
     def synthesize(
@@ -40,28 +45,50 @@ class ExecutiveAgent:
         tradable_symbol: str,
         last_price: float,
     ) -> BoardDecision:
-        locked = "STAND_DOWN" if risk.verdict == "VETO" else "EXECUTE"
+        no_price = last_price <= 0
+        if risk.verdict == "VETO" or no_price:
+            locked = "STAND_DOWN"
+        else:
+            locked = "EXECUTE"
+        mem = self.memory.prompt_block() if self.memory is not None else "BOARD MEMORY: none."
         user = (
+            f"{mem}\n\n"
             f"ORACLE brief:\n{brief.model_dump()}\n\n"
             f"SENTINEL report:\n{risk.model_dump()}\n\n"
             f"Tradable Demo symbol (proxy if rToken unlisted): {tradable_symbol}\n"
             f"Last price: {last_price}\n"
-            f"Locked action: {locked} (SENTINEL verdict={risk.verdict})\n"
+            f"Locked action: {locked} (SENTINEL verdict={risk.verdict}"
+            f"{'; no live last price' if no_price else ''})\n"
             "Write reasoning for the locked action. Do not change it."
         )
         fallback = {
-            "action": "STAND_DOWN" if risk.verdict == "VETO" else "EXECUTE",
-            "consensus": "VETOED" if risk.verdict == "VETO" else "MAJORITY",
-            "reasoning": "Deterministic chair: respect SENTINEL, keep paper clip inside the cap.",
+            "action": locked,
+            "consensus": "VETOED" if risk.verdict == "VETO" else ("DEGRADED" if no_price else "MAJORITY"),
+            "reasoning": (
+                API_TIMEOUT_VETO
+                if API_TIMEOUT_VETO in (risk.rationale or "")
+                else "Deterministic chair: respect SENTINEL, keep paper clip inside the cap."
+            ),
         }
-        payload, degraded = self.cortex.generate_json(
-            _SYSTEM, user, temperature=0.1, fallback=fallback
-        )
+        if API_TIMEOUT_VETO in f"{brief.rationale} {risk.rationale}":
+            print(f"[API ERROR] CHAIRMAN skipping Gemini — {API_TIMEOUT_VETO}", flush=True)
+            payload, degraded = fallback, True
+        else:
+            try:
+                payload, degraded = self.cortex.generate_json(
+                    _SYSTEM, user, temperature=0.1, fallback=fallback
+                )
+            except Exception as exc:
+                print(f"[API ERROR] {str(exc)}", flush=True)
+                payload, degraded = fallback, True
 
         # SENTINEL owns the veto. REDUCE is clearance at cut size, not a stand-down.
         if risk.verdict == "VETO":
             action = "STAND_DOWN"
             consensus = "VETOED"
+        elif no_price:
+            action = "STAND_DOWN"
+            consensus = "DEGRADED"
         else:
             action = "EXECUTE"
             consensus = "UNANIMOUS" if risk.verdict == "CLEAR" else "MAJORITY"
@@ -70,7 +97,7 @@ class ExecutiveAgent:
         amount = 0.0
         if action == "EXECUTE":
             notional = max(1.0, float(risk.max_notional_usdt) * float(risk.size_multiplier))
-            amount = notional / max(last_price, 1e-9)
+            amount = notional / last_price
 
         decision = BoardDecision(
             action=action,
@@ -129,11 +156,42 @@ class ExecutiveAgent:
                 }
             )
 
-        return {
+        bundle = {
             "decision": decision,
             "attestation": attestation,
             "order": order,
         }
+        self._remember(brief, risk, decision, order)
+        return bundle
+
+    def _remember(
+        self,
+        brief: AnalystBrief,
+        risk: RiskReport,
+        decision: BoardDecision,
+        order: dict[str, Any] | None,
+    ) -> None:
+        if self.memory is None:
+            return
+        ticket = order or {}
+        self.memory.record(
+            news_context=list(brief.wire_headlines or []),
+            decision={
+                "action": decision.action,
+                "consensus": decision.consensus,
+                "symbol": decision.symbol,
+                "side": decision.side,
+                "verdict": risk.verdict,
+                "thesis": brief.thesis,
+                "model": decision.model,
+            },
+            result={
+                "ok": bool(ticket.get("ok")),
+                "status": ticket.get("status"),
+                "order_id": ticket.get("order_id"),
+                "error": ticket.get("error"),
+            },
+        )
 
 
 def hash_decision(brief: AnalystBrief, risk: RiskReport, decision: BoardDecision) -> str:

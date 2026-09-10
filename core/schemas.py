@@ -19,6 +19,9 @@ class WeekendTrigger(BaseModel):
     headline: str
     detail: str
     rtoken_map: list[str] = Field(default_factory=list)
+    source: str = ""
+    link: str = ""
+    published: str = ""
 
 
 class AnalystBrief(BaseModel):
@@ -31,6 +34,7 @@ class AnalystBrief(BaseModel):
     horizon: str = "weekend_to_monday_open"
     rationale: str
     affected_tickers: list[str] = Field(default_factory=list)
+    wire_headlines: list[str] = Field(default_factory=list)
     llm_degraded: bool = False
     model: str = ""
 
@@ -43,6 +47,7 @@ class RiskReport(BaseModel):
     max_notional_usdt: float = 15.0
     size_multiplier: float = 1.0
     rationale: str
+    spread_pct: float | None = None
     llm_degraded: bool = False
     model: str = ""
 

@@ -29,18 +29,29 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from agents.analyst import AnalystAgent
+from agents.analyst import AnalystAgent, snap_to_universe
 from agents.executive import ExecutiveAgent
 from agents.risk_manager import RiskManagerAgent
 from connectors.arbitrum import ArbitrumSepolia
 from connectors.bitget_paper import BitgetPaperConnector
 from core.config import load_settings
 from core.llm import GeminiCortex
-from core.schemas import AnalystBrief, RiskReport
+from core.memory import BoardMemory
+from core.schemas import AnalystBrief, BoardDecision, RiskReport
+from utils.notifier import TelegramNotifier, send_startup_message
 
 LIVE_TRADING_ENABLED = False
-VERSION = "0.2.0-engine"
+VERSION = "0.5.0-universe"
 HACKATHON = "Bitget AI Base Camp Hackathon S2"
+
+# Bitget Demo stock-perp universe — ORACLE must pick ONE of these from the live wire.
+TOKEN_UNIVERSE: list[str] = [
+    "AAPL/USDT:USDT",
+    "NVDA/USDT:USDT",
+    "MSFT/USDT:USDT",
+    "GOOG/USDT:USDT",
+    "TSLA/USDT:USDT",
+]
 
 BANNER = r"""
  ██████╗██╗  ██╗██████╗  ██████╗ ███╗   ██╗ ██████╗ ███████╗
@@ -102,7 +113,117 @@ def clip(text: str, n: int = 420) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
+def listed_demo_symbol(
+    bitget: BitgetPaperConnector | None,
+    chosen: str,
+    universe: list[str],
+) -> str:
+    """Snap ORACLE's pick onto a symbol actually listed on Bitget Demo."""
+    snapped = snap_to_universe(chosen, universe)
+    markets = {}
+    if bitget is not None:
+        markets = getattr(bitget.exchange, "markets", None) or {}
+    aliases = _symbol_aliases(snapped)
+    for cand in aliases:
+        if not markets or cand in markets:
+            if not markets:
+                return snapped
+            return cand
+    for member in universe:
+        for cand in _symbol_aliases(member):
+            if cand in markets and _ticker_root(cand) == _ticker_root(snapped):
+                return cand
+    return snapped
+
+
+def _ticker_root(symbol: str) -> str:
+    base = (symbol or "").split(":")[0].split("/")[0].upper()
+    if base.startswith("R") and len(base) > 2:
+        base = base[1:]
+    return "GOOG" if base == "GOOGL" else base
+
+
+def _symbol_aliases(symbol: str) -> list[str]:
+    root = _ticker_root(symbol)
+    alts = [symbol, root, f"{root}/USDT", f"{root}/USDT:USDT"]
+    if root == "GOOG":
+        alts += ["GOOGL", "GOOGL/USDT", "GOOGL/USDT:USDT"]
+    out: list[str] = []
+    for item in alts:
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _dispatch_alerts(
+    notifier: TelegramNotifier,
+    risk: RiskReport,
+    decision: BoardDecision,
+    order: dict[str, Any],
+    attestation: Any,
+) -> None:
+    """Fire-and-forget Telegram. Never raises into the CIC."""
+    try:
+        status = str(order.get("status") or "")
+        symbol = str(order.get("symbol") or decision.symbol or "")
+        if status == "POSITION_ALREADY_OPEN":
+            notifier.alert_position_open(
+                symbol=symbol,
+                side=str(order.get("side") or decision.side or ""),
+                detail=str(order.get("error") or "Position already open"),
+            )
+            return
+        if risk.verdict == "VETO" or decision.consensus == "VETOED":
+            notifier.alert_veto(
+                reason=risk.rationale,
+                symbol=symbol,
+                flags=list(risk.black_swan_flags or []),
+                model=risk.model or decision.model,
+            )
+            return
+        if bool(order.get("ok")):
+            explorer = getattr(attestation, "explorer_url", None) if attestation is not None else None
+            notifier.alert_execute(
+                symbol=str(order.get("symbol") or decision.symbol),
+                side=str(order.get("side") or decision.side),
+                amount=order.get("amount") if order.get("amount") is not None else decision.amount,
+                sl_price=order.get("sl_price"),
+                tp_price=order.get("tp_price"),
+                order_id=order.get("order_id"),
+                explorer_url=explorer,
+                model=decision.model,
+            )
+    except Exception:
+        return
+
+
 def main() -> int:
+    try:
+        return _main()
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        console.print(
+            Panel(
+                f"[bold red]NEXUS DEGRADED — unhandled fault swallowed[/]\n{exc}",
+                border_style="red",
+                box=box.HEAVY,
+            )
+        )
+        return 1
+
+
+def _main() -> int:
     if LIVE_TRADING_ENABLED:
         console.print("[bold red]REFUSING TO BOOT: live trading flag is on.[/]")
         return 2
@@ -124,26 +245,31 @@ def main() -> int:
                 ("paper_trading", str(settings.bitget_paper_trading)),
                 ("live_trading", str(LIVE_TRADING_ENABLED)),
                 ("gemini_requested", settings.gemini_model),
-                ("gemini_resolved", settings.resolved_gemini_model),
+                ("gemini_resolved", settings.resolved_gemini_model or "(unresolved)"),
                 ("gemini_source", settings.gemini_discovery_source),
                 ("gemini_key", settings.public_status()["gemini_key"]),
                 ("bitget_key", settings.public_status()["bitget_key"]),
                 ("arb_chain", str(settings.arbitrum_sepolia_chain_id)),
+                ("telegram", settings.public_status()["telegram"]),
             ],
             border="red",
         )
     )
     console.print()
 
+    notifier = TelegramNotifier.from_settings(settings)
+    send_startup_message(notifier)
+
     phase("PHASE 1  ·  GEMINI CORTEX")
     cortex = GeminiCortex(settings)
+    memory = BoardMemory()
     catalog_n = len(settings.gemini_catalog)
     console.print(
         kv_panel(
             "CORTEX",
             [
                 ("backend", cortex.backend),
-                ("model", cortex.model_name),
+                ("model", cortex.selected_model),
                 ("catalog", f"{catalog_n} generateContent models" if catalog_n else "fallback chain"),
                 ("source", settings.gemini_discovery_source),
             ],
@@ -221,15 +347,21 @@ def main() -> int:
     table.add_column("SUBSYSTEM", style="bold white", no_wrap=True)
     table.add_column("DETAIL", style="grey70")
     table.add_column("STATUS", justify="center")
-    table.add_row("Analyst Agent", "ORACLE · weekend macro", status_dot(True))
-    table.add_row("Risk Manager", "SENTINEL · veto authority", status_dot(True))
+    table.add_row("Analyst Agent", "ORACLE · live RSS wire", status_dot(True))
+    table.add_row("Risk Manager", "SENTINEL · veto + L2 spread", status_dot(True))
     table.add_row("Executive Agent", "CHAIRMAN · attest + execute", status_dot(True))
-    table.add_row("Gemini Cortex", f"{cortex.backend} · {cortex.model_name}", status_dot(cortex.backend != "offline"))
+    table.add_row("Gemini Cortex", f"{cortex.backend} · {cortex.selected_model}", status_dot(cortex.backend != "offline"))
     table.add_row("Bitget Paper", str(bitget_ping.get("symbol") or bitget_err or "unbound"), status_dot(bitget is not None))
     table.add_row(
         "Arbitrum Sepolia",
         f"chain {arb_ping.get('chain_id', 421614)}",
         status_dot(bool(arb_ping)),
+    )
+    table.add_row("Board Memory", f"{len(memory.recent())} cycles · data/history.json", status_dot(True))
+    table.add_row(
+        "Telegram Alerts",
+        "armed · async HTML" if notifier.enabled else "disarmed · no token/chat",
+        status_dot(notifier.enabled, label_ok="ARMED", label_bad="OFF"),
     )
     table.add_row("Compliance Lock", "live trading hard-disabled", status_dot(not LIVE_TRADING_ENABLED))
     console.print(table)
@@ -238,36 +370,129 @@ def main() -> int:
     if bitget is None or arb is None:
         console.print("[bold yellow]Rails incomplete — board will still debate; execution may skip.[/]\n")
 
-    phase("PHASE 3  ·  WEEKEND MACRO INGEST")
-    analyst = AnalystAgent(cortex)
+    phase("PHASE 3  ·  LIVE MACRO INGEST")
+    analyst = AnalystAgent(cortex, memory=memory)
     sentinel = RiskManagerAgent(cortex)
-    chairman = ExecutiveAgent(cortex)
-    triggers = analyst.ingest_weekend_wire()
+    chairman = ExecutiveAgent(cortex, memory=memory)
+    mem_n = len(memory.recent())
+    console.print(
+        kv_panel(
+            "BOARD MEMORY",
+            [
+                ("path", "data/history.json"),
+                ("cycles", str(mem_n)),
+                ("window", "last 5 trades"),
+            ],
+            border="yellow",
+        )
+    )
+    console.print()
+    try:
+        triggers = analyst.ingest_weekend_wire()
+    except Exception as exc:
+        from core.schemas import WeekendTrigger
+
+        triggers = [
+            WeekendTrigger(
+                id="WIRE-FAIL",
+                category="outage",
+                headline="Live financial RSS unavailable",
+                detail=str(exc)[:240],
+                source="chronos-nexus",
+            )
+        ]
     wire = Table(box=box.SIMPLE_HEAVY, header_style="bold cyan", expand=True)
     wire.add_column("ID", style="bold green", no_wrap=True)
+    wire.add_column("SRC", style="yellow", no_wrap=True)
     wire.add_column("CAT", style="magenta")
     wire.add_column("HEADLINE")
     wire.add_column("rTOKEN MAP", style="cyan")
     for trig in triggers:
-        wire.add_row(trig.id, trig.category, trig.headline, ", ".join(trig.rtoken_map))
+        wire.add_row(
+            trig.id,
+            trig.source or "—",
+            trig.category,
+            trig.headline,
+            ", ".join(trig.rtoken_map) or "—",
+        )
     console.print(wire)
     console.print()
-
-    preferred = (bitget.resolved_symbol if bitget else None) or settings.bitget_symbol
-    console.print("[dim]ORACLE is pricing Monday cash gaps against the 24/7 rToken tape…[/]")
-    brief: AnalystBrief = analyst.brief(triggers, preferred)
-    ticker = (
-        bitget.fetch_ticker(preferred)
-        if bitget
-        else {"ok": False, "mocked": True, "last": 100.0, "symbol": preferred}
+    console.print(
+        kv_panel(
+            "TOKEN UNIVERSE",
+            [("symbols", "  ".join(TOKEN_UNIVERSE))],
+            border="magenta",
+        )
     )
-    last = float(ticker.get("last") or 100.0)
+    console.print()
+
+    console.print("[dim]ORACLE is pricing Monday cash gaps and picking the most relevant rToken…[/]")
+    try:
+        brief: AnalystBrief = analyst.brief(triggers, TOKEN_UNIVERSE)
+    except Exception as exc:
+        brief = AnalystBrief(
+            thesis="ORACLE degraded — live brief failed closed.",
+            rationale=str(exc)[:240],
+            primary_symbol=snap_to_universe("", TOKEN_UNIVERSE, [t.headline for t in triggers]),
+            conviction=10,
+            llm_degraded=True,
+            model=cortex.model_name,
+            wire_headlines=[t.headline for t in triggers],
+        )
+    target = listed_demo_symbol(bitget, brief.primary_symbol, TOKEN_UNIVERSE)
+    brief.primary_symbol = target
+    try:
+        ticker = (
+            bitget.fetch_ticker(target)
+            if bitget
+            else {"ok": False, "mocked": False, "last": None, "symbol": target}
+        )
+        book = bitget.fetch_order_book(target) if bitget else {"ok": False, "symbol": target}
+    except Exception as exc:
+        ticker = {"ok": False, "mocked": False, "last": None, "symbol": target, "error": str(exc)[:160]}
+        book = {"ok": False, "symbol": target, "error": str(exc)[:160]}
+    last = _safe_float(ticker.get("last"))
+    spread = book.get("spread_pct")
+    spread_s = f"{float(spread):.4f}%" if isinstance(spread, (int, float)) else "n/a"
+    console.print(
+        kv_panel(
+            "LIVE BOOK",
+            [
+                ("symbol", target),
+                ("picked", "ORACLE · live RSS"),
+                ("last", "n/a" if last is None else str(last)),
+                ("bid", str(book.get("best_bid") if book.get("best_bid") is not None else ticker.get("bid") or "n/a")),
+                ("ask", str(book.get("best_ask") if book.get("best_ask") is not None else ticker.get("ask") or "n/a")),
+                ("spread", spread_s),
+                ("l2", book.get("source") or ("LIVE" if book.get("ok") else "FAULT")),
+                ("model", brief.model or cortex.model_name),
+            ],
+            border="cyan",
+        )
+    )
+    console.print()
 
     phase("PHASE 4  ·  BOARD DEBATE")
-    console.print("[dim]SENTINEL is stress-testing rumor quality, gap risk, and black-swan flags…[/]")
-    risk: RiskReport = sentinel.evaluate(
-        brief, ticker, settings.paper_notional_usdt, tradable_symbol=preferred
-    )
+    console.print("[dim]SENTINEL is stress-testing rumor quality, L2 spread, and black-swan flags…[/]")
+    try:
+        risk: RiskReport = sentinel.evaluate(
+            brief,
+            ticker,
+            settings.paper_notional_usdt,
+            tradable_symbol=target,
+            order_book=book,
+        )
+    except Exception as exc:
+        risk = RiskReport(
+            verdict="VETO",
+            fake_news_risk="HIGH",
+            black_swan_flags=["sentinel_rail_fault"],
+            rationale=f"SENTINEL degraded closed: {exc}"[:400],
+            llm_degraded=True,
+            model=cortex.model_name,
+        )
+    if risk.spread_pct is not None:
+        spread_s = f"{risk.spread_pct:.4f}%"
 
     oracle_panel = Panel(
         Group(
@@ -287,7 +512,11 @@ def main() -> int:
     sentinel_panel = Panel(
         Group(
             Text(f"VERDICT  {risk.verdict}   FAKE-NEWS  {risk.fake_news_risk}", style=f"bold {risk_color}"),
-            Text(f"CAP  {risk.max_notional_usdt} USDT   MULT  {risk.size_multiplier}   MODEL  {risk.model}", style="dim"),
+            Text(
+                f"CAP  {risk.max_notional_usdt} USDT   MULT  {risk.size_multiplier}   "
+                f"SPREAD  {spread_s}   MODEL  {risk.model}",
+                style="dim",
+            ),
             Text(""),
             Text(clip(risk.rationale), style="white"),
             Text(""),
@@ -302,6 +531,17 @@ def main() -> int:
     console.print()
 
     if bitget is None:
+        if risk.verdict == "VETO":
+            stub = BoardDecision(
+                action="STAND_DOWN",
+                consensus="VETOED",
+                symbol=target,
+                side=brief.side,
+                reasoning=risk.rationale,
+                model=risk.model,
+            )
+            _dispatch_alerts(notifier, risk, stub, {"ok": False, "status": "VETOED"}, None)
+            notifier.drain(timeout=2.0)
         console.print("[bold red]No Bitget Demo rail — cannot attest/execute. Halt after debate.[/]")
         console.print(f"  elapsed {time.perf_counter() - t0:.1f}s")
         return 1
@@ -310,14 +550,24 @@ def main() -> int:
         arb = ArbitrumSepolia(settings)
 
     phase("PHASE 5  ·  CHAIRMAN  ·  ATTEST + PAPER EXECUTE")
-    bundle = chairman.convene(
-        brief=brief,
-        risk=risk,
-        bitget=bitget,
-        arbitrum=arb,
-        tradable_symbol=preferred,
-        last_price=last,
-    )
+    try:
+        bundle = chairman.convene(
+            brief=brief,
+            risk=risk,
+            bitget=bitget,
+            arbitrum=arb,
+            tradable_symbol=target,
+            last_price=last if last is not None else 0.0,
+        )
+    except Exception as exc:
+        console.print(f"[bold yellow]CHAIRMAN rail fault — degrading:[/] {exc}")
+        bundle = {
+            "decision": chairman.synthesize(
+                brief, risk, target, last if last is not None else 0.0
+            ),
+            "attestation": None,
+            "order": {"ok": False, "status": "ERROR", "error": str(exc)[:240]},
+        }
     decision = bundle["decision"]
     attestation = bundle["attestation"]
     order = bundle["order"] or {}
@@ -329,6 +579,7 @@ def main() -> int:
                 Text(f"{decision.action}   consensus={decision.consensus}", style=action_style, justify="center"),
                 Text(f"{decision.side.upper()}  {decision.amount:.6f}  {decision.symbol}  (~{decision.notional_usdt} USDT)", justify="center"),
                 Text(f"sha256  {decision.reasoning_hash}", style="dim", justify="center"),
+                Text(f"model  {decision.model or cortex.model_name}", style="dim", justify="center"),
                 Text(""),
                 Text(clip(decision.reasoning), justify="center"),
             ),
@@ -368,6 +619,11 @@ def main() -> int:
                 ("symbol", str(order.get("symbol") or decision.symbol)),
                 ("side", str(order.get("side") or decision.side)),
                 ("amount", str(order.get("amount") or decision.amount)),
+                ("entry", str(order.get("entry_price") or "—")),
+                ("sl -2%", str(order.get("sl_price") or "—")),
+                ("tp +5%", str(order.get("tp_price") or "—")),
+                ("sl_order", str((order.get("sl_order") or {}).get("id") if isinstance(order.get("sl_order"), dict) else order.get("sl_error") or "—")),
+                ("tp_order", str((order.get("tp_order") or {}).get("id") if isinstance(order.get("tp_order"), dict) else order.get("tp_error") or "—")),
                 ("hash", str(order.get("reasoning_hash") or decision.reasoning_hash)),
                 ("log", str(order.get("log_path") or "data/logs/trades.json")),
                 ("error", str(order.get("error") or "—")),
@@ -376,6 +632,9 @@ def main() -> int:
         )
     )
     console.print()
+
+    _dispatch_alerts(notifier, risk, decision, order, attestation)
+    notifier.drain(timeout=2.5)
 
     elapsed = time.perf_counter() - t0
     console.print(
@@ -389,7 +648,11 @@ def main() -> int:
                         style="cyan",
                         justify="center",
                     ),
-                    Text(f"{elapsed:.1f}s  ·  {HACKATHON}  ·  paper only", style="dim", justify="center"),
+                    Text(
+                        f"{elapsed:.1f}s  ·  {HACKATHON}  ·  paper only  ·  {cortex.model_name}",
+                        style="dim",
+                        justify="center",
+                    ),
                 )
             ),
             border_style="green1",
@@ -411,3 +674,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         console.print("\n  [bold red]■[/] [red]interrupt — Nexus halted.[/]")
         raise SystemExit(130)
+    except Exception as exc:
+        console.print(f"\n  [bold red]■[/] [red]Nexus halted (degraded): {exc}[/]")
+        raise SystemExit(1)

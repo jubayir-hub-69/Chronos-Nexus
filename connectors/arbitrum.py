@@ -11,6 +11,7 @@ from typing import Any
 from web3 import Web3
 
 from core.config import Settings
+from core.retry import call_with_backoff
 from core.schemas import AttestationResult
 
 EXPLORER_TX = "https://sepolia.arbiscan.io/tx/{tx_hash}"
@@ -41,15 +42,25 @@ class ArbitrumSepolia:
             except Exception:
                 pass
 
+    def _rpc(self, fn, *, label: str = "arb"):
+        return call_with_backoff(fn, attempts=3, label=label)
+
     def ping(self) -> dict[str, Any]:
-        if not self.w3.is_connected():
-            raise RuntimeError(f"Cannot reach Arbitrum RPC {self.settings.arbitrum_sepolia_rpc}")
-        chain_id = int(self.w3.eth.chain_id)
+        def _connected() -> bool:
+            if not self.w3.is_connected():
+                raise TimeoutError(f"Cannot reach Arbitrum RPC {self.settings.arbitrum_sepolia_rpc}")
+            return True
+
+        try:
+            self._rpc(_connected, label="arb.ping")
+            chain_id = int(self._rpc(lambda: self.w3.eth.chain_id, label="arb.chain_id"))
+        except Exception as exc:
+            raise RuntimeError(f"Cannot reach Arbitrum RPC {self.settings.arbitrum_sepolia_rpc}: {exc}") from exc
         if chain_id != self.expected_chain_id:
             raise RuntimeError(
                 f"Wrong chain: got {chain_id}, expected Arbitrum Sepolia {self.expected_chain_id}"
             )
-        head = int(self.w3.eth.block_number)
+        head = int(self._rpc(lambda: self.w3.eth.block_number, label="arb.block"))
         return {
             "connected": True,
             "chain_id": chain_id,
@@ -61,7 +72,10 @@ class ArbitrumSepolia:
     def read_balance(self) -> dict[str, Any]:
         if self.account is None:
             return {"ok": False, "error": "ARBITRUM_PRIVATE_KEY missing", "eth": 0.0}
-        wei = self.w3.eth.get_balance(self.account.address)
+        try:
+            wei = self._rpc(lambda: self.w3.eth.get_balance(self.account.address), label="arb.balance")
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:220], "eth": 0.0, "address": self.account.address}
         return {
             "ok": True,
             "address": self.account.address,
@@ -92,7 +106,16 @@ class ArbitrumSepolia:
 
         payload = PROOF_PREFIX + digest.encode("ascii")
         from_addr = self.account.address
-        nonce = self.w3.eth.get_transaction_count(from_addr)
+        try:
+            nonce = self._rpc(lambda: self.w3.eth.get_transaction_count(from_addr), label="arb.nonce")
+        except Exception as exc:
+            return AttestationResult(
+                ok=False,
+                skipped=True,
+                from_address=from_addr,
+                reason=f"rpc_error:{exc}"[:220],
+                chain_id=self.expected_chain_id,
+            )
         tx: dict[str, Any] = {
             "chainId": self.expected_chain_id,
             "from": from_addr,
@@ -103,7 +126,7 @@ class ArbitrumSepolia:
         }
 
         try:
-            latest = self.w3.eth.get_block("latest")
+            latest = self._rpc(lambda: self.w3.eth.get_block("latest"), label="arb.head")
             base_fee = int(latest.get("baseFeePerGas") or self.w3.to_wei(0.1, "gwei"))
         except Exception:
             base_fee = int(self.w3.to_wei(0.1, "gwei"))
@@ -113,12 +136,15 @@ class ArbitrumSepolia:
         tx["maxFeePerGas"] = max_fee
 
         try:
-            gas = int(self.w3.eth.estimate_gas(tx))
+            gas = int(self._rpc(lambda: self.w3.eth.estimate_gas(tx), label="arb.estimate_gas"))
         except Exception:
             gas = 21_000 + 16 * (len(payload) + 4)
         tx["gas"] = int(gas * 1.2) + 1_000
 
-        balance = int(self.w3.eth.get_balance(from_addr))
+        try:
+            balance = int(self._rpc(lambda: self.w3.eth.get_balance(from_addr), label="arb.balance.attest"))
+        except Exception:
+            balance = 0
         needed = int(tx["gas"]) * int(max_fee)
         if balance < needed:
             return AttestationResult(
@@ -132,7 +158,12 @@ class ArbitrumSepolia:
         try:
             signed = self.account.sign_transaction(tx)
             raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
-            tx_hash = self.w3.eth.send_raw_transaction(raw)
+            # Do not blindly retry a send: a timeout may mean the tx already landed.
+            tx_hash = call_with_backoff(
+                lambda: self.w3.eth.send_raw_transaction(raw),
+                attempts=2,
+                label="arb.send_raw",
+            )
             hex_hash = tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
             if not hex_hash.startswith("0x"):
                 hex_hash = "0x" + hex_hash
