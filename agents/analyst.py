@@ -3,23 +3,27 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 from calendar import timegm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from core.llm import API_TIMEOUT_VETO, GeminiCortex
+from core.llm import API_QUOTA_VETO, API_TIMEOUT_VETO, GeminiCortex, is_quota_fault
 from core.memory import BoardMemory
 from core.retry import call_with_backoff
 from core.schemas import AnalystBrief, WeekendTrigger
 
 CALLSIGN = "ORACLE"
+STAND_DOWN_SYMBOL = "NONE"
 
 RSS_FEEDS: tuple[tuple[str, str], ...] = (
     ("Yahoo Finance", "https://finance.yahoo.com/news/rssindex"),
+    ("CNBC", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
+    ("MarketWatch", "https://feeds.marketwatch.com/marketwatch/topstories/"),
     ("CoinTelegraph", "https://cointelegraph.com/rss"),
 )
 
@@ -39,9 +43,49 @@ _NEWS_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("microsoft", "msft", "azure", "copilot", "satya"), "MSFT"),
     (("google", "alphabet", "googl", "youtube", "android", "waymo"), "GOOG"),
     (("nvidia", "nvda", "cuda", "gpu", "blackwell", "hopper", "jensen"), "NVDA"),
+    (("amazon", "amzn", "aws ", "bezos"), "AMZN"),
+    (("meta", "facebook", "instagram", "whatsapp", "llama"), "META"),
+    (("netflix", "nflx"), "NFLX"),
+    (("broadcom", "avgo"), "AVGO"),
+    (("amd ", "advanced micro"), "AMD"),
+    (("intel", "intc"), "INTC"),
     (("openai", "chatgpt"), "MSFT"),
     (("ev ", "electric vehicle", "electric car"), "TSLA"),
     (("artificial intelligence", "generative ai", "large language model"), "NVDA"),
+)
+
+_BAD_NEWS_NEEDLES: tuple[str, ...] = (
+    "scandal",
+    "fraud",
+    "indict",
+    "lawsuit",
+    "class action",
+    "bankrupt",
+    "insolv",
+    "crash",
+    "plunge",
+    "tumble",
+    "selloff",
+    "sell-off",
+    "earnings miss",
+    "misses estimates",
+    "missed estimates",
+    "guidance cut",
+    "profit warning",
+    "downgrade",
+    "recall",
+    "sec charge",
+    "sec probe",
+    "investigation",
+    "lay off",
+    "layoff",
+    "job cut",
+    "default",
+    "trading halt",
+    "delist",
+    "restatement",
+    "whistleblower",
+    "accounting probe",
 )
 
 _RTOKEN_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
@@ -59,32 +103,42 @@ _RTOKEN_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
 )
 
 _SYSTEM = """You are ORACLE, the Analyst Agent on Chronos-Nexus.
-You sit a 24/7 rToken desk. Cash US equities are closed (weekend / overnight).
-Tokenized US stocks (Bitget rTokens / stock perps) keep trading. Your job is to
-translate LIVE financial headlines into a Monday cash-session gap thesis and a
-SINGLE paper trade on Bitget Demo.
+You sit a 24/7 global equity / rToken desk. Cash sessions open and close;
+tokenized stocks and stock perps on Bitget Demo keep trading. You scan LIVE
+financial headlines for ANY equity or sector worldwide and either pick ONE
+paper trade or you STAND DOWN.
+
+A SESSION CLOCK is injected every cycle (UTC timestamp, weekday, US cash
+session). Use it. Friday close is not Monday open. Weekend news is gap risk.
+Overnight is not the cash auction.
 
 Rules:
-- Reason about gap risk, not long-term fundamentals.
-- Headlines are LIVE RSS items (Yahoo Finance / CoinTelegraph). Never invent facts
-  that are not in the wire. Never reuse a canned weekend scenario.
+- Reason about gap / session risk, not long-term fundamentals.
+- Headlines are LIVE RSS. Never invent facts that are not in the wire.
 - You receive BOARD MEMORY of the last 5 paper cycles. Do not blindly repeat a
-  side+symbol that just failed or was vetoed for the same news cluster unless the
-  live wire has materially changed.
-- You are given a UNIVERSE of tradable Demo symbols. primary_symbol MUST be
-  copied EXACTLY from that list. Never invent rNVDA/USDT or any name outside it.
-- Pick the SINGLE most relevant name for THIS tape:
-  · iPhone / Apple hardware / App Store / Tim Cook → the AAPL listing
-  · AI chips / GPUs / CUDA / general AI beta / NVIDIA → the NVDA listing
-  · Azure / Office / OpenAI partnership / Satya → the MSFT listing
-  · Search / YouTube / Android / Alphabet / Google → the GOOG listing
-  · EVs / autonomy / Tesla / Musk automotive → the TSLA listing
-- If several names hit, pick the highest-beta expression of the dominant headline.
+  side+symbol that just failed or was vetoed for the same news cluster unless
+  the live wire has materially changed.
+- You are given a LIVE UNIVERSE discovered from Bitget Demo load_markets()
+  (equity / stock perps / rTokens — not a hardcoded five names).
+  primary_symbol MUST be copied EXACTLY from that list, OR you MUST emit
+  primary_symbol="NONE" with side="none" and conviction=0.
+- NEVER default to NVDA. NEVER assume BUY. If the tape is mixed, stale, or
+  names a stock that is not listed, STAND DOWN with NONE / none / 0.
+- Scan ANY equity or sector on the wire (tech, energy, banks, China ADRs,
+  Europe, semis, retail, bio). Map the dominant name onto the live universe.
+- If several listed names hit, pick the single highest-conviction expression
+  of THIS tape and explain in selection_reason why it beat the others.
+- Flag stay_away names when the wire is toxic (scandal, earnings miss, crash,
+  fraud, guidance cut, lawsuit). Those names are not the trade.
 - Output JSON only with keys:
-  thesis, monday_gap_bias, primary_symbol, side, conviction, horizon, rationale, affected_tickers
+  thesis, monday_gap_bias, primary_symbol, side, conviction, horizon,
+  rationale, affected_tickers, news_good, news_bad, stay_away, selection_reason
 - monday_gap_bias: GAP_UP | GAP_DOWN | MIXED | FADE
-- side: buy | sell
+- side: buy | sell | none
 - conviction: integer 0-100
+- stay_away: array of short strings ("NFLX — earnings miss / guidance cut")
+- news_good / news_bad: concise market-context summaries (what is working /
+  what is hurting on THIS wire)
 """
 
 
@@ -95,8 +149,8 @@ class AnalystAgent:
         self.callsign = CALLSIGN
 
     def ingest_weekend_wire(self) -> list[WeekendTrigger]:
-        """Fetch the top 3 live financial RSS headlines. Never returns canned macro."""
-        return fetch_live_wire(limit=3)
+        """Fetch the newest live financial RSS headlines. Never returns canned macro."""
+        return fetch_live_wire(limit=8)
 
     def brief(
         self,
@@ -105,69 +159,103 @@ class AnalystAgent:
         preferred_symbol: str | None = None,
     ) -> AnalystBrief:
         symbols = _normalize_universe(universe, preferred_symbol)
-        news_pick = pick_symbol_from_news(triggers, symbols)
-        default_symbol = news_pick or (preferred_symbol if preferred_symbol in symbols else symbols[0])
+        clock = session_clock()
         wire = [t.model_dump() for t in triggers]
         headlines = [t.headline for t in triggers if t.headline]
         mem = self.memory.prompt_block() if self.memory is not None else "BOARD MEMORY: none."
-        listed = "\n".join(f"  - {s}" for s in symbols)
+        listed = _universe_prompt_block(symbols)
+        heuristic_avoid = detect_stay_away(triggers, symbols)
         user = (
             f"{mem}\n\n"
+            f"SESSION CLOCK (authoritative — do not guess the day or session):\n{clock['prompt']}\n\n"
             "Live financial RSS wire (newest first). These are real headlines, not desk fiction:\n"
-            f"{wire}\n\n"
-            "UNIVERSE of Bitget Demo symbols. primary_symbol MUST be one of these exact strings:\n"
+            f"{_wire_for_prompt(wire)}\n\n"
+            "LIVE UNIVERSE from Bitget Demo load_markets() (equity / stock perps / rTokens).\n"
+            "primary_symbol MUST be one of these exact strings, or NONE:\n"
             f"{listed}\n\n"
-            "Select the single most relevant symbol for this tape "
-            "(iPhone→AAPL, AI/GPU→NVDA, Azure/OpenAI→MSFT, Google/Alphabet→GOOG, EV/Tesla→TSLA).\n"
+            "If the wire names no listed equity, or the tape is not actionable, emit "
+            'primary_symbol="NONE", side="none", conviction=0. NEVER default to NVDA. NEVER assume BUY.\n'
+            "Summarize news_good / news_bad. Fill stay_away for toxic names. "
+            "selection_reason must explain why this name beat the other listed candidates.\n"
             "Produce the JSON brief now. Do not invent catalysts absent from the wire."
         )
+        # Static stand-down object only. Never splice raw RSS into thesis/rationale —
+        # unescaped quotes in headlines previously exploded fallback JSON parsing.
         fallback = {
             "thesis": API_TIMEOUT_VETO,
             "monday_gap_bias": "MIXED",
-            "primary_symbol": default_symbol,
-            "side": "buy",
+            "primary_symbol": STAND_DOWN_SYMBOL,
+            "side": "none",
             "conviction": 0,
             "horizon": "weekend_to_monday_open",
             "rationale": API_TIMEOUT_VETO,
             "affected_tickers": [],
+            "news_good": "",
+            "news_bad": "Gemini unavailable — no tape color without a live model.",
+            "stay_away": [],
+            "selection_reason": "STAND_DOWN: API timeout / no actionable news. No blind fallback.",
         }
         try:
             payload, degraded = self.cortex.generate_json(
                 _SYSTEM, user, temperature=0.35, fallback=fallback
             )
         except Exception as exc:
-            print(f"[API ERROR] {str(exc)}", flush=True)
-            payload, degraded = fallback, True
+            print(f"[API ERROR] {_safe_text(exc)}", flush=True)
+            payload, degraded = dict(fallback), True
         if degraded:
             err = self.cortex.last_error or "unknown Gemini fault"
-            print(f"[API ERROR] ORACLE degraded: {err}", flush=True)
-            payload = {
-                **fallback,
-                **{k: payload.get(k, fallback[k]) for k in fallback},
-                "thesis": str(payload.get("thesis") or API_TIMEOUT_VETO),
-                "rationale": str(payload.get("rationale") or API_TIMEOUT_VETO),
-                "conviction": _clamp_int(payload.get("conviction"), 0),
-            }
+            print(f"[API ERROR] ORACLE degraded: {_safe_text(err)}", flush=True)
+            quota = is_quota_fault(err)
+            reason = API_QUOTA_VETO if quota else API_TIMEOUT_VETO
+            payload = dict(fallback)
+            payload["thesis"] = reason
+            payload["rationale"] = reason
+            payload["primary_symbol"] = STAND_DOWN_SYMBOL
+            payload["side"] = "none"
+            payload["conviction"] = 0
+            payload["stay_away"] = []
+            payload["news_good"] = ""
+            payload["news_bad"] = reason if quota else "Gemini unavailable — no tape color without a live model."
+            payload["selection_reason"] = (
+                API_QUOTA_VETO
+                if quota
+                else fallback["selection_reason"]
+            )
+        picked = snap_to_universe(
+            _safe_text(payload.get("primary_symbol") or STAND_DOWN_SYMBOL),
+            symbols,
+        )
+        if degraded:
+            picked = STAND_DOWN_SYMBOL
+        stay = _str_list(payload.get("stay_away")) if not degraded else []
+        for item in heuristic_avoid:
+            if item not in stay:
+                stay.append(item)
+        side = "none" if degraded else _side(payload.get("side"))
+        conviction = _clamp_int(payload.get("conviction"), 0)
+        if picked == STAND_DOWN_SYMBOL:
+            side = "none"
+            conviction = 0
         return AnalystBrief(
-            thesis=str(payload.get("thesis") or fallback["thesis"]),
+            thesis=_safe_text(payload.get("thesis"), fallback["thesis"]),
             monday_gap_bias=_gap(payload.get("monday_gap_bias")),
-            primary_symbol=snap_to_universe(
-                str(payload.get("primary_symbol") or default_symbol),
-                symbols,
-                headlines,
-            ),
-            side=_side(payload.get("side")),
-            conviction=_clamp_int(payload.get("conviction"), 0 if degraded else 28),
-            horizon=str(payload.get("horizon") or "weekend_to_monday_open"),
-            rationale=str(payload.get("rationale") or fallback["rationale"]),
+            primary_symbol=picked,
+            side=side,
+            conviction=conviction,
+            horizon=_safe_text(payload.get("horizon"), "weekend_to_monday_open"),
+            rationale=_safe_text(payload.get("rationale"), fallback["rationale"]),
             affected_tickers=_str_list(payload.get("affected_tickers")),
             wire_headlines=headlines,
+            news_good=_safe_text(payload.get("news_good")),
+            news_bad=_safe_text(payload.get("news_bad")),
+            stay_away=stay[:12],
+            selection_reason=_safe_text(payload.get("selection_reason")),
             llm_degraded=degraded,
             model=self.cortex.model_name,
         )
 
 
-def fetch_live_wire(limit: int = 3) -> list[WeekendTrigger]:
+def fetch_live_wire(limit: int = 8) -> list[WeekendTrigger]:
     items: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=len(RSS_FEEDS) or 1) as pool:
         futs = [pool.submit(_fetch_feed, name, url) for name, url in RSS_FEEDS]
@@ -379,18 +467,150 @@ def _normalize_universe(
         raw = [str(s).strip() for s in (universe or []) if str(s).strip()]
     if preferred and preferred not in raw:
         raw.append(preferred)
-    return raw or ["NVDA/USDT:USDT"]
+    return raw
+
+
+def is_none_symbol(symbol: str | None) -> bool:
+    raw = (symbol or "").strip().upper()
+    return raw in {"", "NONE", "NULL", "N/A", "NA", "-", "FLAT"}
+
+
+def is_idle_brief(brief: AnalystBrief) -> bool:
+    """True when ORACLE refused a trade: NONE / none / 0 / Gemini timeout."""
+    if brief.llm_degraded:
+        return True
+    if (brief.side or "none").lower() == "none":
+        return True
+    if int(brief.conviction or 0) <= 0:
+        return True
+    return is_none_symbol(brief.primary_symbol)
+
+
+def session_clock(now: datetime | None = None) -> dict[str, str]:
+    """Exact UTC timestamp, weekday, and US cash session for ORACLE's prompt."""
+    utc = now or datetime.now(timezone.utc)
+    if utc.tzinfo is None:
+        utc = utc.replace(tzinfo=timezone.utc)
+    else:
+        utc = utc.astimezone(timezone.utc)
+    et = _eastern(utc)
+    weekday = utc.strftime("%A")
+    session = _us_cash_session(et)
+    stamp = utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    et_stamp = et.strftime("%Y-%m-%d %H:%M %Z") if et.tzinfo else et.strftime("%Y-%m-%d %H:%M ET")
+    prompt = (
+        f"  utc: {stamp}\n"
+        f"  weekday: {weekday}\n"
+        f"  us_eastern: {et_stamp}\n"
+        f"  us_cash_session: {session}\n"
+        "  rTokens / stock perps: trade 24/7 on Bitget Demo regardless of cash hours."
+    )
+    return {
+        "utc": stamp,
+        "weekday": weekday,
+        "session": session,
+        "eastern": et_stamp,
+        "prompt": prompt,
+        "line": f"{stamp} · {weekday} · {session}",
+    }
+
+
+def detect_stay_away(
+    triggers: list[WeekendTrigger] | list[Any],
+    universe: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
+    """Heuristic toxic-tape flags so stay-away alerts still fire if Gemini is dark."""
+    symbols = [str(s).strip() for s in (universe or []) if str(s).strip()]
+    flags: list[str] = []
+    seen: set[str] = set()
+    for item in triggers:
+        if isinstance(item, WeekendTrigger):
+            headline = item.headline
+            blob = f"{item.headline} {item.detail}".lower()
+        else:
+            headline = str(item or "")
+            blob = headline.lower()
+        if not blob.strip():
+            continue
+        hits = [n for n in _BAD_NEWS_NEEDLES if n in blob]
+        if not hits:
+            continue
+        mapped = pick_symbol_from_news([item], symbols) if symbols else None
+        name = _base_ticker(mapped) if mapped else "TAPE"
+        key = f"{name}|{hits[0]}"
+        if key in seen:
+            continue
+        seen.add(key)
+        flags.append(f"{name} — {hits[0]}")
+    return flags[:8]
+
+
+def _universe_prompt_block(symbols: list[str]) -> str:
+    if not symbols:
+        return "  (empty — no Demo equity/rToken listings; you MUST emit NONE)"
+    if len(symbols) <= 280:
+        return "\n".join(f"  - {s}" for s in symbols)
+    bases = sorted({_base_ticker(s) for s in symbols if _base_ticker(s)})
+    head = "\n".join(f"  - {s}" for s in symbols[:80])
+    return (
+        f"  {len(symbols)} listed Demo names. Ticker roots: {', '.join(bases)}\n"
+        "  Exact-symbol sample (copy one of these, or NONE):\n"
+        f"{head}\n"
+        "  … (catalog truncated; Python will snap a ticker root onto the live book)"
+    )
+
+
+def _eastern(utc: datetime) -> datetime:
+    try:
+        from zoneinfo import ZoneInfo
+
+        return utc.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        pass
+    dst = _us_eastern_dst(utc)
+    offset = timedelta(hours=4 if dst else 5)
+    tz = timezone(timedelta(hours=-4 if dst else -5), name="EDT" if dst else "EST")
+    naive = utc.astimezone(timezone.utc).replace(tzinfo=None) - offset
+    return naive.replace(tzinfo=tz)
+
+
+def _us_eastern_dst(utc: datetime) -> bool:
+    """US DST: 2nd Sunday March 07:00 UTC → 1st Sunday November 06:00 UTC."""
+    year = utc.year
+    start = _nth_weekday(year, 3, 6, 2).replace(hour=7)
+    end = _nth_weekday(year, 11, 6, 1).replace(hour=6)
+    return start <= utc.astimezone(timezone.utc) < end
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> datetime:
+    first = datetime(year, month, 1, tzinfo=timezone.utc)
+    delta = (weekday - first.weekday()) % 7
+    day = 1 + delta + (n - 1) * 7
+    return datetime(year, month, day, tzinfo=timezone.utc)
+
+
+def _us_cash_session(et: datetime) -> str:
+    if et.weekday() >= 5:
+        return "WEEKEND — US cash CLOSED; rTokens trade 24/7"
+    minutes = et.hour * 60 + et.minute
+    if minutes < 4 * 60:
+        return "OVERNIGHT — US cash CLOSED"
+    if minutes < 9 * 60 + 30:
+        return "PRE-MARKET — US cash not yet open"
+    if minutes < 16 * 60:
+        return "US CASH OPEN (regular session 09:30–16:00 ET)"
+    if minutes < 20 * 60:
+        return "AFTER-HOURS — US cash closed, extended tape"
+    return "OVERNIGHT — US cash CLOSED"
 
 
 def _base_ticker(symbol: str) -> str:
     raw = (symbol or "").strip()
-    if not raw:
+    if not raw or is_none_symbol(raw):
         return ""
     base = raw.split(":")[0].split("/")[0].upper()
     if base.startswith("R") and len(base) > 2 and base[1:].isalpha():
-        rest = base[1:]
-        if rest in {"NVDA", "AAPL", "TSLA", "MSFT", "GOOG", "GOOGL", "META", "AMZN", "AVGO", "TSM"}:
-            base = rest
+        base = base[1:]
     if base == "GOOGL":
         return "GOOG"
     return base
@@ -401,21 +621,19 @@ def snap_to_universe(
     universe: list[str] | tuple[str, ...],
     headlines: list[str] | None = None,
 ) -> str:
-    """Clamp an LLM / alias symbol onto the Demo universe. Never returns off-list."""
+    """Clamp an LLM / alias symbol onto the Demo universe. Idle tape → NONE, never NVDA."""
+    del headlines  # news-keyword fallback removed — no blind AAPL/NVDA default
     symbols = [str(s).strip() for s in universe if str(s).strip()]
-    if not symbols:
-        return raw or "NVDA/USDT:USDT"
     wanted = (raw or "").strip()
+    if is_none_symbol(wanted):
+        return STAND_DOWN_SYMBOL
     if wanted in symbols:
         return wanted
-    by_base = {_base_ticker(s): s for s in symbols}
+    by_base = {_base_ticker(s): s for s in symbols if _base_ticker(s)}
     base = _base_ticker(wanted)
     if base and base in by_base:
         return by_base[base]
-    news_pick = pick_symbol_from_news(headlines or [], symbols)
-    if news_pick:
-        return news_pick
-    return symbols[0]
+    return STAND_DOWN_SYMBOL
 
 
 def pick_symbol_from_news(
@@ -494,8 +712,8 @@ def _gap(value: Any) -> str:
 
 
 def _side(value: Any) -> str:
-    raw = str(value or "buy").lower()
-    return raw if raw in {"buy", "sell"} else "buy"
+    raw = str(value or "none").lower().strip()
+    return raw if raw in {"buy", "sell", "none"} else "none"
 
 
 def _clamp_int(value: Any, default: int) -> int:
@@ -505,7 +723,36 @@ def _clamp_int(value: Any, default: int) -> int:
         return default
 
 
+def _wire_for_prompt(wire: list[dict[str, Any]]) -> str:
+    """JSON-safe wire dump so quotes in headlines cannot break a later parse."""
+    try:
+        return json.dumps(wire, ensure_ascii=False, default=str)
+    except Exception:
+        return "[]"
+
+
+def _safe_text(value: Any, default: str = "") -> str:
+    if value is None:
+        text = default
+    else:
+        text = str(value)
+    return " ".join(text.replace("\x00", "").split())
+
+
 def _str_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
-    return [str(item) for item in value][:8]
+    out: list[str] = []
+    for item in value[:12]:
+        if isinstance(item, dict):
+            ticker = str(item.get("ticker") or item.get("symbol") or "").strip()
+            reason = str(item.get("reason") or item.get("rationale") or "").strip()
+            if ticker and reason:
+                out.append(f"{ticker} — {reason}")
+            elif ticker or reason:
+                out.append(ticker or reason)
+            continue
+        text = str(item).strip()
+        if text:
+            out.append(text)
+    return out[:8]

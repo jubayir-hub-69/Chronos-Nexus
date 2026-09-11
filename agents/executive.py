@@ -6,7 +6,8 @@ import hashlib
 import json
 from typing import Any
 
-from core.llm import API_TIMEOUT_VETO, GeminiCortex
+from agents.analyst import is_idle_brief
+from core.llm import API_QUOTA_VETO, API_TIMEOUT_VETO, GeminiCortex
 from core.memory import BoardMemory
 from core.schemas import AnalystBrief, AttestationResult, BoardDecision, RiskReport
 from connectors.arbitrum import ArbitrumSepolia
@@ -26,8 +27,10 @@ Output JSON only with keys:
 - consensus: UNANIMOUS | MAJORITY | VETOED
 Hard rules the Python chair will also enforce:
 - VETO → STAND_DOWN / VETOED (including Illiquid Market / High Spread)
+- ORACLE idle (primary_symbol=NONE, side=none, conviction=0, or Gemini timeout) → STAND_DOWN
 - No live last price → STAND_DOWN / DEGRADED
 - CLEAR or REDUCE → EXECUTE (REDUCE already cut size; it is not a veto)
+- NEVER invent NVDA or a BUY when ORACLE stood down.
 - The Demo symbol may be a proxy (e.g. BTC/USDT) when rTokens are not listed on Bitget Demo. That is a venue constraint, not a reason to stand down.
 """
 
@@ -45,8 +48,9 @@ class ExecutiveAgent:
         tradable_symbol: str,
         last_price: float,
     ) -> BoardDecision:
-        no_price = last_price <= 0
-        if risk.verdict == "VETO" or no_price:
+        idle = is_idle_brief(brief)
+        no_price = (not idle) and last_price <= 0
+        if idle or risk.verdict == "VETO" or no_price:
             locked = "STAND_DOWN"
         else:
             locked = "EXECUTE"
@@ -58,19 +62,29 @@ class ExecutiveAgent:
             f"Tradable Demo symbol (proxy if rToken unlisted): {tradable_symbol}\n"
             f"Last price: {last_price}\n"
             f"Locked action: {locked} (SENTINEL verdict={risk.verdict}"
+            f"{'; ORACLE idle STAND_DOWN' if idle else ''}"
             f"{'; no live last price' if no_price else ''})\n"
             "Write reasoning for the locked action. Do not change it."
         )
         fallback = {
             "action": locked,
-            "consensus": "VETOED" if risk.verdict == "VETO" else ("DEGRADED" if no_price else "MAJORITY"),
+            "consensus": (
+                "DEGRADED" if idle or no_price else ("VETOED" if risk.verdict == "VETO" else "MAJORITY")
+            ),
             "reasoning": (
-                API_TIMEOUT_VETO
-                if API_TIMEOUT_VETO in (risk.rationale or "")
-                else "Deterministic chair: respect SENTINEL, keep paper clip inside the cap."
+                API_QUOTA_VETO
+                if API_QUOTA_VETO in f"{brief.rationale} {risk.rationale}"
+                else (
+                    API_TIMEOUT_VETO
+                    if API_TIMEOUT_VETO in (risk.rationale or "")
+                    else "Deterministic chair: respect SENTINEL, keep paper clip inside the cap."
+                )
             ),
         }
-        if API_TIMEOUT_VETO in f"{brief.rationale} {risk.rationale}":
+        if API_QUOTA_VETO in f"{brief.rationale} {risk.rationale}":
+            print(f"[API ERROR] CHAIRMAN skipping Gemini — {API_QUOTA_VETO}", flush=True)
+            payload, degraded = fallback, True
+        elif API_TIMEOUT_VETO in f"{brief.rationale} {risk.rationale}":
             print(f"[API ERROR] CHAIRMAN skipping Gemini — {API_TIMEOUT_VETO}", flush=True)
             payload, degraded = fallback, True
         else:
@@ -83,7 +97,11 @@ class ExecutiveAgent:
                 payload, degraded = fallback, True
 
         # SENTINEL owns the veto. REDUCE is clearance at cut size, not a stand-down.
-        if risk.verdict == "VETO":
+        # ORACLE idle (NONE / none / timeout) is a clean stand-down, not a risk veto.
+        if idle:
+            action = "STAND_DOWN"
+            consensus = "DEGRADED"
+        elif risk.verdict == "VETO":
             action = "STAND_DOWN"
             consensus = "VETOED"
         elif no_price:

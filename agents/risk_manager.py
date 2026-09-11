@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from core.llm import API_TIMEOUT_VETO, GeminiCortex
+from core.llm import API_QUOTA_VETO, API_TIMEOUT_VETO, GeminiCortex
 from core.schemas import AnalystBrief, RiskReport
 
 CALLSIGN = "SENTINEL"
-SPREAD_VETO_PCT = 0.5
+SPREAD_VETO_PCT = 1.5
 VETO_REASON_SPREAD = "Illiquid Market / High Spread"
 
 _SYSTEM = """You are SENTINEL, the Risk Manager Agent on Chronos-Nexus.
@@ -23,9 +23,9 @@ Evaluate:
 3. Weekend rToken liquidity vs Monday cash gap (spread, gap-through risk).
 4. Concentration: one-name AI beta vs a basket.
 5. Size: paper notional must stay tiny (default cap 15 USDT, never above 50).
-6. HARD RULE: if the live bid-ask spread is greater than 0.5%, you MUST VETO
+6. HARD RULE: if the live bid-ask spread is greater than 1.5%, you MUST VETO
    with reason exactly "Illiquid Market / High Spread". Python will enforce this
-   even if you return CLEAR.
+   even if you return CLEAR. Missing/unmeasured spread is a fail-safe VETO.
 
 Verdicts:
 - CLEAR: trade may proceed at requested size
@@ -69,15 +69,16 @@ class RiskManagerAgent:
             f"with reason '{VETO_REASON_SPREAD}'.\n"
             "Produce the JSON risk report now."
         )
-        if API_TIMEOUT_VETO in f"{brief.thesis} {brief.rationale}":
-            print(f"[API ERROR] SENTINEL skipping Gemini — {API_TIMEOUT_VETO}", flush=True)
+        if API_TIMEOUT_VETO in f"{brief.thesis} {brief.rationale}" or API_QUOTA_VETO in f"{brief.thesis} {brief.rationale}":
+            skip = API_QUOTA_VETO if API_QUOTA_VETO in f"{brief.thesis} {brief.rationale}" else API_TIMEOUT_VETO
+            print(f"[API ERROR] SENTINEL skipping Gemini — {skip}", flush=True)
             return RiskReport(
                 verdict="VETO",
                 fake_news_risk="HIGH",
-                black_swan_flags=[API_TIMEOUT_VETO],
+                black_swan_flags=[skip],
                 max_notional_usdt=min(paper_cap_usdt, 15.0),
                 size_multiplier=0.0,
-                rationale=API_TIMEOUT_VETO,
+                rationale=skip,
                 spread_pct=spread_pct,
                 llm_degraded=True,
                 model=self.cortex.model_name,
@@ -150,7 +151,9 @@ def _is_illiquid(book: dict[str, Any], ticker: dict[str, Any], spread_pct: float
     ask = _px(book.get("best_ask"), ticker.get("ask"))
     if bid is not None and ask is not None and bid > 0 and ask > 0 and ask <= bid:
         return True
-    return spread_pct is not None and spread_pct > SPREAD_VETO_PCT
+    if spread_pct is None:
+        return True
+    return spread_pct > SPREAD_VETO_PCT
 
 
 def _book_snapshot(

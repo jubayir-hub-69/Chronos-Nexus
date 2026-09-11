@@ -7,7 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 GapBias = Literal["GAP_UP", "GAP_DOWN", "MIXED", "FADE"]
-Side = Literal["buy", "sell"]
+Side = Literal["buy", "sell", "none"]
 RiskVerdict = Literal["CLEAR", "REDUCE", "VETO"]
 BoardAction = Literal["EXECUTE", "STAND_DOWN"]
 Consensus = Literal["UNANIMOUS", "MAJORITY", "VETOED", "DEGRADED"]
@@ -28,13 +28,17 @@ class AnalystBrief(BaseModel):
     callsign: str = "ORACLE"
     thesis: str
     monday_gap_bias: GapBias = "MIXED"
-    primary_symbol: str = "rNVDA/USDT"
-    side: Side = "buy"
-    conviction: int = Field(ge=0, le=100, default=55)
+    primary_symbol: str = "NONE"
+    side: Side = "none"
+    conviction: int = Field(ge=0, le=100, default=0)
     horizon: str = "weekend_to_monday_open"
     rationale: str
     affected_tickers: list[str] = Field(default_factory=list)
     wire_headlines: list[str] = Field(default_factory=list)
+    news_good: str = ""
+    news_bad: str = ""
+    stay_away: list[str] = Field(default_factory=list)
+    selection_reason: str = ""
     llm_degraded: bool = False
     model: str = ""
 
@@ -57,7 +61,7 @@ class BoardDecision(BaseModel):
     action: BoardAction = "STAND_DOWN"
     consensus: Consensus = "VETOED"
     symbol: str
-    side: Side = "buy"
+    side: Side = "none"
     amount: float = 0.0
     notional_usdt: float = 0.0
     reasoning: str

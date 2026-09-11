@@ -13,15 +13,29 @@ from core.retry import call_with_backoff
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.DOTALL)
 
 # Hard cap per HTTP round-trip. Never let generate_content block the CIC.
-GEMINI_TIMEOUT_S = 15
+GEMINI_TIMEOUT_S = 45
 GEMINI_TIMEOUT_MS = GEMINI_TIMEOUT_S * 1000
 API_TIMEOUT_VETO = "VETO: API Timeout"
+API_QUOTA_VETO = (
+    "Gemini Free Tier API quota reached. System safely standing down until limits reset."
+)
 
 T = TypeVar("T")
 
 
 def _api_error(exc: BaseException) -> None:
-    print(f"[API ERROR] {str(exc)}", flush=True)
+    print(f"[API ERROR] {_clean_api_error(exc)}", flush=True)
+
+
+def _clean_api_error(exc: BaseException) -> str:
+    if _looks_quota(exc):
+        return API_QUOTA_VETO
+    if _looks_parse_fault(exc):
+        return "parser fault: unusable Gemini JSON"
+    if _looks_unavailable(exc):
+        return "Gemini 503/unavailable — standing down"
+    msg = " ".join(str(exc).split())
+    return msg[:400] if msg else type(exc).__name__
 
 
 def _looks_timeout(exc: BaseException) -> bool:
@@ -29,6 +43,79 @@ def _looks_timeout(exc: BaseException) -> bool:
         return True
     blob = f"{type(exc).__name__} {exc}".lower()
     return any(tok in blob for tok in ("timeout", "timed out", "deadline", "read timed out"))
+
+
+def _looks_parse_fault(exc: BaseException) -> bool:
+    if isinstance(exc, json.JSONDecodeError):
+        return True
+    blob = f"{type(exc).__name__} {exc}".lower()
+    return any(
+        tok in blob
+        for tok in (
+            "unterminated",
+            "jsondecode",
+            "expecting value",
+            "invalid json",
+            "parser fault",
+            "json was not an object",
+        )
+    )
+
+
+def _looks_unavailable(exc: BaseException) -> bool:
+    blob = _exc_blob(exc)
+    if _looks_quota(exc):
+        return False
+    return any(
+        tok in blob
+        for tok in ("503", "unavailable", "overloaded", "high demand", "capacity")
+    )
+
+
+def _looks_quota(exc: BaseException) -> bool:
+    return is_quota_fault(exc)
+
+
+def is_quota_fault(value: Any) -> bool:
+    """True for Gemini Free Tier 429 / quota / resource-exhausted — not a crash."""
+    if isinstance(value, BaseException):
+        blob = _exc_blob(value)
+    else:
+        blob = str(value or "").lower()
+    return any(
+        tok in blob
+        for tok in (
+            "429",
+            "quota",
+            "rate limit",
+            "rate_limit",
+            "ratelimit",
+            "resource exhausted",
+            "resource_exhausted",
+            "exceeded your current quota",
+            "quota exceeded",
+            "free_tier",
+            "free tier",
+        )
+    )
+
+
+def _exc_blob(exc: BaseException) -> str:
+    parts = [type(exc).__name__, str(exc)]
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, BaseException):
+        parts.append(type(cause).__name__)
+        parts.append(str(cause))
+    return " ".join(parts).lower()
+
+
+def _should_stand_down(exc: BaseException) -> bool:
+    return (
+        _looks_quota(exc)
+        or _looks_timeout(exc)
+        or _looks_parse_fault(exc)
+        or _looks_unavailable(exc)
+    )
 
 
 def _run_with_timeout(fn: Callable[[], T], *, timeout: float, label: str) -> T:
@@ -113,10 +200,23 @@ class GeminiCortex:
         self.last_error = None
         try:
             text = self._complete(system, user, temperature=temperature, json_mode=True)
-            return _parse_json(text), False
         except Exception as exc:
-            self.last_error = str(exc)
-            _api_error(exc)
+            self.last_error = _clean_api_error(exc)
+            if _looks_quota(exc):
+                print(f"[API ERROR] {API_QUOTA_VETO}", flush=True)
+            else:
+                _api_error(exc)
+            if fallback is None:
+                raise
+            return _timeout_fallback(fallback, exc), True
+        try:
+            return _parse_json(text), False
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            self.last_error = "parser fault: unusable Gemini JSON"
+            print(
+                "[API ERROR] parser fault — Gemini JSON unusable (truncated/503). Standing down.",
+                flush=True,
+            )
             if fallback is None:
                 raise
             return _timeout_fallback(fallback, exc), True
@@ -128,6 +228,8 @@ class GeminiCortex:
         except Exception as exc:
             self.last_error = str(exc)
             _api_error(exc)
+            if _looks_quota(exc):
+                return API_QUOTA_VETO
             if _looks_timeout(exc):
                 return API_TIMEOUT_VETO
             raise
@@ -157,10 +259,12 @@ class GeminiCortex:
             except Exception as exc:
                 last_error = exc
                 _api_error(exc)
-                # A hung/timed-out primary will hang every fallback model too — exit.
-                if _looks_timeout(exc):
+                # Timeout and quota will burn every fallback model the same way — exit.
+                if _looks_timeout(exc) or _looks_quota(exc):
                     break
                 continue
+        if last_error is not None and _looks_quota(last_error):
+            raise last_error
         raise TimeoutError(f"{API_TIMEOUT_VETO}: {last_error}") from last_error
 
     def _complete_once(
@@ -198,7 +302,7 @@ class GeminiCortex:
                     user, request_options={"timeout": GEMINI_TIMEOUT_S}
                 )
             except TypeError:
-                # Older stubs omit request_options; the thread cap still enforces 15s.
+                # Older stubs omit request_options; the thread cap still enforces GEMINI_TIMEOUT_S.
                 response = model.generate_content(user)
             return _response_text(response)
 
@@ -245,15 +349,20 @@ class GeminiCortex:
 
 def _timeout_fallback(fallback: dict[str, Any], exc: BaseException) -> dict[str, Any]:
     out = dict(fallback)
-    if not _looks_timeout(exc):
+    if not _should_stand_down(exc):
         return out
-    out["rationale"] = API_TIMEOUT_VETO
+    reason = API_QUOTA_VETO if _looks_quota(exc) else API_TIMEOUT_VETO
+    out["rationale"] = reason
     if "thesis" in out:
-        out["thesis"] = API_TIMEOUT_VETO
+        out["thesis"] = reason
     if "verdict" in out:
         out["verdict"] = "VETO"
     if "conviction" in out:
         out["conviction"] = 0
+    if "primary_symbol" in out:
+        out["primary_symbol"] = "NONE"
+    if "side" in out:
+        out["side"] = "none"
     if "action" in out:
         out["action"] = "STAND_DOWN"
     if "consensus" in out:
@@ -261,8 +370,8 @@ def _timeout_fallback(fallback: dict[str, Any], exc: BaseException) -> dict[str,
     if "fake_news_risk" in out:
         out["fake_news_risk"] = "HIGH"
     flags = out.get("black_swan_flags")
-    if isinstance(flags, list) and API_TIMEOUT_VETO not in flags:
-        out["black_swan_flags"] = [API_TIMEOUT_VETO, *flags][:8]
+    if isinstance(flags, list) and reason not in flags:
+        out["black_swan_flags"] = [reason, *flags][:8]
     return out
 
 
@@ -291,15 +400,24 @@ def _response_text(response: Any) -> str:
 
 
 def _parse_json(text: str) -> dict[str, Any]:
-    cleaned = _FENCE.sub("", text.strip()).strip()
+    cleaned = _FENCE.sub("", (text or "").strip()).strip()
+    if not cleaned:
+        raise ValueError("parser fault: empty Gemini JSON")
     try:
         payload = json.loads(cleaned)
     except json.JSONDecodeError:
         start = cleaned.find("{")
         end = cleaned.rfind("}")
         if start < 0 or end <= start:
-            raise
-        payload = json.loads(cleaned[start : end + 1])
+            raise json.JSONDecodeError("parser fault: unterminated Gemini JSON", cleaned, 0)
+        try:
+            payload = json.loads(cleaned[start : end + 1])
+        except json.JSONDecodeError:
+            raise json.JSONDecodeError(
+                "parser fault: unterminated Gemini JSON",
+                cleaned,
+                0,
+            ) from None
     if not isinstance(payload, dict):
         raise ValueError("Gemini JSON was not an object")
     return payload

@@ -29,12 +29,18 @@ _SYMBOL_CANDIDATES = (
     "rNVDA/USDT",
     "rAAPL/USDT",
     "rTSLA/USDT",
+    "rMSFT/USDT",
+    "rGOOGL/USDT",
     "NVDA/USDT",
     "AAPL/USDT",
     "TSLA/USDT",
+    "MSFT/USDT",
+    "GOOG/USDT",
     "NVDA/USDT:USDT",
     "AAPL/USDT:USDT",
     "TSLA/USDT:USDT",
+    "MSFT/USDT:USDT",
+    "GOOG/USDT:USDT",
     "BTC/USDT",
     "BTC/USDT:USDT",
 )
@@ -51,6 +57,8 @@ class BitgetPaperConnector:
         self.sandbox = True
         self.preferred_symbol = settings.bitget_symbol
         self.resolved_symbol: str | None = None
+        self.universe: list[str] = []
+        self.universe_source: str = "unloaded"
 
         exchange = ccxt.bitget(
             {
@@ -78,6 +86,7 @@ class BitgetPaperConnector:
             markets = self._ccxt(lambda: self.exchange.load_markets(reload=False), label="bitget.load_markets")
         except Exception:
             markets = self._ccxt(lambda: self.exchange.load_markets(reload=True), label="bitget.load_markets.reload")
+        self.universe = self.discover_equity_universe(markets)
         self.resolved_symbol = self._resolve_symbol(markets)
         market = markets.get(self.resolved_symbol) or {}
         if market.get("swap") or market.get("future"):
@@ -88,10 +97,47 @@ class BitgetPaperConnector:
             "sandbox": True,
             "paptrading": "1",
             "markets": len(markets),
+            "universe": len(self.universe),
+            "universe_source": self.universe_source,
             "symbol": self.resolved_symbol,
             "market_type": "swap" if market.get("swap") else "spot",
             "id": self.exchange.id,
         }
+
+    def discover_equity_universe(self, markets: dict[str, Any] | None = None) -> list[str]:
+        """Live CCXT catalog of Demo equity / stock-perp / rToken listings. No hardcoded cap."""
+        book = markets
+        if not book:
+            try:
+                book = self._ccxt(
+                    lambda: self.exchange.load_markets(reload=False),
+                    label="bitget.load_markets.universe",
+                )
+            except Exception:
+                book = self.exchange.markets or {}
+        equity = _select_equity_universe(book or {})
+        if equity:
+            self.universe_source = "equity"
+            self.universe = equity
+            return list(equity)
+        fallback = _usdt_fallback_universe(book or {})
+        self.universe_source = "usdt-fallback" if fallback else "empty"
+        self.universe = fallback
+        return list(fallback)
+
+    def fetch_equity_universe(self, reload: bool = False) -> list[str]:
+        if reload or not (self.exchange.markets or {}):
+            try:
+                markets = self._ccxt(
+                    lambda: self.exchange.load_markets(reload=bool(reload)),
+                    label="bitget.load_markets.universe.reload",
+                )
+            except Exception:
+                markets = self.exchange.markets or {}
+            return self.discover_equity_universe(markets)
+        if self.universe:
+            return list(self.universe)
+        return self.discover_equity_universe(self.exchange.markets or {})
 
     def fetch_demo_balance(self) -> dict[str, Any]:
         assets: dict[str, dict[str, float]] = {}
@@ -259,37 +305,36 @@ class BitgetPaperConnector:
         if side_n not in {"buy", "sell"}:
             raise ValueError("side must be buy or sell")
 
-        if side_n == "buy":
-            try:
-                existing = self.fetch_open_position(symbol)
-            except Exception as exc:
-                existing = {"open": False, "error": str(exc)[:160]}
-            if existing.get("open"):
-                record = {
-                    "id": str(uuid.uuid4()),
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "venue": "bitget-demo",
-                    "sandbox": True,
-                    "live_trading": False,
-                    "symbol": symbol,
-                    "side": side_n,
-                    "amount": 0.0,
-                    "notional_usdt": 0.0,
-                    "reasoning_hash": reasoning_hash,
-                    "ok": False,
-                    "status": "POSITION_ALREADY_OPEN",
-                    "order_id": None,
-                    "raw_order": {},
-                    "error": POSITION_OPEN_MSG,
-                    "position": existing,
-                    "sl_price": None,
-                    "tp_price": None,
-                }
-                if extra:
-                    record["board"] = extra
-                log_path = _append_trade(record)
-                record["log_path"] = str(log_path)
-                return record
+        try:
+            existing = self.fetch_open_position(symbol)
+        except Exception as exc:
+            existing = {"open": False, "error": str(exc)[:160]}
+        if existing.get("open"):
+            record = {
+                "id": str(uuid.uuid4()),
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "venue": "bitget-demo",
+                "sandbox": True,
+                "live_trading": False,
+                "symbol": symbol,
+                "side": side_n,
+                "amount": 0.0,
+                "notional_usdt": 0.0,
+                "reasoning_hash": reasoning_hash,
+                "ok": False,
+                "status": "POSITION_ALREADY_OPEN",
+                "order_id": None,
+                "raw_order": {},
+                "error": POSITION_OPEN_MSG,
+                "position": existing,
+                "sl_price": None,
+                "tp_price": None,
+            }
+            if extra:
+                record["board"] = extra
+            log_path = _append_trade(record)
+            record["log_path"] = str(log_path)
+            return record
 
         ticker = self.fetch_ticker(symbol)
         try:
@@ -593,7 +638,7 @@ class BitgetPaperConnector:
             return float(f"{qty:.6f}")
 
     def _resolve_symbol(self, markets: dict[str, Any]) -> str:
-        wanted = [self.preferred_symbol, *_SYMBOL_CANDIDATES]
+        wanted = [self.preferred_symbol, *self.universe, *_SYMBOL_CANDIDATES]
         seen: set[str] = set()
         for symbol in wanted:
             if not symbol or symbol in seen:
@@ -606,6 +651,92 @@ class BitgetPaperConnector:
             if market.get("spot") and str(symbol).endswith("/USDT"):
                 return str(symbol)
         raise RuntimeError("No tradable Demo market found on Bitget sandbox")
+
+
+_CRYPTO_DENY = {
+    "BTC", "ETH", "XRP", "SOL", "DOGE", "ADA", "AVAX", "DOT", "LINK", "MATIC",
+    "LTC", "BCH", "UNI", "ATOM", "FIL", "APT", "ARB", "OP", "SUI", "TIA",
+    "NEAR", "INJ", "SEI", "PEPE", "WIF", "BONK", "SHIB", "TRX", "TON", "BNB",
+    "USDT", "USDC", "USD", "EUR", "DAI", "BUSD",
+}
+
+
+def _select_equity_universe(markets: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for symbol, market in (markets or {}).items():
+        name = str(symbol or "").strip()
+        if not name or name in seen:
+            continue
+        if not _is_equity_market(name, market if isinstance(market, dict) else {}):
+            continue
+        seen.add(name)
+        out.append(name)
+    out.sort(key=_universe_sort_key)
+    return out
+
+
+def _usdt_fallback_universe(markets: dict[str, Any]) -> list[str]:
+    """When Demo lists no tagged stock/rToken markets, keep a live USDT book rather than a hardcoded five."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for symbol, market in (markets or {}).items():
+        name = str(symbol or "").strip()
+        if not name or name in seen:
+            continue
+        row = market if isinstance(market, dict) else {}
+        quote = str(row.get("quote") or "").upper()
+        if quote not in {"USDT", "USD", "USDC"} and "USDT" not in name.upper():
+            continue
+        if not (row.get("swap") or row.get("future") or row.get("spot") or ":USDT" in name or name.endswith("/USDT")):
+            continue
+        seen.add(name)
+        out.append(name)
+    out.sort(key=_universe_sort_key)
+    return out
+
+
+def _is_equity_market(symbol: str, market: dict[str, Any] | None = None) -> bool:
+    """True for Bitget stock perps, rTokens, and US-equity-like Demo listings."""
+    market = market or {}
+    info = market.get("info") if isinstance(market.get("info"), dict) else {}
+    tags = " ".join(
+        str(info.get(key) or "")
+        for key in (
+            "productType",
+            "category",
+            "symbolType",
+            "symbolName",
+            "groupName",
+            "subType",
+            "businessType",
+            "symbol",
+        )
+    ).upper()
+    if any(tok in tags for tok in ("STOCK", "EQUITY", "RTOKEN", "SUSDT", "SHARE")):
+        return True
+    base = str(market.get("base") or symbol.split(":")[0].split("/")[0] or "").strip()
+    if not base:
+        return False
+    if base[0] in {"r", "R"} and len(base) > 2 and base[1:].replace("-", "").isalpha():
+        return True
+    root = base[1:].upper() if base[0] in {"r", "R"} and len(base) > 2 and base[1:].isalpha() else base.upper()
+    if root in _CRYPTO_DENY:
+        return False
+    quote = str(market.get("quote") or "").upper()
+    usdtish = quote in {"USDT", "USD", "USDC", ""} or "USDT" in symbol.upper()
+    if root.isalpha() and 1 <= len(root) <= 6 and usdtish:
+        if market.get("swap") or market.get("future") or ":USDT" in symbol:
+            return True
+    return False
+
+
+def _universe_sort_key(symbol: str) -> tuple[int, str]:
+    raw = str(symbol)
+    base = raw.split(":")[0].split("/")[0].upper()
+    rtoken = 0 if (base.startswith("R") and len(base) > 2) else 1
+    swap = 0 if ":USDT" in raw else 1
+    return (rtoken, swap, raw)
 
 
 def protective_prices(entry: float) -> tuple[float, float]:
