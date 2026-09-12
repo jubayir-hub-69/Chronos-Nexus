@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Chronos-Nexus — autonomous weekend-arbitrage mesh.
+"""Chronos-Nexus — autonomous Event-Driven Agent.
 
-Bitget AI Base Camp Hackathon S2 · Agentic Trading
-Paper trading only. Demo lifecycle: wire → debate → attest → execute.
+Bitget AI Base Camp Hackathon S2 · Agentic Trading · Event-Driven Agent
+News-driven directional trading on Bitget Demo. Paper only.
+Lifecycle: wire → debate → attest → execute.
 """
 
 from __future__ import annotations
@@ -77,7 +78,10 @@ def render_banner() -> None:
         Align.center(Text(BANNER, style="bold green1")),
         Align.center(Text("WALL STREET SLEEPS.  THE NEXUS DOES NOT.", style="bold cyan")),
         Align.center(
-            Text("Hackathon S2  ·  Agentic Trading  ·  rToken 24/7  ·  PAPER ONLY", style="dim cyan")
+            Text(
+                "Hackathon S2  ·  Agentic Trading  ·  Event-Driven Agent  ·  PAPER ONLY",
+                style="dim cyan",
+            )
         ),
     )
     console.print(Panel(body, border_style="green", box=box.DOUBLE, padding=(0, 1)))
@@ -598,10 +602,22 @@ def _run_trading_cycle(
                 ("ok", str(order_ok)),
                 ("status", str(order.get("status") or "—")),
                 ("order_id", str(order.get("order_id") or "—")),
-                ("symbol", str(order.get("symbol") or decision.symbol)),
-                ("side", str(order.get("side") or decision.side)),
-                ("amount", str(order.get("amount") or decision.amount)),
-                ("entry", str(order.get("entry_price") or "—")),
+                ("instrument", str(order.get("instrument") or order.get("symbol") or decision.symbol)),
+                ("direction", str(order.get("direction") or order.get("side") or decision.side)),
+                ("quantity", str(order.get("quantity") if order.get("quantity") is not None else order.get("amount") or decision.amount)),
+                (
+                    "price",
+                    str(
+                        order.get("price")
+                        if order.get("price") is not None
+                        else (
+                            order.get("entry_price")
+                            if order.get("entry_price") is not None
+                            else 0.0
+                        )
+                    ),
+                ),
+                ("acct Δ", str(order.get("account_balance_change") if order.get("account_balance_change") is not None else "0.0")),
                 ("sl -2%", str(order.get("sl_price") or "—")),
                 ("tp +5%", str(order.get("tp_price") or "—")),
                 ("sl_order", str((order.get("sl_order") or {}).get("id") if isinstance(order.get("sl_order"), dict) else order.get("sl_error") or "—")),

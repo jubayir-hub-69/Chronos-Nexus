@@ -21,6 +21,9 @@ from core.retry import call_with_backoff
 STOP_LOSS_PCT = 0.02
 TAKE_PROFIT_PCT = 0.05
 POSITION_OPEN_MSG = "Position already open"
+# Bitget USDT-M taker + crossed-margin estimate when the Demo wallet delta is unavailable.
+TAKER_FEE_RATE = 0.0006
+SWAP_LEVERAGE = 5.0
 
 TRADE_LOG = PROJECT_ROOT / "data" / "logs" / "trades.json"
 _LOG_LOCK = threading.Lock()
@@ -44,6 +47,122 @@ _SYMBOL_CANDIDATES = (
     "BTC/USDT",
     "BTC/USDT:USDT",
 )
+
+
+def simulate_account_balance_change(
+    *,
+    side: str,
+    notional_usdt: float,
+    filled: bool,
+    is_swap: bool = True,
+) -> float:
+    """USDT wallet delta for GitBook `account_balance_change`.
+
+    Swap opens lock initial margin (notional / leverage) plus taker fee.
+    Spot buy spends notional + fee; spot sell credits notional − fee.
+    Non-fills (veto, stand-down, error) are a zero change.
+    """
+    if not filled:
+        return 0.0
+    try:
+        notional = abs(float(notional_usdt or 0.0))
+    except (TypeError, ValueError):
+        notional = 0.0
+    if notional <= 0:
+        return 0.0
+    fee = notional * TAKER_FEE_RATE
+    if is_swap:
+        margin = notional / SWAP_LEVERAGE
+        return round(-(margin + fee), 8)
+    side_n = (side or "").lower().strip()
+    if side_n == "buy":
+        return round(-(notional + fee), 8)
+    if side_n == "sell":
+        return round(notional - fee, 8)
+    return 0.0
+
+
+def coerce_price(*candidates: Any) -> float:
+    """First positive float among scalars or ticker/order dicts. Never returns None."""
+    for value in candidates:
+        if value is None or value == "":
+            continue
+        if isinstance(value, dict):
+            nested = coerce_price(
+                value.get("last"),
+                value.get("price"),
+                value.get("average"),
+                value.get("entry_price"),
+            )
+            if nested > 0:
+                return nested
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return 0.0
+
+
+def stamp_gitbook_log(record: dict[str, Any]) -> dict[str, Any]:
+    """Guarantee GitBook paper-log columns on every row. Never leave price/Δ as null."""
+    ts = record.get("timestamp") or record.get("ts") or datetime.now(timezone.utc).isoformat()
+    instrument = str(record.get("instrument") or record.get("symbol") or "")
+    direction = str(record.get("direction") or record.get("side") or "none")
+    try:
+        if record.get("quantity") is not None:
+            quantity = float(record["quantity"])
+        else:
+            quantity = float(record.get("amount") or 0.0)
+    except (TypeError, ValueError):
+        quantity = 0.0
+    raw_order = record.get("raw_order") if isinstance(record.get("raw_order"), dict) else {}
+    price = coerce_price(
+        record.get("price"),
+        record.get("entry_price"),
+        record.get("ticker"),
+        raw_order.get("price") if raw_order else None,
+        raw_order.get("average") if raw_order else None,
+    )
+    try:
+        notional = float(record.get("notional_usdt") or 0.0)
+    except (TypeError, ValueError):
+        notional = 0.0
+    if notional <= 0 and price > 0 and quantity > 0:
+        notional = round(price * quantity, 6)
+        record["notional_usdt"] = notional
+    filled = bool(record.get("ok"))
+    change = record.get("account_balance_change")
+    if change is None or change == "":
+        symbol = str(record.get("symbol") or instrument)
+        change_f = simulate_account_balance_change(
+            side=direction,
+            notional_usdt=notional,
+            filled=filled,
+            is_swap=":USDT" in symbol or bool(record.get("is_swap")),
+        )
+    else:
+        try:
+            change_f = float(change)
+        except (TypeError, ValueError):
+            change_f = 0.0
+
+    record["timestamp"] = ts
+    record["ts"] = record.get("ts") or ts
+    record["instrument"] = instrument
+    record["symbol"] = record.get("symbol") or instrument
+    record["direction"] = direction
+    record["side"] = record.get("side") or direction
+    record["quantity"] = quantity
+    if record.get("amount") is None:
+        record["amount"] = quantity
+    record["price"] = price
+    entry = coerce_price(record.get("entry_price"), price)
+    record["entry_price"] = entry if entry > 0 else price
+    record["account_balance_change"] = change_f
+    return record
 
 
 class BitgetPaperConnector:
@@ -174,6 +293,60 @@ class BitgetPaperConnector:
             "assets": assets,
             "error": " | ".join(errors)[:240] if errors and not assets else None,
         }
+
+    def _snapshot_usdt(self) -> float | None:
+        """Live Demo USDT total. None if the wallet call fails — caller simulates Δ."""
+        try:
+            payload = self.fetch_demo_balance()
+            usdt = (payload.get("assets") or {}).get("USDT") or {}
+            for key in ("total", "free"):
+                try:
+                    value = float(usdt.get(key))
+                except (TypeError, ValueError):
+                    continue
+                if value >= 0:
+                    return value
+        except Exception:
+            return None
+        return None
+
+    def _apply_balance_change(
+        self,
+        record: dict[str, Any],
+        *,
+        balance_before: float | None,
+        filled: bool,
+    ) -> None:
+        """Set account_balance_change from wallet delta, else margin+fee simulation."""
+        record["account_balance_before"] = balance_before
+        if filled:
+            after = self._snapshot_usdt()
+            record["account_balance_after"] = after
+            if balance_before is not None and after is not None:
+                record["account_balance_change"] = round(after - balance_before, 8)
+                record["account_balance_change_source"] = "demo_wallet"
+                return
+        else:
+            record["account_balance_after"] = balance_before
+        try:
+            notional = float(record.get("notional_usdt") or 0.0)
+        except (TypeError, ValueError):
+            notional = 0.0
+        symbol = str(record.get("symbol") or "")
+        try:
+            is_swap = self._is_swap(symbol) if symbol else True
+        except Exception:
+            is_swap = ":USDT" in symbol
+        change = simulate_account_balance_change(
+            side=str(record.get("side") or ""),
+            notional_usdt=notional,
+            filled=filled,
+            is_swap=is_swap,
+        )
+        record["account_balance_change"] = change
+        record["account_balance_change_source"] = "simulated_margin_fee" if filled else "none"
+        if filled and balance_before is not None and record.get("account_balance_after") is None:
+            record["account_balance_after"] = round(balance_before + change, 8)
 
     def fetch_ticker(self, symbol: str | None = None) -> dict[str, Any]:
         target = symbol or self.resolved_symbol or self.preferred_symbol
@@ -310,6 +483,13 @@ class BitgetPaperConnector:
         except Exception as exc:
             existing = {"open": False, "error": str(exc)[:160]}
         if existing.get("open"):
+            pos_px = coerce_price(
+                existing.get("entry_price"),
+                existing.get("markPrice"),
+                (existing.get("raw") or {}).get("entryPrice")
+                if isinstance(existing.get("raw"), dict)
+                else None,
+            )
             record = {
                 "id": str(uuid.uuid4()),
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -327,6 +507,10 @@ class BitgetPaperConnector:
                 "raw_order": {},
                 "error": POSITION_OPEN_MSG,
                 "position": existing,
+                "price": pos_px,
+                "entry_price": pos_px,
+                "account_balance_change": 0.0,
+                "account_balance_change_source": "none",
                 "sl_price": None,
                 "tp_price": None,
             }
@@ -337,10 +521,7 @@ class BitgetPaperConnector:
             return record
 
         ticker = self.fetch_ticker(symbol)
-        try:
-            last = float(ticker.get("last") or 0)
-        except (TypeError, ValueError):
-            last = 0.0
+        last = coerce_price(ticker.get("last"), ticker.get("bid"), ticker.get("ask"))
         if last <= 0:
             record = {
                 "id": str(uuid.uuid4()),
@@ -359,6 +540,10 @@ class BitgetPaperConnector:
                 "raw_order": {},
                 "error": "No live last price — refusing to size a dummy ticket.",
                 "ticker": {k: ticker.get(k) for k in ("last", "percentage", "mocked", "datetime")},
+                "price": 0.0,
+                "entry_price": 0.0,
+                "account_balance_change": 0.0,
+                "account_balance_change_source": "none",
                 "sl_price": None,
                 "tp_price": None,
             }
@@ -368,6 +553,7 @@ class BitgetPaperConnector:
             record["log_path"] = str(log_path)
             return record
         sized = self._size_amount(symbol, amount, last)
+        notional = round(sized * last, 6)
 
         record: dict[str, Any] = {
             "id": str(uuid.uuid4()),
@@ -378,9 +564,11 @@ class BitgetPaperConnector:
             "symbol": symbol,
             "side": side_n,
             "amount": sized,
-            "notional_usdt": round(sized * last, 6),
+            "notional_usdt": notional,
             "reasoning_hash": reasoning_hash,
             "ticker": {k: ticker.get(k) for k in ("last", "percentage", "mocked", "datetime")},
+            "price": last,
+            "entry_price": last,
             "sl_price": None,
             "tp_price": None,
             "sl_order": None,
@@ -389,18 +577,28 @@ class BitgetPaperConnector:
         if extra:
             record["board"] = extra
 
+        balance_before = self._snapshot_usdt()
         try:
             order = self._place(symbol, side_n, sized, last)
             record["ok"] = True
             record["status"] = str(order.get("status") or "submitted")
             record["order_id"] = order.get("id")
             record["raw_order"] = _slim_order(order)
-            entry = _fill_price(order, last)
+            entry = coerce_price(
+                order.get("average"),
+                order.get("price"),
+                last,
+            )
             record["entry_price"] = entry
+            record["price"] = entry
+            record["notional_usdt"] = round(sized * entry, 6) if entry > 0 else notional
+            self._apply_balance_change(record, balance_before=balance_before, filled=True)
             if side_n == "buy" and entry > 0:
                 try:
                     guards = self._place_sl_tp(symbol, sized, entry)
                     record.update(guards)
+                    record["price"] = entry
+                    record["entry_price"] = entry
                 except Exception as guard_exc:
                     sl, tp = protective_prices(entry)
                     record["sl_price"] = sl
@@ -412,6 +610,9 @@ class BitgetPaperConnector:
             record["ok"] = False
             record["order_id"] = None
             record["raw_order"] = {}
+            record["price"] = last
+            record["entry_price"] = last
+            self._apply_balance_change(record, balance_before=balance_before, filled=False)
             if _is_margin_error(msg):
                 record["status"] = "INSUFFICIENT_MARGIN"
                 record["error"] = (
@@ -438,6 +639,12 @@ class BitgetPaperConnector:
             "symbol": extra.get("symbol"),
             "side": extra.get("side"),
             "amount": 0.0,
+            "quantity": 0.0,
+            "price": 0.0,
+            "entry_price": 0.0,
+            "notional_usdt": 0.0,
+            "account_balance_change": 0.0,
+            "account_balance_change_source": "none",
             "reasoning_hash": extra.get("reasoning_hash"),
             "board": extra.get("board"),
         }
@@ -871,6 +1078,7 @@ def _slim_order(order: dict[str, Any]) -> dict[str, Any]:
 
 
 def _append_trade(record: dict[str, Any]) -> Path:
+    stamp_gitbook_log(record)
     TRADE_LOG.parent.mkdir(parents=True, exist_ok=True)
     with _LOG_LOCK:
         if TRADE_LOG.exists():
@@ -880,6 +1088,15 @@ def _append_trade(record: dict[str, Any]) -> Path:
                 payload = {"venue": "bitget-demo", "trades": []}
         else:
             payload = {"venue": "bitget-demo", "paper_trading": True, "trades": []}
+        payload["paper_trading"] = True
+        payload["gitbook_columns"] = [
+            "timestamp",
+            "instrument",
+            "direction",
+            "quantity",
+            "price",
+            "account_balance_change",
+        ]
         trades = payload.setdefault("trades", [])
         trades.append(record)
         tmp = TRADE_LOG.with_suffix(".json.tmp")

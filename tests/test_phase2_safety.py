@@ -9,9 +9,14 @@ from connectors.bitget_paper import (
     POSITION_OPEN_MSG,
     TAKE_PROFIT_PCT,
     STOP_LOSS_PCT,
+    TAKER_FEE_RATE,
+    SWAP_LEVERAGE,
     _SYMBOL_CANDIDATES,
     _position_is_open,
+    coerce_price,
     protective_prices,
+    simulate_account_balance_change,
+    stamp_gitbook_log,
 )
 from core.llm import (
     API_QUOTA_VETO,
@@ -46,6 +51,70 @@ class PositionTests(unittest.TestCase):
         self.assertFalse(_position_is_open({"symbol": "NVDA/USDT:USDT", "contracts": 0, "side": "long"}, "NVDA/USDT:USDT"))
         self.assertFalse(_position_is_open({"symbol": "BTC/USDT:USDT", "contracts": 1, "side": "long"}, "NVDA/USDT:USDT"))
         self.assertEqual(POSITION_OPEN_MSG, "Position already open")
+
+
+class GitBookPaperLogTests(unittest.TestCase):
+    REQUIRED = (
+        "timestamp",
+        "instrument",
+        "direction",
+        "quantity",
+        "price",
+        "account_balance_change",
+    )
+
+    def test_fill_never_logs_null_price(self) -> None:
+        stamped = stamp_gitbook_log(
+            {
+                "ts": "2026-09-10T07:51:02+00:00",
+                "symbol": "NVDA/USDT:USDT",
+                "side": "buy",
+                "amount": 0.03,
+                "ok": True,
+                "ticker": {"last": 225.32},
+            }
+        )
+        for key in self.REQUIRED:
+            self.assertIn(key, stamped)
+            self.assertIsNotNone(stamped[key])
+        self.assertEqual(stamped["price"], 225.32)
+        self.assertEqual(stamped["entry_price"], 225.32)
+        self.assertEqual(stamped["instrument"], "NVDA/USDT:USDT")
+        self.assertEqual(stamped["direction"], "buy")
+        self.assertEqual(stamped["quantity"], 0.03)
+        expected = simulate_account_balance_change(
+            side="buy", notional_usdt=225.32 * 0.03, filled=True, is_swap=True
+        )
+        self.assertEqual(stamped["account_balance_change"], expected)
+        self.assertLess(expected, 0.0)
+
+    def test_stand_down_zero_delta_zero_price(self) -> None:
+        stamped = stamp_gitbook_log(
+            {
+                "ts": "2026-09-12T03:59:38+00:00",
+                "symbol": "NONE",
+                "side": "none",
+                "ok": False,
+                "status": "VETOED",
+            }
+        )
+        self.assertEqual(stamped["price"], 0.0)
+        self.assertEqual(stamped["entry_price"], 0.0)
+        self.assertEqual(stamped["account_balance_change"], 0.0)
+        self.assertEqual(stamped["quantity"], 0.0)
+
+    def test_swap_margin_plus_fee_simulation(self) -> None:
+        notional = 15.0
+        change = simulate_account_balance_change(
+            side="buy", notional_usdt=notional, filled=True, is_swap=True
+        )
+        self.assertAlmostEqual(
+            change, -(notional / SWAP_LEVERAGE + notional * TAKER_FEE_RATE)
+        )
+
+    def test_coerce_price_never_returns_none(self) -> None:
+        self.assertEqual(coerce_price(None, "", {"last": None}, 0, "x"), 0.0)
+        self.assertEqual(coerce_price({"last": 220.24}), 220.24)
 
 
 class UniverseCandidateTests(unittest.TestCase):
