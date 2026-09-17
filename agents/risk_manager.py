@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from core.llm import API_QUOTA_VETO, API_TIMEOUT_VETO, GeminiCortex
+from core.llm import API_QUOTA_VETO, API_TIMEOUT_VETO, QwenCortex
 from core.schemas import AnalystBrief, RiskReport
 
 CALLSIGN = "SENTINEL"
@@ -40,7 +40,7 @@ Output JSON only with keys:
 
 
 class RiskManagerAgent:
-    def __init__(self, cortex: GeminiCortex) -> None:
+    def __init__(self, cortex: QwenCortex) -> None:
         self.cortex = cortex
         self.callsign = CALLSIGN
 
@@ -71,7 +71,7 @@ class RiskManagerAgent:
         )
         if API_TIMEOUT_VETO in f"{brief.thesis} {brief.rationale}" or API_QUOTA_VETO in f"{brief.thesis} {brief.rationale}":
             skip = API_QUOTA_VETO if API_QUOTA_VETO in f"{brief.thesis} {brief.rationale}" else API_TIMEOUT_VETO
-            print(f"[API ERROR] SENTINEL skipping Gemini — {skip}", flush=True)
+            print(f"[API ERROR] SENTINEL skipping OpenRouter - Qwen — {skip}", flush=True)
             return RiskReport(
                 verdict="VETO",
                 fake_news_risk="HIGH",

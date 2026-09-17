@@ -12,7 +12,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from core.llm import API_QUOTA_VETO, API_TIMEOUT_VETO, GeminiCortex, is_quota_fault
+from core.llm import API_QUOTA_VETO, API_TIMEOUT_VETO, QwenCortex, is_quota_fault
 from core.memory import BoardMemory
 from core.retry import call_with_backoff
 from core.schemas import AnalystBrief, WeekendTrigger
@@ -143,7 +143,7 @@ Rules:
 
 
 class AnalystAgent:
-    def __init__(self, cortex: GeminiCortex, memory: BoardMemory | None = None) -> None:
+    def __init__(self, cortex: QwenCortex, memory: BoardMemory | None = None) -> None:
         self.cortex = cortex
         self.memory = memory
         self.callsign = CALLSIGN
@@ -191,7 +191,7 @@ class AnalystAgent:
             "rationale": API_TIMEOUT_VETO,
             "affected_tickers": [],
             "news_good": "",
-            "news_bad": "Gemini unavailable — no tape color without a live model.",
+            "news_bad": "OpenRouter - Qwen unavailable — no tape color without a live model.",
             "stay_away": [],
             "selection_reason": "STAND_DOWN: API timeout / no actionable news. No blind fallback.",
         }
@@ -203,7 +203,7 @@ class AnalystAgent:
             print(f"[API ERROR] {_safe_text(exc)}", flush=True)
             payload, degraded = dict(fallback), True
         if degraded:
-            err = self.cortex.last_error or "unknown Gemini fault"
+            err = self.cortex.last_error or "unknown OpenRouter - Qwen fault"
             print(f"[API ERROR] ORACLE degraded: {_safe_text(err)}", flush=True)
             quota = is_quota_fault(err)
             reason = API_QUOTA_VETO if quota else API_TIMEOUT_VETO
@@ -215,7 +215,7 @@ class AnalystAgent:
             payload["conviction"] = 0
             payload["stay_away"] = []
             payload["news_good"] = ""
-            payload["news_bad"] = reason if quota else "Gemini unavailable — no tape color without a live model."
+            payload["news_bad"] = reason if quota else "OpenRouter - Qwen unavailable — no tape color without a live model."
             payload["selection_reason"] = (
                 API_QUOTA_VETO
                 if quota
@@ -476,7 +476,7 @@ def is_none_symbol(symbol: str | None) -> bool:
 
 
 def is_idle_brief(brief: AnalystBrief) -> bool:
-    """True when ORACLE refused a trade: NONE / none / 0 / Gemini timeout."""
+    """True when ORACLE refused a trade: NONE / none / 0 / OpenRouter timeout."""
     if brief.llm_degraded:
         return True
     if (brief.side or "none").lower() == "none":
@@ -519,7 +519,7 @@ def detect_stay_away(
     triggers: list[WeekendTrigger] | list[Any],
     universe: list[str] | tuple[str, ...] | None = None,
 ) -> list[str]:
-    """Heuristic toxic-tape flags so stay-away alerts still fire if Gemini is dark."""
+    """Heuristic toxic-tape flags so stay-away alerts still fire if OpenRouter is dark."""
     symbols = [str(s).strip() for s in (universe or []) if str(s).strip()]
     flags: list[str] = []
     seen: set[str] = set()

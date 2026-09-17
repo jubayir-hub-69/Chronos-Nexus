@@ -21,9 +21,10 @@ from connectors.bitget_paper import (
 from core.llm import (
     API_QUOTA_VETO,
     API_TIMEOUT_VETO,
-    GEMINI_TIMEOUT_S,
-    GeminiCortex,
+    LLM_TIMEOUT_S,
+    QwenCortex,
     _parse_json,
+    _response_text,
     _run_with_timeout,
     _timeout_fallback,
     is_quota_fault,
@@ -157,7 +158,7 @@ class RetryTests(unittest.TestCase):
             slept.assert_not_called()
 
 
-class GeminiTimeoutTests(unittest.TestCase):
+class OpenRouterTimeoutTests(unittest.TestCase):
     def test_hard_timeout_does_not_hang(self) -> None:
         import time
 
@@ -167,11 +168,11 @@ class GeminiTimeoutTests(unittest.TestCase):
 
         t0 = time.perf_counter()
         with self.assertRaises(TimeoutError):
-            _run_with_timeout(hang, timeout=0.25, label="gemini:test")
+            _run_with_timeout(hang, timeout=0.25, label="openrouter:test")
         self.assertLess(time.perf_counter() - t0, 2.0)
 
     def test_timeout_is_forty_five_seconds(self) -> None:
-        self.assertEqual(GEMINI_TIMEOUT_S, 45)
+        self.assertEqual(LLM_TIMEOUT_S, 45)
 
     def test_timeout_fallback_is_veto(self) -> None:
         out = _timeout_fallback(
@@ -199,7 +200,7 @@ class GeminiTimeoutTests(unittest.TestCase):
             _parse_json('{"thesis": "Apple said "iPhone" sales\n"side": "buy"')
 
     def test_generate_json_parse_fault_returns_fallback(self) -> None:
-        cortex = GeminiCortex.__new__(GeminiCortex)
+        cortex = QwenCortex.__new__(QwenCortex)
         cortex.last_error = None
         cortex.model_name = "test"
         cortex._complete = lambda *a, **k: '{"thesis": "Apple said "iPhone"\n"rationale":'
@@ -232,7 +233,7 @@ class GeminiTimeoutTests(unittest.TestCase):
 
     def test_429_quota_stand_down_is_not_a_crash(self) -> None:
         self.assertTrue(is_quota_fault(RuntimeError("429 RESOURCE_EXHAUSTED quota exceeded")))
-        self.assertTrue(is_quota_fault("Gemini Free Tier API quota reached. System safely standing down until limits reset."))
+        self.assertTrue(is_quota_fault("OpenRouter API quota reached. System safely standing down until limits reset."))
         out = _timeout_fallback(
             {
                 "verdict": "CLEAR",
@@ -251,11 +252,11 @@ class GeminiTimeoutTests(unittest.TestCase):
         self.assertEqual(out["thesis"], API_QUOTA_VETO)
         self.assertEqual(
             API_QUOTA_VETO,
-            "Gemini Free Tier API quota reached. System safely standing down until limits reset.",
+            "OpenRouter API quota reached. System safely standing down until limits reset.",
         )
 
     def test_generate_json_quota_returns_fallback(self) -> None:
-        cortex = GeminiCortex.__new__(GeminiCortex)
+        cortex = QwenCortex.__new__(QwenCortex)
         cortex.last_error = None
         cortex.model_name = "test"
 
@@ -280,6 +281,36 @@ class GeminiTimeoutTests(unittest.TestCase):
         self.assertEqual(payload["conviction"], 0)
         self.assertEqual(payload["rationale"], API_QUOTA_VETO)
         self.assertEqual(cortex.last_error, API_QUOTA_VETO)
+
+    def test_openai_choice_content_is_parsed(self) -> None:
+        from types import SimpleNamespace
+
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"verdict": "CLEAR", "rationale": "ok"}'
+                    )
+                )
+            ]
+        )
+        payload = _parse_json(_response_text(response))
+        self.assertEqual(payload["verdict"], "CLEAR")
+        self.assertEqual(payload["rationale"], "ok")
+
+    def test_openai_dict_and_fenced_json(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": '```json\n{"action": "STAND_DOWN", "consensus": "VETOED"}\n```'
+                    }
+                }
+            ]
+        }
+        payload = _parse_json(_response_text(response))
+        self.assertEqual(payload["action"], "STAND_DOWN")
+        self.assertEqual(payload["consensus"], "VETOED")
 
 
 class TelegramTests(unittest.TestCase):

@@ -1,4 +1,4 @@
-"""Gemini cortex used by the Board of Directors."""
+"""OpenRouter - Qwen cortex used by the Board of Directors."""
 
 from __future__ import annotations
 
@@ -7,17 +7,22 @@ import re
 import threading
 from typing import Any, Callable, TypeVar
 
-from core.config import Settings, _FALLBACK_MODELS, _normalize_model_name
+from core.config import (
+    CORTEX_BACKEND_LABEL,
+    DEFAULT_QWEN_MODEL,
+    OPENROUTER_BASE_URL,
+    Settings,
+    normalize_model_name,
+)
 from core.retry import call_with_backoff
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.DOTALL)
 
-# Hard cap per HTTP round-trip. Never let generate_content block the CIC.
-GEMINI_TIMEOUT_S = 45
-GEMINI_TIMEOUT_MS = GEMINI_TIMEOUT_S * 1000
+# Hard cap per HTTP round-trip. Never let chat.completions block the CIC.
+LLM_TIMEOUT_S = 45
 API_TIMEOUT_VETO = "VETO: API Timeout"
 API_QUOTA_VETO = (
-    "Gemini Free Tier API quota reached. System safely standing down until limits reset."
+    "OpenRouter API quota reached. System safely standing down until limits reset."
 )
 
 T = TypeVar("T")
@@ -31,9 +36,9 @@ def _clean_api_error(exc: BaseException) -> str:
     if _looks_quota(exc):
         return API_QUOTA_VETO
     if _looks_parse_fault(exc):
-        return "parser fault: unusable Gemini JSON"
+        return "parser fault: unusable OpenRouter JSON"
     if _looks_unavailable(exc):
-        return "Gemini 503/unavailable — standing down"
+        return "OpenRouter 503/unavailable — standing down"
     msg = " ".join(str(exc).split())
     return msg[:400] if msg else type(exc).__name__
 
@@ -76,8 +81,23 @@ def _looks_quota(exc: BaseException) -> bool:
     return is_quota_fault(exc)
 
 
+def _looks_json_mode_unsupported(exc: BaseException) -> bool:
+    blob = _exc_blob(exc)
+    return any(
+        tok in blob
+        for tok in (
+            "response_format",
+            "json_object",
+            "json mode",
+            "json_schema",
+            "not supported",
+            "unsupported",
+        )
+    )
+
+
 def is_quota_fault(value: Any) -> bool:
-    """True for Gemini Free Tier 429 / quota / resource-exhausted — not a crash."""
+    """True for OpenRouter 429 / quota / rate-limit — not a crash."""
     if isinstance(value, BaseException):
         blob = _exc_blob(value)
     else:
@@ -96,12 +116,20 @@ def is_quota_fault(value: Any) -> bool:
             "quota exceeded",
             "free_tier",
             "free tier",
+            "insufficient_quota",
+            "credits",
         )
     )
 
 
 def _exc_blob(exc: BaseException) -> str:
     parts = [type(exc).__name__, str(exc)]
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        parts.append(str(status))
+    code = getattr(exc, "code", None)
+    if code is not None:
+        parts.append(str(code))
     cause = getattr(exc, "__cause__", None)
     if isinstance(cause, BaseException):
         parts.append(type(cause).__name__)
@@ -125,10 +153,10 @@ def _run_with_timeout(fn: Callable[[], T], *, timeout: float, label: str) -> T:
     def _worker() -> None:
         try:
             box["ok"] = fn()
-        except Exception as exc:  # noqa: BLE001 — surface the real Gemini fault
+        except Exception as exc:  # noqa: BLE001 — surface the real OpenRouter fault
             box["err"] = exc
 
-    thread = threading.Thread(target=_worker, daemon=True, name="gemini-timeout")
+    thread = threading.Thread(target=_worker, daemon=True, name="openrouter-timeout")
     thread.start()
     thread.join(timeout=timeout)
     if thread.is_alive():
@@ -140,54 +168,47 @@ def _run_with_timeout(fn: Callable[[], T], *, timeout: float, label: str) -> T:
     return box["ok"]
 
 
-class GeminiCortex:
-    """Thin adapter over google-generativeai (new google-genai as fallback)."""
+class QwenCortex:
+    """Thin adapter over the OpenAI SDK pointed at OpenRouter (Qwen)."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        # Exact auto-selector id (e.g. gemini-3.8-flash). Never a nickname like "1.5".
-        self.selected_model = _normalize_model_name(
-            settings.resolved_gemini_model or _FALLBACK_MODELS[0]
-        )
+        self.selected_model = normalize_model_name(
+            settings.resolved_qwen_model or settings.qwen_model or DEFAULT_QWEN_MODEL
+        ) or DEFAULT_QWEN_MODEL
         self.model_name = self.selected_model
         self.backend: str = "none"
         self.last_error: str | None = None
-        self._legacy: Any = None
         self._client: Any = None
         self._bind()
 
     def _bind(self) -> None:
-        key = self.settings.gemini_api_key
+        key = (self.settings.openrouter_api_key or "").strip()
         if not key:
             self.backend = "offline"
+            print("[CORTEX] OPENROUTER_API_KEY empty — OpenRouter - Qwen offline", flush=True)
             return
         try:
-            from google import genai
-            from google.genai import types
-
-            try:
-                http: Any = types.HttpOptions(
-                    timeout=GEMINI_TIMEOUT_MS,
-                    retry_options=types.HttpRetryOptions(attempts=1),
-                )
-            except Exception:
-                http = {"timeout": GEMINI_TIMEOUT_MS}
-            self._client = genai.Client(api_key=key, http_options=http)
-            self.backend = "google-genai"
-            return
-        except ImportError:
-            pass
-        try:
-            import google.generativeai as genai
-
-            genai.configure(api_key=key)
-            self._legacy = genai
-            self.backend = "google-generativeai"
+            from openai import OpenAI
         except ImportError as exc:
             raise RuntimeError(
-                "Install google-genai (pip install google-genai). "
-                "google-generativeai is end-of-life."
+                "Install openai (pip install openai) to call OpenRouter - Qwen."
             ) from exc
+        self._client = OpenAI(
+            api_key=key,
+            base_url=OPENROUTER_BASE_URL,
+            timeout=float(LLM_TIMEOUT_S),
+            max_retries=0,
+            default_headers={
+                "HTTP-Referer": "https://github.com/chronos-nexus",
+                "X-Title": "Chronos-Nexus",
+            },
+        )
+        self.backend = CORTEX_BACKEND_LABEL
+        print(
+            f"[CORTEX] running on {CORTEX_BACKEND_LABEL} · {self.selected_model}",
+            flush=True,
+        )
 
     def generate_json(
         self,
@@ -212,9 +233,9 @@ class GeminiCortex:
         try:
             return _parse_json(text), False
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
-            self.last_error = "parser fault: unusable Gemini JSON"
+            self.last_error = "parser fault: unusable OpenRouter JSON"
             print(
-                "[API ERROR] parser fault — Gemini JSON unusable (truncated/503). Standing down.",
+                "[API ERROR] parser fault — OpenRouter JSON unusable (truncated/503). Standing down.",
                 flush=True,
             )
             if fallback is None:
@@ -235,18 +256,18 @@ class GeminiCortex:
             raise
 
     def _complete(self, system: str, user: str, temperature: float, json_mode: bool) -> str:
-        if self.backend == "offline":
-            raise RuntimeError("GEMINI_API_KEY is empty")
+        if self.backend == "offline" or self._client is None:
+            raise RuntimeError("OPENROUTER_API_KEY is empty")
 
-        names = _candidate_models(self.model_name)[:3]
+        names = _candidate_models(self.model_name)
         last_error: Exception | None = None
         for index, name in enumerate(names):
-            label = f"gemini:{name}"
+            label = f"openrouter:{name}"
             try:
                 text = call_with_backoff(
                     lambda n=name, lab=label: _run_with_timeout(
                         lambda: self._complete_once(n, system, user, temperature, json_mode),
-                        timeout=GEMINI_TIMEOUT_S,
+                        timeout=LLM_TIMEOUT_S,
                         label=lab,
                     ),
                     attempts=3 if index == 0 else 1,
@@ -254,12 +275,11 @@ class GeminiCortex:
                     max_delay=1.5,
                     label=label,
                 )
-                self.model_name = _normalize_model_name(name)
+                self.model_name = normalize_model_name(name) or name
                 return text
             except Exception as exc:
                 last_error = exc
                 _api_error(exc)
-                # Timeout and quota will burn every fallback model the same way — exit.
                 if _looks_timeout(exc) or _looks_quota(exc):
                     break
                 continue
@@ -275,75 +295,24 @@ class GeminiCortex:
         temperature: float,
         json_mode: bool,
     ) -> str:
-        if self.backend == "google-generativeai":
-            return self._complete_legacy(name, system, user, temperature, json_mode)
-        return self._complete_new(name, system, user, temperature, json_mode)
-
-    def _complete_legacy(
-        self,
-        name: str,
-        system: str,
-        user: str,
-        temperature: float,
-        json_mode: bool,
-    ) -> str:
-        gen_cfg: dict[str, Any] = {"temperature": temperature, "max_output_tokens": 2048}
-        if json_mode:
-            gen_cfg["response_mime_type"] = "application/json"
-
-        def _call(cfg: dict[str, Any]) -> str:
-            model = self._legacy.GenerativeModel(
-                model_name=name,
-                system_instruction=system,
-                generation_config=cfg,
-            )
-            try:
-                response = model.generate_content(
-                    user, request_options={"timeout": GEMINI_TIMEOUT_S}
-                )
-            except TypeError:
-                # Older stubs omit request_options; the thread cap still enforces GEMINI_TIMEOUT_S.
-                response = model.generate_content(user)
-            return _response_text(response)
-
-        try:
-            return _call(gen_cfg)
-        except Exception:
-            if not json_mode:
-                raise
-            gen_cfg.pop("response_mime_type", None)
-            return _call(gen_cfg)
-
-    def _complete_new(
-        self,
-        name: str,
-        system: str,
-        user: str,
-        temperature: float,
-        json_mode: bool,
-    ) -> str:
-        from google.genai import types
-
-        cfg_kwargs: dict[str, Any] = {
+        kwargs: dict[str, Any] = {
+            "model": name,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
             "temperature": temperature,
-            "max_output_tokens": 2048,
-            "system_instruction": system,
-            "http_options": types.HttpOptions(
-                timeout=GEMINI_TIMEOUT_MS,
-                retry_options=types.HttpRetryOptions(attempts=1),
-            ),
+            "max_tokens": 2048,
         }
-        try:
-            cfg_kwargs["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(disable=True)
-        except Exception:
-            pass
         if json_mode:
-            cfg_kwargs["response_mime_type"] = "application/json"
-        response = self._client.models.generate_content(
-            model=name,
-            contents=user,
-            config=types.GenerateContentConfig(**cfg_kwargs),
-        )
+            kwargs["response_format"] = {"type": "json_object"}
+        try:
+            response = self._client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            if not json_mode or not _looks_json_mode_unsupported(exc):
+                raise
+            kwargs.pop("response_format", None)
+            response = self._client.chat.completions.create(**kwargs)
         return _response_text(response)
 
 
@@ -376,48 +345,87 @@ def _timeout_fallback(fallback: dict[str, Any], exc: BaseException) -> dict[str,
 
 
 def _candidate_models(primary: str) -> list[str]:
-    ordered = [_normalize_model_name(primary)]
-    for name in _FALLBACK_MODELS:
-        if name not in ordered:
-            ordered.append(name)
-    return ordered
+    ordered: list[str] = []
+    for name in (primary, DEFAULT_QWEN_MODEL):
+        cleaned = normalize_model_name(name)
+        if cleaned and cleaned not in ordered:
+            ordered.append(cleaned)
+    return ordered or [DEFAULT_QWEN_MODEL]
+
+
+def _message_text(message: Any) -> str:
+    if message is None:
+        return ""
+    content = getattr(message, "content", None)
+    if content is None and isinstance(message, dict):
+        content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for part in content:
+            if isinstance(part, str) and part.strip():
+                chunks.append(part)
+                continue
+            if isinstance(part, dict):
+                text = part.get("text") or part.get("content") or ""
+                if text:
+                    chunks.append(str(text))
+                continue
+            text = getattr(part, "text", None) or getattr(part, "content", None)
+            if text:
+                chunks.append(str(text))
+        if chunks:
+            return "\n".join(chunks)
+    parsed = getattr(message, "parsed", None)
+    if isinstance(parsed, dict):
+        return json.dumps(parsed)
+    if isinstance(message, dict) and isinstance(message.get("parsed"), dict):
+        return json.dumps(message["parsed"])
+    return str(content or "").strip()
 
 
 def _response_text(response: Any) -> str:
-    text = getattr(response, "text", None)
+    choices = getattr(response, "choices", None)
+    if choices is None and isinstance(response, dict):
+        choices = response.get("choices")
+    for choice in choices or []:
+        message = getattr(choice, "message", None)
+        if message is None and isinstance(choice, dict):
+            message = choice.get("message")
+        text = _message_text(message)
+        if text:
+            return text
+    text = getattr(response, "output_text", None)
     if text:
         return str(text)
-    chunks: list[str] = []
-    for candidate in getattr(response, "candidates", None) or []:
-        content = getattr(candidate, "content", None)
-        for part in getattr(content, "parts", None) or []:
-            piece = getattr(part, "text", None)
-            if piece:
-                chunks.append(str(piece))
-    if chunks:
-        return "\n".join(chunks)
-    raise RuntimeError("empty Gemini response")
+    raise RuntimeError("empty OpenRouter response")
 
 
 def _parse_json(text: str) -> dict[str, Any]:
     cleaned = _FENCE.sub("", (text or "").strip()).strip()
     if not cleaned:
-        raise ValueError("parser fault: empty Gemini JSON")
+        raise ValueError("parser fault: empty OpenRouter JSON")
     try:
         payload = json.loads(cleaned)
     except json.JSONDecodeError:
         start = cleaned.find("{")
         end = cleaned.rfind("}")
         if start < 0 or end <= start:
-            raise json.JSONDecodeError("parser fault: unterminated Gemini JSON", cleaned, 0)
+            raise json.JSONDecodeError("parser fault: unterminated OpenRouter JSON", cleaned, 0)
         try:
             payload = json.loads(cleaned[start : end + 1])
         except json.JSONDecodeError:
             raise json.JSONDecodeError(
-                "parser fault: unterminated Gemini JSON",
+                "parser fault: unterminated OpenRouter JSON",
                 cleaned,
                 0,
             ) from None
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError("OpenRouter JSON was not an object") from exc
     if not isinstance(payload, dict):
-        raise ValueError("Gemini JSON was not an object")
+        raise ValueError("OpenRouter JSON was not an object")
     return payload

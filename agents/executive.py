@@ -7,7 +7,7 @@ import json
 from typing import Any
 
 from agents.analyst import is_idle_brief
-from core.llm import API_QUOTA_VETO, API_TIMEOUT_VETO, GeminiCortex
+from core.llm import API_QUOTA_VETO, API_TIMEOUT_VETO, QwenCortex
 from core.memory import BoardMemory
 from core.schemas import AnalystBrief, AttestationResult, BoardDecision, RiskReport
 from connectors.arbitrum import ArbitrumSepolia
@@ -27,7 +27,7 @@ Output JSON only with keys:
 - consensus: UNANIMOUS | MAJORITY | VETOED
 Hard rules the Python chair will also enforce:
 - VETO → STAND_DOWN / VETOED (including Illiquid Market / High Spread)
-- ORACLE idle (primary_symbol=NONE, side=none, conviction=0, or Gemini timeout) → STAND_DOWN
+- ORACLE idle (primary_symbol=NONE, side=none, conviction=0, or OpenRouter timeout) → STAND_DOWN
 - No live last price → STAND_DOWN / DEGRADED
 - CLEAR or REDUCE → EXECUTE (REDUCE already cut size; it is not a veto)
 - NEVER invent NVDA or a BUY when ORACLE stood down.
@@ -36,7 +36,7 @@ Hard rules the Python chair will also enforce:
 
 
 class ExecutiveAgent:
-    def __init__(self, cortex: GeminiCortex, memory: BoardMemory | None = None) -> None:
+    def __init__(self, cortex: QwenCortex, memory: BoardMemory | None = None) -> None:
         self.cortex = cortex
         self.memory = memory
         self.callsign = CALLSIGN
@@ -82,10 +82,10 @@ class ExecutiveAgent:
             ),
         }
         if API_QUOTA_VETO in f"{brief.rationale} {risk.rationale}":
-            print(f"[API ERROR] CHAIRMAN skipping Gemini — {API_QUOTA_VETO}", flush=True)
+            print(f"[API ERROR] CHAIRMAN skipping OpenRouter - Qwen — {API_QUOTA_VETO}", flush=True)
             payload, degraded = fallback, True
         elif API_TIMEOUT_VETO in f"{brief.rationale} {risk.rationale}":
-            print(f"[API ERROR] CHAIRMAN skipping Gemini — {API_TIMEOUT_VETO}", flush=True)
+            print(f"[API ERROR] CHAIRMAN skipping OpenRouter - Qwen — {API_TIMEOUT_VETO}", flush=True)
             payload, degraded = fallback, True
         else:
             try:

@@ -5,10 +5,8 @@
 # --- Terminal UI ---
 rich>=13.9.4
 
-# --- LLM cortex: Google Gemini (GEMINI_MODEL=auto) ---
-# google-genai is current; google-generativeai is EOL but kept as fallback.
-google-genai>=1.0.0
-google-generativeai>=0.8.5
+# --- LLM cortex: OpenRouter - Qwen (openai SDK, OpenAI-compatible) ---
+openai>=1.68.0
 python-dotenv>=1.1.0
 
 # --- Web3: Arbitrum Sepolia on-chain Proof of Thought ---

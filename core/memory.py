@@ -1,6 +1,6 @@
 """Lightweight board memory — last N paper cycles on disk.
 
-ORACLE and CHAIRMAN inject this into Gemini so the desk does not
+ORACLE and CHAIRMAN inject this into OpenRouter - Qwen so the desk does not
 repeat an identical failed setup. Not a vector store: a JSON ring buffer.
 """
 
@@ -38,7 +38,7 @@ class BoardMemory:
         return self.load()[-limit:]
 
     def prompt_block(self) -> str:
-        """Compact recap for Gemini context. Empty memory is stated explicitly."""
+        """Compact recap for OpenRouter - Qwen context. Empty memory is stated explicitly."""
         rows = self.recent()
         if not rows:
             return "BOARD MEMORY: empty (no prior cycles)."

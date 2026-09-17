@@ -43,7 +43,7 @@ from agents.risk_manager import RiskManagerAgent
 from connectors.arbitrum import ArbitrumSepolia
 from connectors.bitget_paper import BitgetPaperConnector
 from core.config import Settings, load_settings
-from core.llm import GeminiCortex
+from core.llm import QwenCortex
 from core.memory import BoardMemory
 from core.schemas import AnalystBrief, BoardDecision, RiskReport
 from utils.notifier import TelegramNotifier, send_startup_message
@@ -252,7 +252,7 @@ def _dispatch_alerts(
 
 def _run_trading_cycle(
     settings: Settings,
-    cortex: GeminiCortex,
+    cortex: QwenCortex,
     memory: BoardMemory,
     bitget: BitgetPaperConnector | None,
     arb: ArbitrumSepolia | None,
@@ -378,8 +378,8 @@ def _run_trading_cycle(
         )
     if brief.llm_degraded:
         notifier.alert_api_error(
-            error=brief.rationale or "Gemini timeout / degraded",
-            where="ORACLE / Gemini",
+            error=brief.rationale or "OpenRouter - Qwen timeout / degraded",
+            where="ORACLE / OpenRouter - Qwen",
             action="STAND_DOWN",
             session=clock["line"],
         )
@@ -456,7 +456,7 @@ def _run_trading_cycle(
         except Exception as exc:
             notifier.alert_api_error(
                 error=str(exc)[:400],
-                where="SENTINEL / Gemini",
+                where="SENTINEL / OpenRouter - Qwen",
                 action="VETO",
                 session=clock["line"],
             )
@@ -697,10 +697,11 @@ def _main() -> int:
                 ("version", VERSION),
                 ("paper_trading", str(settings.bitget_paper_trading)),
                 ("live_trading", str(LIVE_TRADING_ENABLED)),
-                ("gemini_requested", settings.gemini_model),
-                ("gemini_resolved", settings.resolved_gemini_model or "(unresolved)"),
-                ("gemini_source", settings.gemini_discovery_source),
-                ("gemini_key", settings.public_status()["gemini_key"]),
+                ("cortex", settings.public_status()["cortex_backend"]),
+                ("qwen_requested", settings.qwen_model),
+                ("qwen_resolved", settings.resolved_qwen_model or "(unresolved)"),
+                ("qwen_source", settings.qwen_source or "(pending)"),
+                ("openrouter_key", settings.public_status()["openrouter_key"]),
                 ("bitget_key", settings.public_status()["bitget_key"]),
                 ("arb_chain", str(settings.arbitrum_sepolia_chain_id)),
                 ("telegram", settings.public_status()["telegram"]),
@@ -713,18 +714,17 @@ def _main() -> int:
     notifier = TelegramNotifier.from_settings(settings)
     send_startup_message(notifier)
 
-    phase("PHASE 1  ·  GEMINI CORTEX")
-    cortex = GeminiCortex(settings)
+    phase("PHASE 1  ·  OPENROUTER - QWEN")
+    cortex = QwenCortex(settings)
     memory = BoardMemory()
-    catalog_n = len(settings.gemini_catalog)
     console.print(
         kv_panel(
-            "CORTEX",
+            "CORTEX  ·  OpenRouter - Qwen",
             [
                 ("backend", cortex.backend),
                 ("model", cortex.selected_model),
-                ("catalog", f"{catalog_n} generateContent models" if catalog_n else "fallback chain"),
-                ("source", settings.gemini_discovery_source),
+                ("base_url", "https://openrouter.ai/api/v1"),
+                ("source", settings.qwen_source or "default"),
             ],
             border="magenta",
         )
@@ -804,7 +804,7 @@ def _main() -> int:
     table.add_row("Analyst Agent", "ORACLE · live RSS wire", status_dot(True))
     table.add_row("Risk Manager", "SENTINEL · veto + L2 spread", status_dot(True))
     table.add_row("Executive Agent", "CHAIRMAN · attest + execute", status_dot(True))
-    table.add_row("Gemini Cortex", f"{cortex.backend} · {cortex.selected_model}", status_dot(cortex.backend != "offline"))
+    table.add_row("OpenRouter - Qwen", f"{cortex.backend} · {cortex.selected_model}", status_dot(cortex.backend != "offline"))
     table.add_row(
         "Bitget Paper",
         f"{bitget_ping.get('symbol') or bitget_err or 'unbound'} · univ {bitget_ping.get('universe', '—')}",

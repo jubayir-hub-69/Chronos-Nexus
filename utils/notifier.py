@@ -158,13 +158,13 @@ class TelegramNotifier:
         self,
         *,
         error: str,
-        where: str = "Gemini",
+        where: str = "OpenRouter - Qwen",
         action: str = "STAND_DOWN",
         session: str = "",
     ) -> None:
         quota = is_quota_fault(error)
         title = (
-            "⚠️ <b>GEMINI FREE TIER QUOTA</b>"
+            "⚠️ <b>OPENROUTER QUOTA</b>"
             if quota
             else "⚠️ <b>API ERROR / TIMEOUT</b>"
         )
@@ -186,7 +186,7 @@ class TelegramNotifier:
         )
         if quota:
             lines.append(
-                "Not a crash. Free-tier limit hit — the hourly daemon will retry after reset."
+                "Not a crash. OpenRouter limit hit — the hourly daemon will retry after reset."
             )
         else:
             lines.append(

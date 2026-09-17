@@ -194,7 +194,7 @@ class MemoryTests(unittest.TestCase):
                         "consensus": "MAJORITY",
                         "verdict": "REDUCE",
                         "thesis": f"thesis-{i}",
-                        "model": "gemini-3.8-flash",
+                        "model": "qwen/qwen-2.5-72b-instruct",
                     },
                     result={"ok": i % 2 == 0, "status": "submitted" if i % 2 == 0 else "VETOED"},
                 )
@@ -205,7 +205,7 @@ class MemoryTests(unittest.TestCase):
             block = mem.prompt_block()
             self.assertNotIn("headline-0", block)
             self.assertIn("headline-5", block)
-            self.assertEqual(rows[-1]["decision"]["model"], "gemini-3.8-flash")
+            self.assertEqual(rows[-1]["decision"]["model"], "qwen/qwen-2.5-72b-instruct")
 
 
 if __name__ == "__main__":
