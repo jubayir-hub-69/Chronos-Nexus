@@ -1,4 +1,4 @@
-"""Environment loading + OpenRouter / Qwen cortex settings.
+"""Environment loading + Bitget hackathon Qwen cortex settings.
 
 Paper trading is a hard lock. Live Bitget keys are refused.
 """
@@ -18,9 +18,9 @@ ENV_PATH = PROJECT_ROOT / ".env"
 
 load_dotenv(ENV_PATH, override=False)
 
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_QWEN_MODEL = "qwen/qwen-2.5-72b-instruct"
-CORTEX_BACKEND_LABEL = "OpenRouter - Qwen"
+QWEN_BASE_URL = "https://hackathon.bitgetops.com/v1"
+DEFAULT_QWEN_MODEL = "qwen3.8-max"
+CORTEX_BACKEND_LABEL = "Bitget Hackathon - Qwen 3.8 Max"
 
 
 def mask_secret(value: str, keep: int = 4) -> str:
@@ -32,8 +32,19 @@ def mask_secret(value: str, keep: int = 4) -> str:
 
 
 def normalize_model_name(name: str) -> str:
-    """Keep the full OpenRouter slug (e.g. qwen/qwen-2.5-72b-instruct)."""
-    return (name or "").strip()
+    """Hackathon Qwen model id. Empty / auto / legacy slugs resolve to qwen3.8-max."""
+    raw = (name or "").strip()
+    if not raw:
+        return ""
+    lowered = raw.lower()
+    if lowered in {
+        "auto",
+        "default",
+        "qwen-max",
+        "qwen/qwen-2.5-72b-instruct",
+    }:
+        return DEFAULT_QWEN_MODEL
+    return raw
 
 
 class Settings(BaseSettings):
@@ -44,7 +55,7 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    openrouter_api_key: str = ""
+    qwen_api_key: str = ""
     qwen_model: str = DEFAULT_QWEN_MODEL
 
     bitget_api_key: str = ""
@@ -113,7 +124,7 @@ class Settings(BaseSettings):
             "qwen_model_requested": self.qwen_model or DEFAULT_QWEN_MODEL,
             "qwen_model_resolved": self.resolved_qwen_model or "(pending)",
             "qwen_source": self.qwen_source or "(pending)",
-            "openrouter_key": mask_secret(self.openrouter_api_key),
+            "qwen_key": mask_secret(self.qwen_api_key),
             "bitget_key": mask_secret(self.bitget_api_key),
             "bitget_paper": str(self.bitget_paper_trading),
             "arb_chain": str(self.arbitrum_sepolia_chain_id),

@@ -20,6 +20,12 @@ from core.retry import call_with_backoff
 
 STOP_LOSS_PCT = 0.02
 TAKE_PROFIT_PCT = 0.05
+ATR_SL_MULT = 1.5
+ATR_TP_MULT = 2.5
+ATR_SL_PCT_FLOOR = 0.012
+ATR_SL_PCT_CAP = 0.05
+ATR_TP_PCT_FLOOR = 0.03
+ATR_TP_PCT_CAP = 0.12
 POSITION_OPEN_MSG = "Position already open"
 # Bitget USDT-M taker + crossed-margin estimate when the Demo wallet delta is unavailable.
 TAKER_FEE_RATE = 0.0006
@@ -196,6 +202,7 @@ class BitgetPaperConnector:
         # Must be the first call after construct — CCXT Demo / PAPTRADING=1.
         exchange.set_sandbox_mode(True)
         self.exchange = exchange
+        self._order_lock = threading.RLock()
 
     def _ccxt(self, fn, *, label: str = "bitget"):
         return call_with_backoff(fn, attempts=3, label=label)
@@ -471,6 +478,17 @@ class BitgetPaperConnector:
         reasoning_hash: str,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        with self._order_lock:
+            return self._execute_paper_order(symbol, side, amount, reasoning_hash, extra)
+
+    def _execute_paper_order(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        reasoning_hash: str,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not self.sandbox:
             raise RuntimeError("REFUSING live order — sandbox lock tripped")
 
@@ -593,14 +611,14 @@ class BitgetPaperConnector:
             record["price"] = entry
             record["notional_usdt"] = round(sized * entry, 6) if entry > 0 else notional
             self._apply_balance_change(record, balance_before=balance_before, filled=True)
-            if side_n == "buy" and entry > 0:
+            if entry > 0:
                 try:
-                    guards = self._place_sl_tp(symbol, sized, entry)
+                    guards = self._place_sl_tp(symbol, sized, entry, side=side_n)
                     record.update(guards)
                     record["price"] = entry
                     record["entry_price"] = entry
                 except Exception as guard_exc:
-                    sl, tp = protective_prices(entry)
+                    sl, tp = protective_prices(entry, side_n)
                     record["sl_price"] = sl
                     record["tp_price"] = tp
                     record["sl_error"] = str(guard_exc)[:240]
@@ -659,22 +677,43 @@ class BitgetPaperConnector:
                 self._ccxt(lambda: self.exchange.set_leverage(5, symbol), label="bitget.leverage")
             except Exception:
                 pass
-            params: dict[str, Any] = {"marginMode": "crossed", "tradeSide": "open", "hedged": True}
-            if side == "buy":
-                sl, tp = protective_prices(last)
-                params["stopLossPrice"] = self._price(symbol, sl)
-                params["takeProfitPrice"] = self._price(symbol, tp)
-            try:
-                return self._ccxt(
-                    lambda: self.exchange.create_order(symbol, "market", side, amount, None, params),
-                    label="bitget.create_order.swap",
-                )
-            except Exception:
-                bare = {"marginMode": "crossed", "tradeSide": "open", "hedged": True}
-                return self._ccxt(
-                    lambda: self.exchange.create_order(symbol, "market", side, amount, None, bare),
-                    label="bitget.create_order.swap.bare",
-                )
+            sl, tp = protective_prices(last, side, atr=self.fetch_atr(symbol))
+            sl_px = self._price(symbol, sl)
+            tp_px = self._price(symbol, tp)
+            param_sets: list[dict[str, Any]] = [
+                {
+                    "marginMode": "crossed",
+                    "tradeSide": "open",
+                    "hedged": True,
+                    "stopLossPrice": sl_px,
+                    "takeProfitPrice": tp_px,
+                    "presetStopLossPrice": sl_px,
+                    "presetTakeProfitPrice": tp_px,
+                },
+                {
+                    "marginMode": "crossed",
+                    "tradeSide": "open",
+                    "hedged": True,
+                    "stopLossPrice": sl_px,
+                    "takeProfitPrice": tp_px,
+                },
+                {"marginMode": "crossed", "tradeSide": "open", "hedged": True},
+            ]
+            last_exc: Exception | None = None
+            for params in param_sets:
+                try:
+                    return self._ccxt(
+                        lambda p=params: self.exchange.create_order(
+                            symbol, "market", side, amount, None, p
+                        ),
+                        label="bitget.create_order.swap",
+                    )
+                except Exception as exc:
+                    last_exc = exc
+                    continue
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError("swap create_order failed")
 
         try:
             return self._ccxt(
@@ -693,60 +732,92 @@ class BitgetPaperConnector:
                     raise RuntimeError(f"{first} | fallback: {second}") from second
             raise
 
-    def _place_sl_tp(self, symbol: str, amount: float, entry: float) -> dict[str, Any]:
-        """Place a -2% stop-loss and +5% take-profit immediately after a BUY fill."""
-        sl, tp = protective_prices(entry)
+    def _place_sl_tp(
+        self,
+        symbol: str,
+        amount: float,
+        entry: float,
+        side: str = "buy",
+    ) -> dict[str, Any]:
+        """Attach SL/TP immediately after a fill. Longs sell-to-close; shorts buy-to-close."""
+        side_n = (side or "buy").lower().strip()
+        short = side_n in {"sell", "short"}
+        sl, tp = protective_prices(entry, side_n, atr=self.fetch_atr(symbol))
         sl = self._price(symbol, sl)
         tp = self._price(symbol, tp)
         qty = self._size_amount(symbol, amount, entry)
+        sl_pct = ((sl / entry) - 1.0) * 100.0 if entry else 0.0
+        tp_pct = ((tp / entry) - 1.0) * 100.0 if entry else 0.0
         out: dict[str, Any] = {
             "sl_price": sl,
             "tp_price": tp,
-            "sl_pct": -STOP_LOSS_PCT * 100.0,
-            "tp_pct": TAKE_PROFIT_PCT * 100.0,
+            "sl_pct": sl_pct,
+            "tp_pct": tp_pct,
             "sl_order": None,
             "tp_order": None,
             "sl_error": None,
             "tp_error": None,
         }
         is_swap = self._is_swap(symbol)
+        close_side = "buy" if short else "sell"
+        hold = "short" if short else "long"
         close = {
             "reduceOnly": True,
             "marginMode": "crossed",
             "tradeSide": "close",
             "hedged": True,
-            "holdSide": "long",
+            "holdSide": hold,
         }
 
         sl_attempts: list[tuple[str, Any, dict[str, Any]]] = []
         if is_swap:
             sl_attempts = [
-                ("market", None, {**close, "stopLossPrice": sl}),
-                ("stop", sl, {**close, "stopPrice": sl}),
-                ("stop_market", None, {**close, "stopPrice": sl}),
+                ("market", None, {**close, "stopLossPrice": sl, "presetStopLossPrice": sl}),
+                ("stop", sl, {**close, "stopPrice": sl, "triggerPrice": sl}),
+                ("stop_market", None, {**close, "stopPrice": sl, "triggerPrice": sl}),
+                (
+                    "market",
+                    None,
+                    {**close, "triggerPrice": sl, "planType": "loss_plan", "triggerType": "mark_price"},
+                ),
+                (
+                    "market",
+                    None,
+                    {**close, "triggerPrice": sl, "planType": "pos_loss", "triggerType": "mark_price"},
+                ),
             ]
         else:
             sl_attempts = [
-                ("stop_market", None, {"stopPrice": sl}),
-                ("stop", sl, {"stopPrice": sl}),
+                ("stop_market", None, {"stopPrice": sl, "triggerPrice": sl}),
+                ("stop", sl, {"stopPrice": sl, "triggerPrice": sl}),
                 ("market", None, {"stopLossPrice": sl}),
             ]
-        sl_order, sl_err = self._first_order(symbol, "sell", qty, sl_attempts)
+        sl_order, sl_err = self._first_order(symbol, close_side, qty, sl_attempts)
         out["sl_order"] = _slim_order(sl_order) if sl_order else None
         out["sl_error"] = sl_err
 
         tp_attempts: list[tuple[str, Any, dict[str, Any]]] = []
         if is_swap:
             tp_attempts = [
-                ("limit", tp, {**close, "takeProfitPrice": tp}),
+                ("limit", tp, {**close, "takeProfitPrice": tp, "presetTakeProfitPrice": tp}),
                 ("limit", tp, close),
+                (
+                    "market",
+                    None,
+                    {**close, "triggerPrice": tp, "planType": "profit_plan", "triggerType": "mark_price"},
+                ),
+                (
+                    "market",
+                    None,
+                    {**close, "triggerPrice": tp, "planType": "pos_profit", "triggerType": "mark_price"},
+                ),
             ]
         else:
             tp_attempts = [
                 ("limit", tp, {"timeInForce": "GTC"}),
                 ("limit", tp, {"takeProfitPrice": tp}),
             ]
-        tp_order, tp_err = self._first_order(symbol, "sell", qty, tp_attempts)
+        tp_order, tp_err = self._first_order(symbol, close_side, qty, tp_attempts)
         out["tp_order"] = _slim_order(tp_order) if tp_order else None
         out["tp_error"] = tp_err
         return out
@@ -813,6 +884,255 @@ class BitgetPaperConnector:
                 "error": None,
             }
         return {"open": False, "source": "spot", "symbol": symbol, "contracts": held}
+
+    def fetch_atr(self, symbol: str, timeframe: str = "1h", period: int = 14) -> float | None:
+        """True-range ATR from live Demo OHLCV. None if the venue has no candles."""
+        try:
+            rows = self._ccxt(
+                lambda: self.exchange.fetch_ohlcv(symbol, timeframe, limit=max(period + 2, 16)),
+                label="bitget.ohlcv.atr",
+            )
+        except Exception:
+            return None
+        if not isinstance(rows, list) or len(rows) < 3:
+            return None
+        trs: list[float] = []
+        for i in range(1, len(rows)):
+            try:
+                high = float(rows[i][2])
+                low = float(rows[i][3])
+                prev_close = float(rows[i - 1][4])
+            except (TypeError, ValueError, IndexError):
+                continue
+            trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+        window = trs[-period:] if trs else []
+        if not window:
+            return None
+        return sum(window) / float(len(window))
+
+    def fetch_open_book(self) -> list[dict[str, Any]]:
+        """Every live Demo position with mark, entry, and unrealized PnL."""
+        raw: list[Any] = []
+        errors: list[str] = []
+        try:
+            raw = list(
+                self._ccxt(lambda: self.exchange.fetch_positions(), label="bitget.fetch_positions.book")
+                or []
+            )
+        except Exception as exc:
+            errors.append(str(exc)[:160])
+        book: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for pos in raw:
+            snap = normalize_position(pos)
+            if not snap or not snap.get("open"):
+                continue
+            key = f"{snap['symbol']}|{snap['side']}"
+            if key in seen:
+                continue
+            seen.add(key)
+            book.append(snap)
+        if not book:
+            for symbol in list(self.universe or [])[:40]:
+                try:
+                    spot = self._spot_base_holding(symbol)
+                except Exception:
+                    continue
+                if not spot.get("open"):
+                    continue
+                mark = coerce_price((self.fetch_ticker(symbol) or {}).get("last"))
+                qty = float(spot.get("contracts") or 0.0)
+                entry = coerce_price(spot.get("entry_price"), mark)
+                pnl_usdt, pnl_pct = unrealized_pnl(entry, mark, qty, "buy")
+                book.append(
+                    {
+                        "open": True,
+                        "source": "spot",
+                        "symbol": symbol,
+                        "side": "buy",
+                        "contracts": qty,
+                        "entry_price": entry,
+                        "mark_price": mark,
+                        "pnl_usdt": pnl_usdt,
+                        "pnl_pct": pnl_pct,
+                        "raw": spot.get("raw") or {},
+                        "error": None,
+                    }
+                )
+        if errors and not book:
+            return [{"open": False, "error": " | ".join(errors), "symbol": "", "side": "none"}]
+        return book
+
+    def close_market(
+        self,
+        symbol: str,
+        *,
+        fraction: float = 1.0,
+        reason: str = "manual",
+        side: str | None = None,
+    ) -> dict[str, Any]:
+        """Reduce-only market close. Never opens a new book."""
+        with self._order_lock:
+            return self._close_market(symbol, fraction=fraction, reason=reason, side=side)
+
+    def _close_market(
+        self,
+        symbol: str,
+        *,
+        fraction: float = 1.0,
+        reason: str = "manual",
+        side: str | None = None,
+    ) -> dict[str, Any]:
+        if not self.sandbox:
+            raise RuntimeError("REFUSING live close — sandbox lock tripped")
+        existing = self.fetch_open_position(symbol)
+        if side:
+            wanted = _norm_side(side)
+            got = _norm_side(str(existing.get("side") or ""))
+            if got and wanted and got != wanted and existing.get("open"):
+                # still close the live book on this symbol
+                pass
+        if not existing.get("open"):
+            return {
+                "ok": False,
+                "status": "FLAT",
+                "symbol": symbol,
+                "error": "No open position",
+                "pnl_usdt": 0.0,
+                "pnl_pct": 0.0,
+            }
+        pos_side = _norm_side(str(existing.get("side") or side or "buy"))
+        qty = float(existing.get("contracts") or 0.0) * max(0.0, min(1.0, float(fraction)))
+        entry = coerce_price(existing.get("entry_price"), (existing.get("raw") or {}).get("entryPrice"))
+        ticker = self.fetch_ticker(symbol)
+        mark = coerce_price(ticker.get("last"), ticker.get("bid"), ticker.get("ask"), entry)
+        if qty <= 0:
+            return {
+                "ok": False,
+                "status": "FLAT",
+                "symbol": symbol,
+                "error": "Quantity is zero",
+                "pnl_usdt": 0.0,
+                "pnl_pct": 0.0,
+            }
+        qty = self._size_amount(symbol, qty, mark or entry or 1.0)
+        close_side = "buy" if pos_side in {"sell", "short"} else "sell"
+        is_swap = self._is_swap(symbol)
+        hold = "short" if close_side == "buy" else "long"
+        param_sets: list[dict[str, Any]] = [{}]
+        if is_swap:
+            param_sets = [
+                {
+                    "reduceOnly": True,
+                    "marginMode": "crossed",
+                    "tradeSide": "close",
+                    "hedged": True,
+                    "holdSide": hold,
+                },
+                {
+                    "reduceOnly": True,
+                    "marginMode": "crossed",
+                    "tradeSide": "close",
+                    "holdSide": hold,
+                },
+                {"reduceOnly": True, "holdSide": hold},
+                {"reduceOnly": True},
+            ]
+        balance_before = self._snapshot_usdt()
+        record: dict[str, Any] = {
+            "id": str(uuid.uuid4()),
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "venue": "bitget-demo",
+            "sandbox": True,
+            "live_trading": False,
+            "symbol": symbol,
+            "side": close_side,
+            "position_side": pos_side,
+            "amount": qty,
+            "reason": reason,
+            "entry_price": entry,
+            "price": mark,
+            "mark_price": mark,
+        }
+        try:
+            order = None
+            last_exc: Exception | None = None
+            for params in param_sets:
+                try:
+                    order = self._ccxt(
+                        lambda p=params: self.exchange.create_order(
+                            symbol, "market", close_side, qty, None, p
+                        ),
+                        label="bitget.close_market",
+                    )
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    continue
+            if order is None:
+                raise last_exc or RuntimeError("close_market failed")
+            fill = coerce_price(order.get("average"), order.get("price"), mark)
+            pnl_usdt, pnl_pct = unrealized_pnl(entry, fill, qty, pos_side)
+            record.update(
+                {
+                    "ok": True,
+                    "status": "CLOSED" if fraction >= 0.999 else "PARTIAL",
+                    "order_id": order.get("id"),
+                    "raw_order": _slim_order(order),
+                    "price": fill,
+                    "pnl_usdt": round(pnl_usdt, 6),
+                    "pnl_pct": round(pnl_pct, 4),
+                    "notional_usdt": round(abs(fill * qty), 6),
+                }
+            )
+            self._apply_balance_change(record, balance_before=balance_before, filled=True)
+        except Exception as exc:
+            pnl_usdt, pnl_pct = unrealized_pnl(entry, mark, qty, pos_side)
+            record.update(
+                {
+                    "ok": False,
+                    "status": "ERROR",
+                    "error": str(exc)[:400],
+                    "pnl_usdt": round(pnl_usdt, 6),
+                    "pnl_pct": round(pnl_pct, 4),
+                    "notional_usdt": round(abs((mark or 0.0) * qty), 6),
+                }
+            )
+            self._apply_balance_change(record, balance_before=balance_before, filled=False)
+        log_path = _append_trade(record)
+        record["log_path"] = str(log_path)
+        return record
+
+    def close_all(self, *, reason: str = "closeall") -> list[dict[str, Any]]:
+        with self._order_lock:
+            return self._close_all(reason=reason)
+
+    def _close_all(self, *, reason: str = "closeall") -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        for pos in self.fetch_open_book():
+            if not pos.get("open"):
+                continue
+            try:
+                results.append(
+                    self.close_market(
+                        str(pos.get("symbol")),
+                        fraction=1.0,
+                        reason=reason,
+                        side=str(pos.get("side") or ""),
+                    )
+                )
+            except Exception as exc:
+                results.append(
+                    {
+                        "ok": False,
+                        "status": "ERROR",
+                        "symbol": pos.get("symbol"),
+                        "error": str(exc)[:240],
+                        "pnl_usdt": 0.0,
+                        "pnl_pct": 0.0,
+                    }
+                )
+        return results
 
     def _is_swap(self, symbol: str) -> bool:
         try:
@@ -946,9 +1266,99 @@ def _universe_sort_key(symbol: str) -> tuple[int, str]:
     return (rtoken, swap, raw)
 
 
-def protective_prices(entry: float) -> tuple[float, float]:
+def protective_prices(
+    entry: float,
+    side: str = "buy",
+    atr: float | None = None,
+) -> tuple[float, float]:
+    """SL/TP prices. Longs: SL below / TP above. Shorts: SL above / TP below.
+
+    When ATR is available, distance is 1.5× ATR (floored/capped) and TP is 2.5× SL.
+    """
     px = float(entry)
-    return px * (1.0 - STOP_LOSS_PCT), px * (1.0 + TAKE_PROFIT_PCT)
+    sl_pct = STOP_LOSS_PCT
+    tp_pct = TAKE_PROFIT_PCT
+    if atr is not None and px > 0:
+        try:
+            atr_pct = abs(float(atr)) / px
+        except (TypeError, ValueError):
+            atr_pct = 0.0
+        if atr_pct > 0:
+            sl_pct = min(ATR_SL_PCT_CAP, max(ATR_SL_PCT_FLOOR, atr_pct * ATR_SL_MULT))
+            tp_pct = min(ATR_TP_PCT_CAP, max(ATR_TP_PCT_FLOOR, sl_pct * ATR_TP_MULT))
+    if _norm_side(side) in {"sell", "short"}:
+        return px * (1.0 + sl_pct), px * (1.0 - tp_pct)
+    return px * (1.0 - sl_pct), px * (1.0 + tp_pct)
+
+
+def unrealized_pnl(entry: float, mark: float, qty: float, side: str) -> tuple[float, float]:
+    """Return (pnl_usdt, pnl_pct). Shorts profit when mark falls."""
+    try:
+        entry_f = float(entry or 0.0)
+        mark_f = float(mark or 0.0)
+        qty_f = abs(float(qty or 0.0))
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+    if entry_f <= 0 or qty_f <= 0 or mark_f <= 0:
+        return 0.0, 0.0
+    if _norm_side(side) in {"sell", "short"}:
+        usdt = (entry_f - mark_f) * qty_f
+        pct = ((entry_f - mark_f) / entry_f) * 100.0
+    else:
+        usdt = (mark_f - entry_f) * qty_f
+        pct = ((mark_f - entry_f) / entry_f) * 100.0
+    return round(usdt, 8), round(pct, 6)
+
+
+def _norm_side(side: str) -> str:
+    raw = (side or "").strip().lower()
+    if raw in {"sell", "short"}:
+        return "sell"
+    if raw in {"buy", "long"}:
+        return "buy"
+    return raw
+
+
+def normalize_position(pos: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(pos, dict):
+        return None
+    symbol = str(pos.get("symbol") or "")
+    qty = _position_contracts(pos)
+    info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
+    side = _norm_side(str(pos.get("side") or info.get("holdSide") or info.get("posSide") or ""))
+    if not symbol or qty <= 0 or side in {"flat", "none", "closed", ""}:
+        return None
+    entry = coerce_price(pos.get("entryPrice"), info.get("openPriceAvg"), pos.get("markPrice"))
+    mark = coerce_price(pos.get("markPrice"), pos.get("entryPrice"), entry)
+    pnl_usdt = pos.get("unrealizedPnl")
+    try:
+        pnl_usdt_f = float(pnl_usdt) if pnl_usdt not in (None, "") else None
+    except (TypeError, ValueError):
+        pnl_usdt_f = None
+    pnl_pct = pos.get("percentage")
+    try:
+        pnl_pct_f = float(pnl_pct) if pnl_pct not in (None, "") else None
+    except (TypeError, ValueError):
+        pnl_pct_f = None
+    if pnl_usdt_f is None or pnl_pct_f is None:
+        calc_usdt, calc_pct = unrealized_pnl(entry, mark, qty, side)
+        if pnl_usdt_f is None:
+            pnl_usdt_f = calc_usdt
+        if pnl_pct_f is None:
+            pnl_pct_f = calc_pct
+    return {
+        "open": True,
+        "source": "positions",
+        "symbol": symbol,
+        "side": side,
+        "contracts": qty,
+        "entry_price": entry,
+        "mark_price": mark,
+        "pnl_usdt": round(float(pnl_usdt_f or 0.0), 6),
+        "pnl_pct": round(float(pnl_pct_f or 0.0), 4),
+        "raw": _slim_position(pos),
+        "error": None,
+    }
 
 
 def _fill_price(order: dict[str, Any], last: float) -> float:

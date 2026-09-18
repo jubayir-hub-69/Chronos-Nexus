@@ -27,7 +27,7 @@ Output JSON only with keys:
 - consensus: UNANIMOUS | MAJORITY | VETOED
 Hard rules the Python chair will also enforce:
 - VETO → STAND_DOWN / VETOED (including Illiquid Market / High Spread)
-- ORACLE idle (primary_symbol=NONE, side=none, conviction=0, or OpenRouter timeout) → STAND_DOWN
+- ORACLE idle (primary_symbol=NONE, side=none, conviction=0, or Qwen timeout) → STAND_DOWN
 - No live last price → STAND_DOWN / DEGRADED
 - CLEAR or REDUCE → EXECUTE (REDUCE already cut size; it is not a veto)
 - NEVER invent NVDA or a BUY when ORACLE stood down.
@@ -82,10 +82,10 @@ class ExecutiveAgent:
             ),
         }
         if API_QUOTA_VETO in f"{brief.rationale} {risk.rationale}":
-            print(f"[API ERROR] CHAIRMAN skipping OpenRouter - Qwen — {API_QUOTA_VETO}", flush=True)
+            print(f"[API ERROR] CHAIRMAN skipping Bitget Hackathon - Qwen 3.8 Max — {API_QUOTA_VETO}", flush=True)
             payload, degraded = fallback, True
         elif API_TIMEOUT_VETO in f"{brief.rationale} {risk.rationale}":
-            print(f"[API ERROR] CHAIRMAN skipping OpenRouter - Qwen — {API_TIMEOUT_VETO}", flush=True)
+            print(f"[API ERROR] CHAIRMAN skipping Bitget Hackathon - Qwen 3.8 Max — {API_TIMEOUT_VETO}", flush=True)
             payload, degraded = fallback, True
         else:
             try:

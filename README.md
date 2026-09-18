@@ -22,7 +22,7 @@
 Bitget AI Base Camp Hackathon S2 · Track: **Agentic Trading** · Sub-theme: **Event-Driven Agent** · Mode: **Paper / Demo only** · Version: **0.6.0-glasshouse**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![OpenRouter Qwen](https://img.shields.io/badge/OpenRouter-Qwen%20(45s%20%2F%20429%20stand--down)-8E75B2?style=for-the-badge)](https://openrouter.ai/)
+[![Bitget Qwen 3.8 Max](https://img.shields.io/badge/Bitget-Hackathon%20Qwen%203.8%20Max-00C3A5?style=for-the-badge)](https://bitget-ai.gitbook.io/bitgetai_hackathons2#qwen-token-subsidy-during-the-hackathon)
 [![Bitget Paper Trading](https://img.shields.io/badge/Bitget-Paper%20Trading%20%7C%20PAPTRADING%3D1-00C3A5?style=for-the-badge)](https://www.bitget.com/api-doc/classic/demotrading/restapi)
 [![Arbitrum Sepolia](https://img.shields.io/badge/Arbitrum-Sepolia%20421614-28A0F0?style=for-the-badge)](https://sepolia.arbiscan.io/)
 [![Telegram Glasshouse](https://img.shields.io/badge/Telegram-Glasshouse%20Observability-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://core.telegram.org/bots/api)
@@ -61,8 +61,8 @@ This is a production-shaped Event-Driven Agent, not a single-shot script. The CI
 | **1** | **True 24/7 autonomous daemon** | `while True` hourly cycles. No `input("Press Enter")`. Cycle faults sleep 5 minutes and recover. Ctrl+C is the only shutdown. |
 | **2** | **Unlimited market universe** | Boot + each cycle call CCXT `load_markets()` and discover **all** Bitget Demo equity / stock-perp / rToken listings. ORACLE may pick any listed name, or `NONE`. |
 | **3** | **GitBook paper log** | Every row in `data/logs/trades.json` carries `timestamp`, `instrument`, `direction`, `quantity`, `price`, and `account_balance_change`. `price` is never null. Wallet Δ is live USDT before/after a fill, else simulated margin + taker fee. |
-| **4** | **Glasshouse Telegram** | Live HTML alerts: market wire, Stay Away, rationale-backed EXECUTE, exact-reason VETO, API timeout, OpenRouter quota stand-down. |
-| **5** | **OpenRouter - Qwen safe** | **45s** OpenRouter hard timeout. **503 / 429 quota** stand down to `NONE`. The daemon keeps running. |
+| **4** | **Glasshouse Telegram** | Live HTML alerts: market wire, Stay Away, rationale-backed EXECUTE, exact-reason VETO, API timeout, Qwen quota stand-down. |
+| **5** | **Bitget Hackathon - Qwen 3.8 Max** | **45s** Qwen proxy hard timeout. **503 / 429 quota** stand down to `NONE`. The daemon keeps running. |
 
 ```
  LIVE RSS (Yahoo / CNBC / MarketWatch / CoinTelegraph)
@@ -100,7 +100,7 @@ This is a production-shaped Event-Driven Agent, not a single-shot script. The CI
 
 Weekend geopolitics, supply-chain shocks, and sector leaks hit the tape while cash equity is closed. Human desks wait for Sunday night futures. rTokens already moved.
 
-Chronos-Nexus runs that window as an **event → debate → risk clearance → on-chain Proof of Thought → guarded paper execution** loop — **every hour, unattended**, on **OpenRouter - Qwen**. The trade is a **directional** paper ticket on the name the news actually maps to, not a basis harvest.
+Chronos-Nexus runs that window as an **event → debate → risk clearance → on-chain Proof of Thought → guarded paper execution** loop — **every hour, unattended**, on **Bitget Hackathon - Qwen 3.8 Max**. The trade is a **directional** paper ticket on the name the news actually maps to, not a basis harvest.
 
 | Pain | What the Nexus does |
 |---|---|
@@ -114,7 +114,7 @@ Chronos-Nexus runs that window as an **event → debate → risk clearance → o
 | Free-tier daemons “crash” at quota | **429 / Resource Exhausted** → exact Telegram stand-down, daemon keeps running |
 | Hackathon / evaluation risk | Bitget **Demo only** (`set_sandbox_mode(True)`, `PAPTRADING=1`) |
 
-**Live E2E (this repo):** OpenRouter - Qwen (`qwen/qwen-2.5-72b-instruct`) · board debate completed · Sepolia attestation mined · Bitget Demo paper orders submitted on listed stock perps. Subsequent live tests confirmed **NONE stand-down** (no NVDA default) when the tape or the model is not actionable.
+**Live E2E (this repo):** Bitget Hackathon - Qwen 3.8 Max (`qwen3.8-max`) · board debate completed · Sepolia attestation mined · Bitget Demo paper orders submitted on listed stock perps. Subsequent live tests confirmed **NONE stand-down** (no NVDA default) when the tape or the model is not actionable.
 
 ---
 
@@ -181,7 +181,7 @@ Event → decision → execution (required Agentic Trading demonstration):
 | SENTINEL `VETO` | `STAND_DOWN` | Zero — Python overrides the model |
 | ORACLE idle (`NONE` / `none` / conviction 0) | `STAND_DOWN` | Zero — not a risk veto, a clean pass |
 | API timeout / 503 / parser fault | `STAND_DOWN` | Zero — degraded closed |
-| OpenRouter **429 quota** | `STAND_DOWN` | Zero — wait for reset, daemon stays up |
+| Qwen **429 quota** | `STAND_DOWN` | Zero — wait for reset, daemon stays up |
 | No live last price | `STAND_DOWN` | Zero |
 
 ```mermaid
@@ -217,7 +217,7 @@ flowchart LR
 3. [True 24/7 autonomous daemon](#1-true-247-autonomous-daemon)
 4. [Unlimited market universe](#2-unlimited-market-universe)
 5. [Glasshouse Telegram observability](#3-glasshouse-telegram-observability)
-6. [Bulletproof resilience & OpenRouter quota](#4-bulletproof-resilience--openrouter-quota)
+6. [Bulletproof resilience & Qwen quota](#4-bulletproof-resilience--qwen-quota)
 7. [Testnet / paper-trading compliance](#5-testnet--paper-trading-compliance)
 8. [Quickstart](#6-quickstart--setup)
 9. [Verifiable audit trail](#7-verifiable-audit-trail--on-chain-proofs)
@@ -231,7 +231,7 @@ flowchart LR
 
 `main.py` is a CIC, not a one-shot demo.
 
-- **Phases 0–2** (compliance, OpenRouter - Qwen cortex, Bitget + Sepolia rails) boot **once**.
+- **Phases 0–2** (compliance, Bitget Hackathon - Qwen 3.8 Max cortex, Bitget + Sepolia rails) boot **once**.
 - **Phases 3–5** (live ingest → board debate → attest + paper execute) run inside `while True`.
 - After each cycle: `time.sleep(3600)` — hourly trading.
 - Any cycle exception: log, Telegram API-fault alert, `time.sleep(300)`, continue. The process does not die.
@@ -278,32 +278,32 @@ The bot is a live terminal, not a fill ping. Disarmed if `TELEGRAM_BOT_TOKEN` or
 | **EXECUTE** | Symbol, side, amount, SL −2%, TP +5%, order id, Arbiscan proof, and **why this name beat the rest of the tape** |
 | **VETO / skipped** | Exact reason (spread, crossed book, position already open, margin, venue error) |
 | **API timeout / 503** | Parser-safe stand-down: `primary_symbol=NONE`, `side=none`, `conviction=0` |
-| **OpenRouter quota (429)** | Exact text: *OpenRouter API quota reached. System safely standing down until limits reset.* |
+| **Qwen quota (429)** | Exact text: *Bitget Qwen API quota reached. System safely standing down until limits reset.* |
 
 ---
 
-## 4. Bulletproof resilience & OpenRouter quota
+## 4. Bulletproof resilience & Qwen quota
 
-The daemon is designed to live on **OpenRouter - Qwen** for a multi-day eval. Quota is not a crash. It is a weather report.
+The daemon is designed to live on **Bitget Hackathon - Qwen 3.8 Max** for a multi-day eval. Quota is not a crash. It is a weather report.
 
 | Fault | Behaviour |
 |---|---|
-| OpenRouter hung | **45s** hard cap (`LLM_TIMEOUT_S`) via SDK timeout + daemon-thread join |
+| Qwen proxy hung | **45s** hard cap (`LLM_TIMEOUT_S`) via SDK timeout + daemon-thread join |
 | Truncated JSON / unescaped quotes in RSS-echoed strings | `JSONDecodeError` caught as **parser fault** → fallback dict, no `Unterminated string` bleed |
 | **503 UNAVAILABLE** (high demand) | Stand down to `NONE` / `none` / `0` |
-| **429 Resource Exhausted / quota exceeded** | Rationale **exactly**: `OpenRouter API quota reached. System safely standing down until limits reset.` Telegram broadcasts that sentence. Hourly loop keeps running. |
+| **429 Resource Exhausted / quota exceeded** | Rationale **exactly**: `Bitget Qwen API quota reached. System safely standing down until limits reset.` Telegram broadcasts that sentence. Hourly loop keeps running. |
 | No actionable listed name | Same idle path — never default to NVDA, never assume BUY |
 | Missing / dark L2 book | Fail-safe **illiquid veto** (unmeasured spread is not “fine”) |
 | Spread **> 1.5%** | Binding `Illiquid Market / High Spread` |
 | Open long **or** short | `POSITION_ALREADY_OPEN` — no stacked book |
 
-ORACLE, SENTINEL, and CHAIRMAN **skip further OpenRouter - Qwen calls** once quota or timeout is latched, so a rate-limit window is not burned by three agents retrying the same 429.
+ORACLE, SENTINEL, and CHAIRMAN **skip further Bitget Hackathon - Qwen 3.8 Max calls** once quota or timeout is latched, so a rate-limit window is not burned by three agents retrying the same 429.
 
 External rails sit behind exponential backoff (`core/retry.py`: 3 attempts, 0.75s base, 6s cap). Auth failures and insufficient margin are **not** retried.
 
-### OpenRouter - Qwen model
+### Bitget Hackathon - Qwen 3.8 Max model
 
-`QWEN_MODEL` is read from `.env`. If empty or `auto`, the cortex falls back to `qwen/qwen-2.5-72b-instruct`. The client is the standard `openai` package pointed at `https://openrouter.ai/api/v1`.
+`QWEN_MODEL` is read from `.env`. If empty or `auto`, the cortex falls back to `qwen3.8-max`. The client is the standard `openai` package pointed at `https://hackathon.bitgetops.com/v1` with `QWEN_API_KEY`.
 
 Quota and hard timeouts **stop further model attempts**.
 
@@ -340,7 +340,7 @@ Evaluators: claim **Bitget Demo virtual USDT** before a fill is possible. An unf
 ### Prerequisites
 
 - Python **3.10+** (verified on 3.12)
-- An [OpenRouter API key](https://openrouter.ai/keys) — Qwen via the OpenAI-compatible API
+- A Bitget hackathon `QWEN_API_KEY` (admin-provisioned Qwen 3.8 Max / `qwen3.8-max`)
 - Bitget **Demo** API key + secret + passphrase
 - An Arbitrum **Sepolia** account with a small ETH balance (faucet) for 0-value txs
 - Virtual Demo USDT claimed on Bitget Demo (required for a fill)
@@ -362,8 +362,8 @@ cp .env.example .env   # Windows: copy .env.example .env
 ### Configure `.env`
 
 ```dotenv
-OPENROUTER_API_KEY=your_openrouter_key
-QWEN_MODEL=qwen/qwen-2.5-72b-instruct
+QWEN_API_KEY=your_bitget_qwen_api_key
+QWEN_MODEL=qwen3.8-max
 
 BITGET_API_KEY=your_demo_api_key
 BITGET_API_SECRET=your_demo_secret
@@ -390,7 +390,7 @@ python main.py
 Expected lifecycle:
 
 1. Kernel / compliance lock
-2. OpenRouter - Qwen cortex (**45s** timeout)
+2. Bitget Hackathon - Qwen 3.8 Max cortex (**45s** timeout)
 3. Bitget Demo + Arbitrum Sepolia health + **live universe count**
 4. Hourly cycle: live RSS → ORACLE → SENTINEL → CHAIRMAN
 5. Telegram glasshouse dispatch
@@ -472,8 +472,8 @@ Chronos-Nexus/
 │   ├── risk_manager.py          # SENTINEL — veto + L2 spread > 1.5% + dark-book fail-safe
 │   └── executive.py             # CHAIRMAN — memory, attest, execute
 ├── core/
-│   ├── config.py                # dotenv, paper lock, OpenRouter - Qwen, Telegram
-│   ├── llm.py                   # openai → OpenRouter · 45s timeout · 503/429/parser-fault stand-down
+│   ├── config.py                # dotenv, paper lock, Bitget hackathon Qwen 3.8 Max, Telegram
+│   ├── llm.py                   # openai → hackathon.bitgetops.com/v1 · 45s timeout · 503/429/parser-fault stand-down
 │   ├── memory.py                # last-5 ring buffer → data/history.json
 │   ├── retry.py                 # exponential backoff for every rail
 │   └── schemas.py               # Pydantic board contracts (side includes none)
@@ -494,7 +494,7 @@ Chronos-Nexus/
 
 ## Disclaimer
 
-Chronos-Nexus is research / hackathon software. The wire is **live RSS**, not a licensed news terminal. Tokenized equity products and Demo listings differ by region and account. Stop-loss / take-profit placement depends on Bitget Demo order-type support; prices are always recorded even if a venue rejects the protective ticket. OpenRouter quota is a hard platform limit — the desk stands down until it resets. Nothing here is investment advice. Do not point this process at live keys unless you have lifted the documented gates and accept the loss.
+Chronos-Nexus is research / hackathon software. The wire is **live RSS**, not a licensed news terminal. Tokenized equity products and Demo listings differ by region and account. Stop-loss / take-profit placement depends on Bitget Demo order-type support; prices are always recorded even if a venue rejects the protective ticket. Qwen quota is a hard platform limit — the desk stands down until it resets. Nothing here is investment advice. Do not point this process at live keys unless you have lifted the documented gates and accept the loss.
 
 ---
 

@@ -158,7 +158,7 @@ class RetryTests(unittest.TestCase):
             slept.assert_not_called()
 
 
-class OpenRouterTimeoutTests(unittest.TestCase):
+class QwenTimeoutTests(unittest.TestCase):
     def test_hard_timeout_does_not_hang(self) -> None:
         import time
 
@@ -168,7 +168,7 @@ class OpenRouterTimeoutTests(unittest.TestCase):
 
         t0 = time.perf_counter()
         with self.assertRaises(TimeoutError):
-            _run_with_timeout(hang, timeout=0.25, label="openrouter:test")
+            _run_with_timeout(hang, timeout=0.25, label="qwen:test")
         self.assertLess(time.perf_counter() - t0, 2.0)
 
     def test_timeout_is_forty_five_seconds(self) -> None:
@@ -233,7 +233,8 @@ class OpenRouterTimeoutTests(unittest.TestCase):
 
     def test_429_quota_stand_down_is_not_a_crash(self) -> None:
         self.assertTrue(is_quota_fault(RuntimeError("429 RESOURCE_EXHAUSTED quota exceeded")))
-        self.assertTrue(is_quota_fault("OpenRouter API quota reached. System safely standing down until limits reset."))
+        self.assertTrue(is_quota_fault(RuntimeError("Throttling.RateQuota flow control")))
+        self.assertTrue(is_quota_fault("Bitget Qwen API quota reached. System safely standing down until limits reset."))
         out = _timeout_fallback(
             {
                 "verdict": "CLEAR",
@@ -252,7 +253,7 @@ class OpenRouterTimeoutTests(unittest.TestCase):
         self.assertEqual(out["thesis"], API_QUOTA_VETO)
         self.assertEqual(
             API_QUOTA_VETO,
-            "OpenRouter API quota reached. System safely standing down until limits reset.",
+            "Bitget Qwen API quota reached. System safely standing down until limits reset.",
         )
 
     def test_generate_json_quota_returns_fallback(self) -> None:
@@ -311,6 +312,23 @@ class OpenRouterTimeoutTests(unittest.TestCase):
         payload = _parse_json(_response_text(response))
         self.assertEqual(payload["action"], "STAND_DOWN")
         self.assertEqual(payload["consensus"], "VETOED")
+
+    def test_responses_output_text_is_parsed(self) -> None:
+        from types import SimpleNamespace
+
+        response = SimpleNamespace(
+            choices=None,
+            output_text='{"verdict": "CLEAR", "rationale": "responses wire"}',
+            output=[
+                SimpleNamespace(
+                    type="reasoning",
+                    content=[{"text": "internal chain of thought"}],
+                )
+            ],
+        )
+        payload = _parse_json(_response_text(response))
+        self.assertEqual(payload["verdict"], "CLEAR")
+        self.assertEqual(payload["rationale"], "responses wire")
 
 
 class TelegramTests(unittest.TestCase):

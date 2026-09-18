@@ -5,7 +5,7 @@
 # --- Terminal UI ---
 rich>=13.9.4
 
-# --- LLM cortex: OpenRouter - Qwen (openai SDK, OpenAI-compatible) ---
+# --- LLM cortex: Bitget hackathon Qwen 3.8 Max via openai SDK (https://hackathon.bitgetops.com/v1) ---
 openai>=1.68.0
 python-dotenv>=1.1.0
 
@@ -22,3 +22,6 @@ pydantic-settings>=2.8.0
 # --- Live financial wire (RSS) ---
 feedparser>=6.0.11
 requests>=2.32.3
+
+# --- Telegram PnL cards ---
+pillow>=11.0.0

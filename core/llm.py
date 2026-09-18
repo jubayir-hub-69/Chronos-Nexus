@@ -1,4 +1,4 @@
-"""OpenRouter - Qwen cortex used by the Board of Directors."""
+"""Bitget Hackathon - Qwen 3.8 Max cortex used by the Board of Directors."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from typing import Any, Callable, TypeVar
 
 from core.config import (
     CORTEX_BACKEND_LABEL,
+    QWEN_BASE_URL,
     DEFAULT_QWEN_MODEL,
-    OPENROUTER_BASE_URL,
     Settings,
     normalize_model_name,
 )
@@ -22,7 +22,7 @@ _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.DOTALL)
 LLM_TIMEOUT_S = 45
 API_TIMEOUT_VETO = "VETO: API Timeout"
 API_QUOTA_VETO = (
-    "OpenRouter API quota reached. System safely standing down until limits reset."
+    "Bitget Qwen API quota reached. System safely standing down until limits reset."
 )
 
 T = TypeVar("T")
@@ -36,9 +36,9 @@ def _clean_api_error(exc: BaseException) -> str:
     if _looks_quota(exc):
         return API_QUOTA_VETO
     if _looks_parse_fault(exc):
-        return "parser fault: unusable OpenRouter JSON"
+        return "parser fault: unusable Qwen JSON"
     if _looks_unavailable(exc):
-        return "OpenRouter 503/unavailable — standing down"
+        return "Bitget Qwen 503/unavailable — standing down"
     msg = " ".join(str(exc).split())
     return msg[:400] if msg else type(exc).__name__
 
@@ -97,7 +97,7 @@ def _looks_json_mode_unsupported(exc: BaseException) -> bool:
 
 
 def is_quota_fault(value: Any) -> bool:
-    """True for OpenRouter 429 / quota / rate-limit — not a crash."""
+    """True for Bitget Qwen 429 / quota / rate-limit — not a crash."""
     if isinstance(value, BaseException):
         blob = _exc_blob(value)
     else:
@@ -110,6 +110,9 @@ def is_quota_fault(value: Any) -> bool:
             "rate limit",
             "rate_limit",
             "ratelimit",
+            "throttling",
+            "ratequota",
+            "flow control",
             "resource exhausted",
             "resource_exhausted",
             "exceeded your current quota",
@@ -118,6 +121,8 @@ def is_quota_fault(value: Any) -> bool:
             "free tier",
             "insufficient_quota",
             "credits",
+            "arrearage",
+            "allocationquota",
         )
     )
 
@@ -153,10 +158,10 @@ def _run_with_timeout(fn: Callable[[], T], *, timeout: float, label: str) -> T:
     def _worker() -> None:
         try:
             box["ok"] = fn()
-        except Exception as exc:  # noqa: BLE001 — surface the real OpenRouter fault
+        except Exception as exc:  # noqa: BLE001 — surface the real Qwen proxy fault
             box["err"] = exc
 
-    thread = threading.Thread(target=_worker, daemon=True, name="openrouter-timeout")
+    thread = threading.Thread(target=_worker, daemon=True, name="qwen-timeout")
     thread.start()
     thread.join(timeout=timeout)
     if thread.is_alive():
@@ -169,7 +174,7 @@ def _run_with_timeout(fn: Callable[[], T], *, timeout: float, label: str) -> T:
 
 
 class QwenCortex:
-    """Thin adapter over the OpenAI SDK pointed at OpenRouter (Qwen)."""
+    """Thin adapter over the OpenAI SDK pointed at the Bitget hackathon Qwen proxy."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -183,30 +188,40 @@ class QwenCortex:
         self._bind()
 
     def _bind(self) -> None:
-        key = (self.settings.openrouter_api_key or "").strip()
+        key = (self.settings.qwen_api_key or "").strip()
         if not key:
             self.backend = "offline"
-            print("[CORTEX] OPENROUTER_API_KEY empty — OpenRouter - Qwen offline", flush=True)
+            print(
+                f"[CORTEX] QWEN_API_KEY empty — {CORTEX_BACKEND_LABEL} offline",
+                flush=True,
+            )
             return
         try:
             from openai import OpenAI
         except ImportError as exc:
             raise RuntimeError(
-                "Install openai (pip install openai) to call OpenRouter - Qwen."
+                f"Install openai (pip install openai) to call {CORTEX_BACKEND_LABEL}."
             ) from exc
-        self._client = OpenAI(
-            api_key=key,
-            base_url=OPENROUTER_BASE_URL,
-            timeout=float(LLM_TIMEOUT_S),
-            max_retries=0,
-            default_headers={
-                "HTTP-Referer": "https://github.com/chronos-nexus",
-                "X-Title": "Chronos-Nexus",
-            },
-        )
+        try:
+            self._client = OpenAI(
+                api_key=key,
+                base_url=QWEN_BASE_URL,
+                timeout=float(LLM_TIMEOUT_S),
+                max_retries=0,
+            )
+        except Exception as exc:  # noqa: BLE001 — never crash the CIC on bind
+            self._client = None
+            self.backend = "offline"
+            self.last_error = _clean_api_error(exc)
+            print(
+                f"[API ERROR] {CORTEX_BACKEND_LABEL} bind failed — standing down: {self.last_error}",
+                flush=True,
+            )
+            return
         self.backend = CORTEX_BACKEND_LABEL
         print(
-            f"[CORTEX] running on {CORTEX_BACKEND_LABEL} · {self.selected_model}",
+            f"[CORTEX] running on {CORTEX_BACKEND_LABEL} · {self.selected_model} "
+            "· Responses API · thinking off",
             flush=True,
         )
 
@@ -233,9 +248,9 @@ class QwenCortex:
         try:
             return _parse_json(text), False
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
-            self.last_error = "parser fault: unusable OpenRouter JSON"
+            self.last_error = "parser fault: unusable Qwen JSON"
             print(
-                "[API ERROR] parser fault — OpenRouter JSON unusable (truncated/503). Standing down.",
+                "[API ERROR] parser fault — Qwen JSON unusable (truncated/503). Standing down.",
                 flush=True,
             )
             if fallback is None:
@@ -247,22 +262,20 @@ class QwenCortex:
         try:
             return self._complete(system, user, temperature=temperature, json_mode=False)
         except Exception as exc:
-            self.last_error = str(exc)
+            self.last_error = _clean_api_error(exc)
             _api_error(exc)
             if _looks_quota(exc):
                 return API_QUOTA_VETO
-            if _looks_timeout(exc):
-                return API_TIMEOUT_VETO
-            raise
+            return API_TIMEOUT_VETO
 
     def _complete(self, system: str, user: str, temperature: float, json_mode: bool) -> str:
         if self.backend == "offline" or self._client is None:
-            raise RuntimeError("OPENROUTER_API_KEY is empty")
+            raise RuntimeError("QWEN_API_KEY is empty")
 
         names = _candidate_models(self.model_name)
         last_error: Exception | None = None
         for index, name in enumerate(names):
-            label = f"openrouter:{name}"
+            label = f"qwen:{name}"
             try:
                 text = call_with_backoff(
                     lambda n=name, lab=label: _run_with_timeout(
@@ -295,6 +308,55 @@ class QwenCortex:
         temperature: float,
         json_mode: bool,
     ) -> str:
+        # Official Bitget hackathon proxy is the OpenAI Responses wire
+        # (Codex config: wire_api = "responses"). qwen3.8-max thinks by
+        # default; thinking on a board JSON prompt blows past 45s and the
+        # desk stands down. Disable thinking on every path.
+        try:
+            return self._complete_via_responses(name, system, user, temperature, json_mode)
+        except Exception as exc:
+            if _looks_timeout(exc) or _looks_quota(exc):
+                raise
+            return self._complete_via_chat(name, system, user, temperature, json_mode)
+
+    def _complete_via_responses(
+        self,
+        name: str,
+        system: str,
+        user: str,
+        temperature: float,
+        json_mode: bool,
+    ) -> str:
+        kwargs: dict[str, Any] = {
+            "model": name,
+            "input": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": temperature,
+            "max_output_tokens": 2048,
+            "reasoning": {"effort": "none"},
+            "extra_body": {"enable_thinking": False},
+        }
+        if json_mode:
+            kwargs["text"] = {"format": {"type": "json_object"}}
+        try:
+            response = self._client.responses.create(**kwargs)
+        except Exception as exc:
+            if not json_mode or not _looks_json_mode_unsupported(exc):
+                raise
+            kwargs.pop("text", None)
+            response = self._client.responses.create(**kwargs)
+        return _response_text(response)
+
+    def _complete_via_chat(
+        self,
+        name: str,
+        system: str,
+        user: str,
+        temperature: float,
+        json_mode: bool,
+    ) -> str:
         kwargs: dict[str, Any] = {
             "model": name,
             "messages": [
@@ -303,6 +365,7 @@ class QwenCortex:
             ],
             "temperature": temperature,
             "max_tokens": 2048,
+            "extra_body": {"enable_thinking": False},
         }
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
@@ -397,27 +460,46 @@ def _response_text(response: Any) -> str:
         if text:
             return text
     text = getattr(response, "output_text", None)
-    if text:
-        return str(text)
-    raise RuntimeError("empty OpenRouter response")
+    if callable(text):
+        try:
+            text = text()
+        except Exception:
+            text = None
+    if isinstance(text, str) and text.strip():
+        return text
+    output = getattr(response, "output", None)
+    if output is None and isinstance(response, dict):
+        output = response.get("output")
+    for item in output or []:
+        itype = ""
+        if isinstance(item, dict):
+            itype = str(item.get("type") or "")
+        else:
+            itype = str(getattr(item, "type", "") or type(item).__name__)
+        if "reasoning" in itype.lower():
+            continue
+        text = _message_text(item)
+        if text:
+            return text
+    raise RuntimeError("empty Qwen response")
 
 
 def _parse_json(text: str) -> dict[str, Any]:
     cleaned = _FENCE.sub("", (text or "").strip()).strip()
     if not cleaned:
-        raise ValueError("parser fault: empty OpenRouter JSON")
+        raise ValueError("parser fault: empty Qwen JSON")
     try:
         payload = json.loads(cleaned)
     except json.JSONDecodeError:
         start = cleaned.find("{")
         end = cleaned.rfind("}")
         if start < 0 or end <= start:
-            raise json.JSONDecodeError("parser fault: unterminated OpenRouter JSON", cleaned, 0)
+            raise json.JSONDecodeError("parser fault: unterminated Qwen JSON", cleaned, 0)
         try:
             payload = json.loads(cleaned[start : end + 1])
         except json.JSONDecodeError:
             raise json.JSONDecodeError(
-                "parser fault: unterminated OpenRouter JSON",
+                "parser fault: unterminated Qwen JSON",
                 cleaned,
                 0,
             ) from None
@@ -425,7 +507,7 @@ def _parse_json(text: str) -> dict[str, Any]:
         try:
             payload = json.loads(payload)
         except json.JSONDecodeError as exc:
-            raise ValueError("OpenRouter JSON was not an object") from exc
+            raise ValueError("Qwen JSON was not an object") from exc
     if not isinstance(payload, dict):
-        raise ValueError("OpenRouter JSON was not an object")
+        raise ValueError("Qwen JSON was not an object")
     return payload

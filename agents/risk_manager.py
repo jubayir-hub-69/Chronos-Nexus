@@ -71,7 +71,7 @@ class RiskManagerAgent:
         )
         if API_TIMEOUT_VETO in f"{brief.thesis} {brief.rationale}" or API_QUOTA_VETO in f"{brief.thesis} {brief.rationale}":
             skip = API_QUOTA_VETO if API_QUOTA_VETO in f"{brief.thesis} {brief.rationale}" else API_TIMEOUT_VETO
-            print(f"[API ERROR] SENTINEL skipping OpenRouter - Qwen — {skip}", flush=True)
+            print(f"[API ERROR] SENTINEL skipping Bitget Hackathon - Qwen 3.8 Max — {skip}", flush=True)
             return RiskReport(
                 verdict="VETO",
                 fake_news_risk="HIGH",

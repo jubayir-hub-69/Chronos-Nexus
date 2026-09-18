@@ -45,7 +45,9 @@ from connectors.bitget_paper import BitgetPaperConnector
 from core.config import Settings, load_settings
 from core.llm import QwenCortex
 from core.memory import BoardMemory
+from core.positions import PositionDesk
 from core.schemas import AnalystBrief, BoardDecision, RiskReport
+from utils.commands import CommandDesk, TelegramCommandLoop, TerminalCommandLoop
 from utils.notifier import TelegramNotifier, send_startup_message
 
 LIVE_TRADING_ENABLED = False
@@ -250,6 +252,25 @@ def _dispatch_alerts(
         return
 
 
+def _emit_desk_actions(notifier: TelegramNotifier, actions: list[dict[str, Any]]) -> None:
+    for action in actions or []:
+        if not action:
+            continue
+        try:
+            notifier.alert_pnl(
+                symbol=str(action.get("symbol") or ""),
+                pnl_pct=float(action.get("pnl_pct") or 0.0),
+                pnl_usdt=float(action.get("pnl_usdt") or 0.0),
+                kind=str(action.get("kind") or action.get("status") or "CLOSE"),
+                reason=str(action.get("reason") or action.get("status") or ""),
+                side=str(action.get("side") or action.get("position_side") or ""),
+                entry=action.get("entry_price"),
+                mark=action.get("mark_price") or action.get("price"),
+            )
+        except Exception:
+            continue
+
+
 def _run_trading_cycle(
     settings: Settings,
     cortex: QwenCortex,
@@ -257,6 +278,7 @@ def _run_trading_cycle(
     bitget: BitgetPaperConnector | None,
     arb: ArbitrumSepolia | None,
     notifier: TelegramNotifier,
+    desk: PositionDesk,
 ) -> None:
     t0 = time.perf_counter()
     phase("PHASE 3  ·  LIVE MACRO INGEST")
@@ -376,10 +398,64 @@ def _run_trading_cycle(
             rationale=brief.news_bad or brief.rationale,
             session=clock["line"],
         )
+
+    phase("PHASE 3.5  ·  POSITION DESK")
+    book: list[dict[str, Any]] = []
+    try:
+        book = desk.snapshot(bitget)
+    except Exception as exc:
+        console.print(f"[bold yellow]Position book unavailable:[/] {exc}")
+        book = []
+    if not book:
+        console.print("[dim]FLAT — no open Demo positions.[/]")
+    else:
+        pos_table = Table(box=box.SIMPLE_HEAVY, header_style="bold cyan", expand=True)
+        pos_table.add_column("SYMBOL", style="bold white")
+        pos_table.add_column("SIDE", no_wrap=True)
+        pos_table.add_column("QTY", justify="right")
+        pos_table.add_column("ENTRY", justify="right")
+        pos_table.add_column("MARK", justify="right")
+        pos_table.add_column("PnL %", justify="right")
+        pos_table.add_column("USDT", justify="right")
+        for pos in book:
+            pnl_pct = float(pos.get("pnl_pct") or 0.0)
+            pnl_usdt = float(pos.get("pnl_usdt") or 0.0)
+            style = "green" if pnl_pct >= 0 else "red"
+            pos_table.add_row(
+                str(pos.get("symbol") or ""),
+                str(pos.get("side") or "").upper(),
+                str(pos.get("contracts") or ""),
+                str(pos.get("entry_price") or ""),
+                str(pos.get("mark_price") or ""),
+                f"{pnl_pct:+.2f}%",
+                f"{pnl_usdt:+.2f}",
+                style=style,
+            )
+        console.print(pos_table)
+    desk_actions: list[dict[str, Any]] = []
+    try:
+        desk_actions = desk.manage(bitget, brief)
+    except Exception as exc:
+        console.print(f"[bold yellow]Desk manage degraded:[/] {exc}")
+        desk_actions = []
+    if desk_actions:
+        for action in desk_actions:
+            flag = "green" if float(action.get("pnl_pct") or 0.0) >= 0 else "red"
+            console.print(
+                f"  [{flag}]{action.get('kind') or action.get('status')}[/]  "
+                f"{action.get('symbol')}  "
+                f"{float(action.get('pnl_pct') or 0.0):+.2f}%  "
+                f"{float(action.get('pnl_usdt') or 0.0):+.2f} USDT  "
+                f"{action.get('reason') or ''}"
+            )
+        _emit_desk_actions(notifier, desk_actions)
+    else:
+        console.print("[dim]No autonomous close this cycle.[/]")
+    console.print()
     if brief.llm_degraded:
         notifier.alert_api_error(
-            error=brief.rationale or "OpenRouter - Qwen timeout / degraded",
-            where="ORACLE / OpenRouter - Qwen",
+            error=brief.rationale or "Bitget Hackathon - Qwen 3.8 Max timeout / degraded",
+            where="ORACLE / Bitget Hackathon - Qwen 3.8 Max",
             action="STAND_DOWN",
             session=clock["line"],
         )
@@ -456,7 +532,7 @@ def _run_trading_cycle(
         except Exception as exc:
             notifier.alert_api_error(
                 error=str(exc)[:400],
-                where="SENTINEL / OpenRouter - Qwen",
+                where="SENTINEL / Bitget Hackathon - Qwen 3.8 Max",
                 action="VETO",
                 session=clock["line"],
             )
@@ -631,6 +707,12 @@ def _run_trading_cycle(
     )
     console.print()
 
+    if bool(order.get("ok")):
+        try:
+            desk.record_open(order, brief)
+        except Exception:
+            pass
+
     _dispatch_alerts(
         notifier, brief, risk, decision, order, attestation, session=clock["line"]
     )
@@ -701,7 +783,7 @@ def _main() -> int:
                 ("qwen_requested", settings.qwen_model),
                 ("qwen_resolved", settings.resolved_qwen_model or "(unresolved)"),
                 ("qwen_source", settings.qwen_source or "(pending)"),
-                ("openrouter_key", settings.public_status()["openrouter_key"]),
+                ("qwen_key", settings.public_status()["qwen_key"]),
                 ("bitget_key", settings.public_status()["bitget_key"]),
                 ("arb_chain", str(settings.arbitrum_sepolia_chain_id)),
                 ("telegram", settings.public_status()["telegram"]),
@@ -713,17 +795,18 @@ def _main() -> int:
 
     notifier = TelegramNotifier.from_settings(settings)
     send_startup_message(notifier)
+    desk = PositionDesk()
 
-    phase("PHASE 1  ·  OPENROUTER - QWEN")
+    phase("PHASE 1  ·  BITGET HACKATHON - QWEN 3.8 MAX")
     cortex = QwenCortex(settings)
     memory = BoardMemory()
     console.print(
         kv_panel(
-            "CORTEX  ·  OpenRouter - Qwen",
+            "CORTEX  ·  Bitget Hackathon - Qwen 3.8 Max",
             [
                 ("backend", cortex.backend),
                 ("model", cortex.selected_model),
-                ("base_url", "https://openrouter.ai/api/v1"),
+                ("base_url", "https://hackathon.bitgetops.com/v1"),
                 ("source", settings.qwen_source or "default"),
             ],
             border="magenta",
@@ -804,7 +887,7 @@ def _main() -> int:
     table.add_row("Analyst Agent", "ORACLE · live RSS wire", status_dot(True))
     table.add_row("Risk Manager", "SENTINEL · veto + L2 spread", status_dot(True))
     table.add_row("Executive Agent", "CHAIRMAN · attest + execute", status_dot(True))
-    table.add_row("OpenRouter - Qwen", f"{cortex.backend} · {cortex.selected_model}", status_dot(cortex.backend != "offline"))
+    table.add_row("Bitget Hackathon - Qwen 3.8 Max", f"{cortex.backend} · {cortex.selected_model}", status_dot(cortex.backend != "offline"))
     table.add_row(
         "Bitget Paper",
         f"{bitget_ping.get('symbol') or bitget_err or 'unbound'} · univ {bitget_ping.get('universe', '—')}",
@@ -818,15 +901,34 @@ def _main() -> int:
     table.add_row("Board Memory", f"{len(memory.recent())} cycles · data/history.json", status_dot(True))
     table.add_row(
         "Telegram Alerts",
-        "armed · async HTML" if notifier.enabled else "disarmed · no token/chat",
+        "armed · async HTML + PnL cards" if notifier.enabled else "disarmed · no token/chat",
         status_dot(notifier.enabled, label_ok="ARMED", label_bad="OFF"),
     )
+    table.add_row(
+        "Telegram Commands",
+        "/positions /close /closeall" if notifier.enabled and bitget is not None else "disarmed",
+        status_dot(notifier.enabled and bitget is not None, label_ok="ARMED", label_bad="OFF"),
+    )
+    table.add_row(
+        "Terminal Commands",
+        "nexus> /positions /close /closeall /help",
+        status_dot(True, label_ok="ARMED", label_bad="OFF"),
+    )
+    table.add_row("Position Desk", "SL/TP · trail · thesis close", status_dot(True))
     table.add_row("Compliance Lock", "live trading hard-disabled", status_dot(not LIVE_TRADING_ENABLED))
     console.print(table)
     console.print()
 
     if bitget is None or arb is None:
         console.print("[bold yellow]Rails incomplete — board will still debate; execution may skip.[/]\n")
+
+    command_desk = CommandDesk(
+        bitget,
+        desk,
+        on_close=lambda result: _emit_desk_actions(notifier, [result]),
+    )
+    TelegramCommandLoop(notifier, command_desk).start()
+    TerminalCommandLoop(command_desk, printer=lambda msg: console.print(msg)).start()
 
     while True:
         try:
@@ -837,9 +939,11 @@ def _main() -> int:
                 bitget=bitget,
                 arb=arb,
                 notifier=notifier,
+                desk=desk,
             )
             console.print(
-                f"  [dim]Hourly daemon — next cycle in {CYCLE_INTERVAL_SEC}s.[/]"
+                f"  [dim]Hourly daemon — next cycle in {CYCLE_INTERVAL_SEC}s. "
+                "Type /positions /close /closeall at nexus>.[/]"
             )
             time.sleep(CYCLE_INTERVAL_SEC)
         except KeyboardInterrupt:

@@ -14,9 +14,10 @@ from core.llm import API_QUOTA_VETO, is_quota_fault
 from core.retry import call_with_backoff
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_PHOTO = "https://api.telegram.org/bot{token}/sendPhoto"
 STARTUP_TEXT = (
-    "Chronos-Nexus is ONLINE — glasshouse desk, unlimited Demo universe, "
-    "hourly tape scan."
+    "Chronos-Nexus is ONLINE — glasshouse desk, SL/TP armed, hourly tape scan.\n"
+    "Commands: /positions  /close SYMBOL  /closeall  /help"
 )
 _TELEGRAM_MAX = 3900
 _INFLIGHT: list[threading.Thread] = []
@@ -158,13 +159,13 @@ class TelegramNotifier:
         self,
         *,
         error: str,
-        where: str = "OpenRouter - Qwen",
+        where: str = "Bitget Hackathon - Qwen 3.8 Max",
         action: str = "STAND_DOWN",
         session: str = "",
     ) -> None:
         quota = is_quota_fault(error)
         title = (
-            "⚠️ <b>OPENROUTER QUOTA</b>"
+            "⚠️ <b>QWEN QUOTA</b>"
             if quota
             else "⚠️ <b>API ERROR / TIMEOUT</b>"
         )
@@ -186,7 +187,7 @@ class TelegramNotifier:
         )
         if quota:
             lines.append(
-                "Not a crash. OpenRouter limit hit — the hourly daemon will retry after reset."
+                "Not a crash. Bitget Qwen limit hit — the hourly daemon will retry after reset."
             )
         else:
             lines.append(
@@ -292,6 +293,90 @@ class TelegramNotifier:
             lines.append(f"<b>Model:</b> <code>{_html(model)}</code>")
         self.send_async("\n".join(lines))
 
+    def alert_pnl(
+        self,
+        *,
+        symbol: str,
+        pnl_pct: float,
+        pnl_usdt: float,
+        kind: str = "CLOSE",
+        reason: str = "",
+        side: str = "",
+        entry: Any = None,
+        mark: Any = None,
+    ) -> None:
+        win = float(pnl_pct) >= 0
+        kind_u = str(kind or "CLOSE").upper()
+        if kind_u == "SL":
+            emoji, headline = "🛑", "STOP LOSS"
+        elif kind_u in {"TP", "PARTIAL"}:
+            emoji, headline = "🟢", "TAKE PROFIT" if kind_u == "TP" else "PARTIAL TAKE PROFIT"
+        elif kind_u == "TRAIL":
+            emoji, headline = "🟢", "TRAILING EXIT"
+        elif kind_u == "THESIS":
+            emoji, headline = "⚠️", "THESIS INVALIDATED — CLOSED"
+        elif kind_u == "MANUAL":
+            emoji, headline = "🖐️", "MANUAL CLOSE"
+        else:
+            emoji, headline = ("🟢", "POSITION CLOSED") if win else ("🛑", "POSITION CLOSED")
+        sign = "+" if pnl_pct >= 0 else ""
+        usd = "+" if pnl_usdt >= 0 else ""
+        lines = [
+            "<b>CHRONOS-NEXUS</b>",
+            f"{emoji} <b>{headline}</b>",
+            "",
+            f"<b>Token:</b> <code>{_html(symbol)}</code>",
+        ]
+        if side:
+            lines.append(f"<b>Side:</b> <code>{_html(str(side).upper())}</code>")
+        lines.append(f"<b>PnL:</b> <b>{sign}{float(pnl_pct):.2f}%</b>")
+        lines.append(f"<b>USDT:</b> <b>{usd}{float(pnl_usdt):.2f} USDT</b>")
+        if entry not in (None, "", 0, "0"):
+            lines.append(f"<b>Entry:</b> <code>{_html(entry)}</code>")
+        if mark not in (None, "", 0, "0"):
+            lines.append(f"<b>Exit:</b> <code>{_html(mark)}</code>")
+        if reason:
+            lines.append(f"<b>Why:</b> {_html(reason)}")
+        caption = "\n".join(lines)
+        photo = None
+        try:
+            from utils.pnl_card import render_pnl_card
+
+            photo = render_pnl_card(
+                symbol=symbol,
+                pnl_pct=float(pnl_pct),
+                pnl_usdt=float(pnl_usdt),
+                title=headline,
+                side=side,
+            )
+        except Exception:
+            photo = None
+        if photo:
+            self.send_photo_async(photo, caption)
+        else:
+            self.send_async(caption)
+
+    def reply(self, text: str) -> None:
+        """Synchronous-feel reply used by the command loop (still never raises)."""
+        self.send_async(text)
+
+    def send_photo_async(self, png: bytes, caption: str) -> None:
+        if not self.enabled:
+            print(
+                "[TELEGRAM ERROR] disarmed — TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing",
+                flush=True,
+            )
+            return
+        thread = threading.Thread(
+            target=self._send_photo_safe,
+            args=(png, _clip_telegram(caption, 1000)),
+            daemon=True,
+            name="chronos-telegram-photo",
+        )
+        with _INFLIGHT_LOCK:
+            _INFLIGHT.append(thread)
+        thread.start()
+
     def send_async(self, text: str) -> None:
         if not self.enabled:
             print(
@@ -326,6 +411,40 @@ class TelegramNotifier:
                 self._post(_strip_tags(text), parse_mode=None)
             except Exception as exc2:
                 print(f"[TELEGRAM ERROR] {str(exc2)}", flush=True)
+
+    def _send_photo_safe(self, png: bytes, caption: str) -> None:
+        try:
+            self._post_photo(png, caption, parse_mode="HTML")
+        except Exception as exc:
+            print(f"[TELEGRAM ERROR] photo send failed: {exc}", flush=True)
+            self._send_safe(caption)
+
+    def _post_photo(self, png: bytes, caption: str, parse_mode: str | None) -> None:
+        url = TELEGRAM_PHOTO.format(token=self.token)
+
+        def _once() -> None:
+            files = {"photo": ("pnl.png", png, "image/png")}
+            data: dict[str, Any] = {
+                "chat_id": self.chat_id,
+                "caption": caption,
+            }
+            if parse_mode:
+                data["parse_mode"] = parse_mode
+            resp = requests.post(url, data=data, files=files, timeout=20)
+            body = ""
+            try:
+                body = resp.text[:300]
+            except Exception:
+                body = ""
+            if resp.status_code == 429:
+                raise TimeoutError(f"429 telegram rate limit {body}")
+            if resp.status_code >= 400:
+                raise RuntimeError(f"telegram HTTP {resp.status_code}: {body}")
+            payload = resp.json() if resp.content else {}
+            if isinstance(payload, dict) and payload.get("ok") is False:
+                raise RuntimeError(str(payload.get("description") or "telegram photo failed"))
+
+        call_with_backoff(_once, attempts=3, label="telegram.sendPhoto")
 
     def _post(self, text: str, parse_mode: str | None) -> None:
         url = TELEGRAM_API.format(token=self.token)

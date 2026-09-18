@@ -19,6 +19,8 @@ _RETRY_TOKENS = (
     "429",
     "rate limit",
     "ratelimit",
+    "throttling",
+    "ratequota",
     "too many requests",
     "resource exhausted",
     "timeout",
