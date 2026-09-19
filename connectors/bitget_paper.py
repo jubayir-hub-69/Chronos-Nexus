@@ -17,9 +17,22 @@ import ccxt
 
 from core.config import PROJECT_ROOT, Settings
 from core.retry import call_with_backoff
+from core.ta import (
+    MTF_FRAMES,
+    RSI_FALLBACK_TIMEFRAME,
+    RSI_PERIOD,
+    RSI_TIMEFRAME,
+    analyze_candles,
+    compute_atr,
+    compute_rsi,
+    enrich_ohlcv,
+    mtf_alignment,
+    sl_tp_from_margin,
+)
 
 STOP_LOSS_PCT = 0.02
 TAKE_PROFIT_PCT = 0.05
+SCALE_TP_FRACTION = 0.5
 ATR_SL_MULT = 1.5
 ATR_TP_MULT = 2.5
 ATR_SL_PCT_FLOOR = 0.012
@@ -301,6 +314,256 @@ class BitgetPaperConnector:
             "error": " | ".join(errors)[:240] if errors and not assets else None,
         }
 
+    def resolve_spot_symbol(self, query: str) -> str | None:
+        """Any live Bitget Spot listing matching the query. Never returns a swap/perp."""
+        raw = (query or "").strip()
+        if not raw:
+            return None
+        try:
+            markets = self.exchange.markets or self._ccxt(
+                lambda: self.exchange.load_markets(reload=False),
+                label="bitget.load_markets.spot",
+            )
+        except Exception:
+            markets = self.exchange.markets or {}
+        q = raw.upper().replace("USDT:USDT", "USDT")
+        if q.endswith(":USDT"):
+            q = q[: -len(":USDT")]
+        candidates: list[str] = []
+        if "/" in q:
+            candidates.append(q)
+            base = q.split("/")[0]
+            quote = q.split("/")[1] if "/" in q else "USDT"
+            if quote not in {"USDT", "USDC", "USD"}:
+                candidates.append(f"{base}/USDT")
+        else:
+            candidates.extend([f"{q}/USDT", f"{q}/USDC", f"{q}/USD"])
+        for cand in candidates:
+            market = markets.get(cand) if isinstance(markets, dict) else None
+            if _is_spot_market(cand, market if isinstance(market, dict) else {}):
+                return cand
+        root = q.split("/")[0]
+        alt = root[1:] if root.startswith("R") and len(root) > 2 and root[1:].isalpha() else root
+        if alt == "GOOGL":
+            alt = "GOOG"
+        hits: list[str] = []
+        for name, market in (markets or {}).items():
+            row = market if isinstance(market, dict) else {}
+            if not _is_spot_market(str(name), row):
+                continue
+            base = str(row.get("base") or str(name).split("/")[0] or "").upper()
+            base_root = base[1:] if base.startswith("R") and len(base) > 2 else base
+            if base_root == "GOOGL":
+                base_root = "GOOG"
+            if base == root or base_root == alt or base == alt:
+                hits.append(str(name))
+        hits.sort(key=lambda n: (0 if str(n).endswith("/USDT") else 1, n))
+        return hits[0] if hits else None
+
+    def fetch_spot_usdt_free(self) -> float:
+        """Spot wallet free USDT via fetch_balance(type=spot)."""
+        try:
+            raw = self._ccxt(
+                lambda: self.exchange.fetch_balance({"type": "spot"}),
+                label="bitget.balance.spot.chat",
+            )
+        except Exception:
+            return 0.0
+        frees = raw.get("free") or {}
+        try:
+            return max(0.0, float(frees.get("USDT") or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def fetch_spot_quote(self, symbol: str) -> dict[str, Any]:
+        """Live spot ticker. Isolated from the swap defaultType used by the AI desk."""
+        resolved = self.resolve_spot_symbol(symbol) or symbol
+        prev = (self.exchange.options or {}).get("defaultType")
+        try:
+            self.exchange.options["defaultType"] = "spot"
+            ticker = self.fetch_ticker(resolved)
+        finally:
+            self.exchange.options["defaultType"] = prev
+        last = coerce_price(ticker.get("last"), ticker.get("bid"), ticker.get("ask"))
+        return {
+            "ok": bool(ticker.get("ok")) and last > 0,
+            "symbol": resolved,
+            "last": last,
+            "bid": ticker.get("bid"),
+            "ask": ticker.get("ask"),
+            "error": ticker.get("error"),
+        }
+
+    def execute_spot_market(
+        self,
+        symbol: str,
+        side: str,
+        quote_usdt: float,
+    ) -> dict[str, Any]:
+        """Manual Telegram fill. Spot market only. Never leverage, never SL/TP, never swap."""
+        if not self.sandbox:
+            raise RuntimeError("REFUSING live spot order — sandbox lock tripped")
+        side_n = (side or "").lower().strip()
+        if side_n not in {"buy", "sell"}:
+            return {"ok": False, "status": "ERROR", "error": "side must be buy or sell", "symbol": symbol}
+        try:
+            cost = float(quote_usdt)
+        except (TypeError, ValueError):
+            cost = 0.0
+        if cost <= 0:
+            return {"ok": False, "status": "ERROR", "error": "USDT amount must be positive", "symbol": symbol}
+        resolved = self.resolve_spot_symbol(symbol)
+        if not resolved:
+            return {
+                "ok": False,
+                "status": "NOT_SPOT",
+                "error": f"{symbol} is not listed on Bitget Spot. Manual chat trades are SPOT only.",
+                "symbol": symbol,
+            }
+        try:
+            market = self.exchange.market(resolved)
+        except Exception:
+            market = {}
+        if not _is_spot_market(resolved, market if isinstance(market, dict) else {}):
+            return {
+                "ok": False,
+                "status": "NOT_SPOT",
+                "error": f"{resolved} is not a Spot market. Manual chat trades cannot use futures/margin.",
+                "symbol": resolved,
+            }
+
+        prev = (self.exchange.options or {}).get("defaultType")
+        balance_before: float | None = None
+        record: dict[str, Any] = {
+            "id": str(uuid.uuid4()),
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "venue": "bitget-demo",
+            "sandbox": True,
+            "live_trading": False,
+            "source": "telegram_spot_manual",
+            "market_type": "spot",
+            "symbol": resolved,
+            "side": side_n,
+            "notional_usdt": round(cost, 6),
+        }
+        try:
+            self.exchange.options["defaultType"] = "spot"
+            quote = self.fetch_spot_quote(resolved)
+            last = coerce_price(quote.get("last"))
+            if last <= 0:
+                record.update(
+                    {
+                        "ok": False,
+                        "status": "NO_LIVE_PRICE",
+                        "error": "No live Bitget Spot price.",
+                        "amount": 0.0,
+                        "price": 0.0,
+                    }
+                )
+                log_path = _append_trade(record)
+                record["log_path"] = str(log_path)
+                return record
+            qty = self._size_amount(resolved, cost / last, last)
+            record["amount"] = qty
+            record["quantity"] = qty
+            record["price"] = last
+            record["entry_price"] = last
+            free = self.fetch_spot_usdt_free()
+            if side_n == "buy" and free + 1e-9 < cost:
+                record.update(
+                    {
+                        "ok": False,
+                        "status": "INSUFFICIENT_MARGIN",
+                        "error": f"Spot USDT free {free:.4f} < {cost:.4f} requested.",
+                    }
+                )
+                log_path = _append_trade(record)
+                record["log_path"] = str(log_path)
+                return record
+            balance_before = self._snapshot_usdt()
+            order = self._place_spot_market(resolved, side_n, qty, last, cost)
+            fill = coerce_price(order.get("average"), order.get("price"), last)
+            filled_qty = coerce_price(order.get("filled"), order.get("amount"), qty)
+            record.update(
+                {
+                    "ok": True,
+                    "status": str(order.get("status") or "closed"),
+                    "order_id": order.get("id"),
+                    "raw_order": _slim_order(order),
+                    "price": fill,
+                    "entry_price": fill,
+                    "amount": filled_qty,
+                    "quantity": filled_qty,
+                    "notional_usdt": round(abs(fill * filled_qty), 6) if fill and filled_qty else round(cost, 6),
+                }
+            )
+            self._apply_balance_change(record, balance_before=balance_before, filled=True)
+        except Exception as exc:
+            record.update(
+                {
+                    "ok": False,
+                    "status": "ERROR",
+                    "error": str(exc)[:400],
+                    "order_id": None,
+                    "raw_order": {},
+                }
+            )
+            self._apply_balance_change(record, balance_before=None, filled=False)
+        finally:
+            self.exchange.options["defaultType"] = prev
+        log_path = _append_trade(record)
+        record["log_path"] = str(log_path)
+        return record
+
+    def _place_spot_market(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        last: float,
+        cost: float,
+    ) -> dict[str, Any]:
+        params = {"type": "spot"}
+        if side == "buy" and hasattr(self.exchange, "create_market_buy_order_with_cost"):
+            try:
+                return self._ccxt(
+                    lambda: self.exchange.create_market_buy_order_with_cost(symbol, cost, params),
+                    label="bitget.spot.buy_cost",
+                )
+            except TypeError:
+                try:
+                    return self._ccxt(
+                        lambda: self.exchange.create_market_buy_order_with_cost(symbol, cost),
+                        label="bitget.spot.buy_cost.noparams",
+                    )
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        return self._ccxt(
+            lambda: self.exchange.create_order(symbol, "market", side, amount, None, params),
+            label="bitget.spot.create_order",
+        )
+
+    def fetch_account_equity(self) -> dict[str, Any]:
+        """Live USDT equity via CCXT fetch_balance. Caps the 5–6% daily risk budget."""
+        payload = self.fetch_demo_balance()
+        usdt = (payload.get("assets") or {}).get("USDT") or {}
+        equity = 0.0
+        for key in ("total", "free"):
+            try:
+                value = float(usdt.get(key) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if value > equity:
+                equity = value
+        return {
+            "ok": bool(payload.get("ok")) and equity > 0,
+            "equity_usdt": round(equity, 6) if equity > 0 else None,
+            "source": "ccxt.fetch_balance",
+            "error": payload.get("error"),
+        }
+
     def _snapshot_usdt(self) -> float | None:
         """Live Demo USDT total. None if the wallet call fails — caller simulates Δ."""
         try:
@@ -384,7 +647,7 @@ class BitgetPaperConnector:
                 "error": str(exc)[:240],
             }
 
-    def fetch_order_book(self, symbol: str | None = None, limit: int = 20) -> dict[str, Any]:
+    def fetch_order_book(self, symbol: str | None = None, limit: int = 50) -> dict[str, Any]:
         """Live L2 book for the Demo symbol. Never invents bids/asks."""
         target = symbol or self.resolved_symbol or self.preferred_symbol
         try:
@@ -477,9 +740,23 @@ class BitgetPaperConnector:
         amount: float,
         reasoning_hash: str,
         extra: dict[str, Any] | None = None,
+        sl_price: float | None = None,
+        tp_price: float | None = None,
+        margin_usdt: float | None = None,
+        sl_margin_frac: float | None = None,
     ) -> dict[str, Any]:
         with self._order_lock:
-            return self._execute_paper_order(symbol, side, amount, reasoning_hash, extra)
+            return self._execute_paper_order(
+                symbol,
+                side,
+                amount,
+                reasoning_hash,
+                extra,
+                sl_price=sl_price,
+                tp_price=tp_price,
+                margin_usdt=margin_usdt,
+                sl_margin_frac=sl_margin_frac,
+            )
 
     def _execute_paper_order(
         self,
@@ -488,6 +765,10 @@ class BitgetPaperConnector:
         amount: float,
         reasoning_hash: str,
         extra: dict[str, Any] | None = None,
+        sl_price: float | None = None,
+        tp_price: float | None = None,
+        margin_usdt: float | None = None,
+        sl_margin_frac: float | None = None,
     ) -> dict[str, Any]:
         if not self.sandbox:
             raise RuntimeError("REFUSING live order — sandbox lock tripped")
@@ -591,13 +872,24 @@ class BitgetPaperConnector:
             "tp_price": None,
             "sl_order": None,
             "tp_order": None,
+            "margin_usdt": margin_usdt,
+            "sl_margin_frac": sl_margin_frac,
         }
         if extra:
             record["board"] = extra
 
         balance_before = self._snapshot_usdt()
         try:
-            order = self._place(symbol, side_n, sized, last)
+            order = self._place(
+                symbol,
+                side_n,
+                sized,
+                last,
+                sl_price=sl_price,
+                tp_price=tp_price,
+                margin_usdt=margin_usdt,
+                sl_margin_frac=sl_margin_frac,
+            )
             record["ok"] = True
             record["status"] = str(order.get("status") or "submitted")
             record["order_id"] = order.get("id")
@@ -610,15 +902,36 @@ class BitgetPaperConnector:
             record["entry_price"] = entry
             record["price"] = entry
             record["notional_usdt"] = round(sized * entry, 6) if entry > 0 else notional
+            if margin_usdt is None and record["notional_usdt"]:
+                try:
+                    lev = SWAP_LEVERAGE if self._is_swap(symbol) else 1.0
+                except Exception:
+                    lev = SWAP_LEVERAGE
+                record["margin_usdt"] = round(float(record["notional_usdt"]) / lev, 6)
             self._apply_balance_change(record, balance_before=balance_before, filled=True)
             if entry > 0:
                 try:
-                    guards = self._place_sl_tp(symbol, sized, entry, side=side_n)
+                    guards = self._place_sl_tp(
+                        symbol,
+                        sized,
+                        entry,
+                        side=side_n,
+                        sl_price=sl_price,
+                        tp_price=tp_price,
+                        margin_usdt=record.get("margin_usdt"),
+                        sl_margin_frac=sl_margin_frac,
+                    )
                     record.update(guards)
                     record["price"] = entry
                     record["entry_price"] = entry
                 except Exception as guard_exc:
-                    sl, tp = protective_prices(entry, side_n)
+                    sl, tp = protective_prices(
+                        entry,
+                        side_n,
+                        margin_usdt=record.get("margin_usdt"),
+                        qty=sized,
+                        sl_margin_frac=sl_margin_frac,
+                    )
                     record["sl_price"] = sl
                     record["tp_price"] = tp
                     record["sl_error"] = str(guard_exc)[:240]
@@ -670,14 +983,36 @@ class BitgetPaperConnector:
         record["log_path"] = str(log_path)
         return record
 
-    def _place(self, symbol: str, side: str, amount: float, last: float) -> dict[str, Any]:
+    def _place(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        last: float,
+        sl_price: float | None = None,
+        tp_price: float | None = None,
+        margin_usdt: float | None = None,
+        sl_margin_frac: float | None = None,
+    ) -> dict[str, Any]:
         is_swap = self._is_swap(symbol)
         if is_swap:
             try:
                 self._ccxt(lambda: self.exchange.set_leverage(5, symbol), label="bitget.leverage")
             except Exception:
                 pass
-            sl, tp = protective_prices(last, side, atr=self.fetch_atr(symbol))
+            sl, tp = protective_prices(
+                last,
+                side,
+                atr=None if sl_price else self.fetch_atr(symbol),
+                margin_usdt=margin_usdt,
+                qty=amount,
+                sl_margin_frac=sl_margin_frac,
+                leverage=SWAP_LEVERAGE,
+            )
+            if sl_price:
+                sl = float(sl_price)
+            if tp_price:
+                tp = float(tp_price)
             sl_px = self._price(symbol, sl)
             tp_px = self._price(symbol, tp)
             param_sets: list[dict[str, Any]] = [
@@ -738,14 +1073,38 @@ class BitgetPaperConnector:
         amount: float,
         entry: float,
         side: str = "buy",
+        sl_price: float | None = None,
+        tp_price: float | None = None,
+        margin_usdt: float | None = None,
+        sl_margin_frac: float | None = None,
     ) -> dict[str, Any]:
         """Attach SL/TP immediately after a fill. Longs sell-to-close; shorts buy-to-close."""
         side_n = (side or "buy").lower().strip()
         short = side_n in {"sell", "short"}
-        sl, tp = protective_prices(entry, side_n, atr=self.fetch_atr(symbol))
+        sl, tp = protective_prices(
+            entry,
+            side_n,
+            atr=None if sl_price else self.fetch_atr(symbol),
+            margin_usdt=margin_usdt,
+            qty=amount,
+            sl_margin_frac=sl_margin_frac,
+            leverage=SWAP_LEVERAGE if self._is_swap(symbol) else 1.0,
+        )
+        if sl_price:
+            sl = float(sl_price)
+        if tp_price:
+            tp = float(tp_price)
         sl = self._price(symbol, sl)
         tp = self._price(symbol, tp)
         qty = self._size_amount(symbol, amount, entry)
+        tp_qty = self._size_amount(symbol, float(amount) * SCALE_TP_FRACTION, entry)
+        try:
+            market = self.exchange.market(symbol)
+            min_amt = float(((market.get("limits") or {}).get("amount") or {}).get("min") or 0)
+        except Exception:
+            min_amt = 0.0
+        if min_amt and tp_qty < min_amt:
+            tp_qty = qty
         sl_pct = ((sl / entry) - 1.0) * 100.0 if entry else 0.0
         tp_pct = ((tp / entry) - 1.0) * 100.0 if entry else 0.0
         out: dict[str, Any] = {
@@ -817,10 +1176,100 @@ class BitgetPaperConnector:
                 ("limit", tp, {"timeInForce": "GTC"}),
                 ("limit", tp, {"takeProfitPrice": tp}),
             ]
-        tp_order, tp_err = self._first_order(symbol, close_side, qty, tp_attempts)
+        tp_order, tp_err = self._first_order(symbol, close_side, tp_qty, tp_attempts)
         out["tp_order"] = _slim_order(tp_order) if tp_order else None
         out["tp_error"] = tp_err
+        out["tp_qty"] = tp_qty
         return out
+
+    def update_stop_loss(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        sl_price: float,
+        old_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Replace a reduce-only stop. Never opens a new book. Safe no-op on venue faults."""
+        if not self.sandbox:
+            raise RuntimeError("REFUSING live stop amend — sandbox lock tripped")
+        side_n = _norm_side(side)
+        short = side_n in {"sell", "short"}
+        sl = self._price(symbol, float(sl_price))
+        qty = self._size_amount(symbol, amount, sl)
+        if qty <= 0 or sl <= 0:
+            return {"ok": False, "sl_price": sl, "sl_order": None, "error": "invalid stop size"}
+        if old_order_id:
+            try:
+                self._ccxt(
+                    lambda: self.exchange.cancel_order(str(old_order_id), symbol),
+                    label="bitget.cancel_stop",
+                )
+            except Exception:
+                pass
+        close_side = "buy" if short else "sell"
+        hold = "short" if short else "long"
+        is_swap = self._is_swap(symbol)
+        close = {
+            "reduceOnly": True,
+            "marginMode": "crossed",
+            "tradeSide": "close",
+            "hedged": True,
+            "holdSide": hold,
+        }
+        attempts: list[tuple[str, Any, dict[str, Any]]] = []
+        if is_swap:
+            attempts = [
+                ("market", None, {**close, "stopLossPrice": sl, "presetStopLossPrice": sl}),
+                ("stop", sl, {**close, "stopPrice": sl, "triggerPrice": sl}),
+                ("stop_market", None, {**close, "stopPrice": sl, "triggerPrice": sl}),
+            ]
+        else:
+            attempts = [
+                ("stop_market", None, {"stopPrice": sl, "triggerPrice": sl}),
+                ("stop", sl, {"stopPrice": sl, "triggerPrice": sl}),
+            ]
+        order, err = self._first_order(symbol, close_side, qty, attempts)
+        return {
+            "ok": order is not None,
+            "sl_price": sl,
+            "sl_order": _slim_order(order) if order else None,
+            "sl_order_id": (order or {}).get("id") if order else None,
+            "error": err,
+            "qty": qty,
+        }
+
+    def _partial_close_qty(
+        self,
+        symbol: str,
+        contracts: float,
+        fraction: float,
+        mark: float,
+    ) -> tuple[float, str]:
+        """Size a reduce-only close. Never exceeds the live book. Skips dust partials."""
+        try:
+            frac = max(0.0, min(1.0, float(fraction)))
+        except (TypeError, ValueError):
+            frac = 1.0
+        try:
+            total = abs(float(contracts or 0.0))
+        except (TypeError, ValueError):
+            total = 0.0
+        if total <= 0:
+            return 0.0, "empty"
+        raw = total if frac >= 0.999 else total * frac
+        min_amt = 0.0
+        try:
+            market = self.exchange.market(symbol)
+            min_amt = float(((market.get("limits") or {}).get("amount") or {}).get("min") or 0)
+        except Exception:
+            min_amt = 0.0
+        if frac < 0.999 and min_amt and raw < min_amt:
+            return 0.0, "below_min"
+        qty = self._size_amount(symbol, raw, mark or 1.0)
+        if qty > total:
+            qty = self._size_amount(symbol, total, mark or 1.0)
+        return qty, "ok"
 
     def _first_order(
         self,
@@ -885,30 +1334,179 @@ class BitgetPaperConnector:
             }
         return {"open": False, "source": "spot", "symbol": symbol, "contracts": held}
 
-    def fetch_atr(self, symbol: str, timeframe: str = "1h", period: int = 14) -> float | None:
-        """True-range ATR from live Demo OHLCV. None if the venue has no candles."""
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str = RSI_TIMEFRAME,
+        limit: int = 64,
+    ) -> list[list[Any]]:
+        """Live Demo candles. Empty list if the venue has no OHLCV for this symbol."""
         try:
             rows = self._ccxt(
-                lambda: self.exchange.fetch_ohlcv(symbol, timeframe, limit=max(period + 2, 16)),
-                label="bitget.ohlcv.atr",
+                lambda: self.exchange.fetch_ohlcv(symbol, timeframe, limit=int(limit)),
+                label=f"bitget.ohlcv.{timeframe}",
             )
         except Exception:
-            return None
-        if not isinstance(rows, list) or len(rows) < 3:
-            return None
-        trs: list[float] = []
-        for i in range(1, len(rows)):
+            return []
+        return list(rows) if isinstance(rows, list) else []
+
+    def _ohlcv_with_fallback(
+        self,
+        symbol: str,
+        timeframe: str = RSI_TIMEFRAME,
+        period: int = RSI_PERIOD,
+    ) -> tuple[str, list[list[Any]]]:
+        used = timeframe or RSI_TIMEFRAME
+        need = max(int(period) * 4, 50)
+        rows = self.fetch_ohlcv(symbol, used, limit=need)
+        if len(rows) < int(period) + 1:
+            used = RSI_FALLBACK_TIMEFRAME
+            rows = self.fetch_ohlcv(symbol, used, limit=need)
+        return used, rows
+
+    def fetch_rsi(
+        self,
+        symbol: str,
+        timeframe: str = RSI_TIMEFRAME,
+        period: int = RSI_PERIOD,
+    ) -> dict[str, Any]:
+        """RSI(14) from live OHLCV. Prefers 15m; falls back to 1h if the tape is thin."""
+        used, rows = self._ohlcv_with_fallback(symbol, timeframe, period)
+        closes: list[float] = []
+        for row in rows:
             try:
-                high = float(rows[i][2])
-                low = float(rows[i][3])
-                prev_close = float(rows[i - 1][4])
+                closes.append(float(row[4]))
             except (TypeError, ValueError, IndexError):
                 continue
-            trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
-        window = trs[-period:] if trs else []
-        if not window:
-            return None
-        return sum(window) / float(len(window))
+        rsi = compute_rsi(closes, period)
+        return {
+            "ok": rsi is not None,
+            "mocked": False,
+            "symbol": symbol,
+            "timeframe": used,
+            "period": int(period),
+            "rsi": rsi,
+            "bars": len(closes),
+            "source": "ohlcv",
+            "error": None if rsi is not None else "insufficient OHLCV for RSI(14)",
+        }
+
+    def fetch_ta_bundle(
+        self,
+        symbol: str,
+        timeframe: str = RSI_TIMEFRAME,
+        period: int = RSI_PERIOD,
+    ) -> dict[str, Any]:
+        """RSI + candle structure + ATR from one OHLCV pull."""
+        used, rows = self._ohlcv_with_fallback(symbol, timeframe, period)
+        closes: list[float] = []
+        for row in rows:
+            try:
+                closes.append(float(row[4]))
+            except (TypeError, ValueError, IndexError):
+                continue
+        rsi = compute_rsi(closes, period)
+        candles = analyze_candles(rows)
+        atr = candles.get("atr")
+        if atr is None:
+            atr = compute_atr(rows)
+        payload: dict[str, Any] = {
+            "ok": bool(rsi is not None or candles.get("ok")),
+            "mocked": False,
+            "symbol": symbol,
+            "timeframe": used,
+            "period": int(period),
+            "rsi": rsi,
+            "bars": len(closes),
+            "source": "ohlcv",
+            "atr": atr,
+            "error": None,
+        }
+        payload.update(candles)
+        if rsi is None and not candles.get("ok"):
+            payload["error"] = "insufficient OHLCV for TA bundle"
+        return payload
+
+    def fetch_mtf_bundle(self, symbol: str) -> dict[str, Any]:
+        """15m entry + 1h/4h confirmation from live Bitget fetch_ohlcv."""
+        frames: dict[str, Any] = {}
+        for tf in MTF_FRAMES:
+            rows = self.fetch_ohlcv(symbol, tf, limit=80)
+            if not rows:
+                continue
+            frames[tf] = enrich_ohlcv(rows, tf)
+        entry = frames.get("15m") if isinstance(frames.get("15m"), dict) else {}
+        payload: dict[str, Any] = {
+            "ok": bool(frames),
+            "mocked": False,
+            "symbol": symbol,
+            "source": "bitget.fetch_ohlcv.mtf",
+            "frames": frames,
+            "mtf": mtf_alignment(frames, "buy"),
+            "error": None if frames else "no OHLCV on 15m/1h/4h",
+        }
+        payload.update(entry)
+        if not payload.get("timeframe"):
+            payload["timeframe"] = "15m"
+        return payload
+
+    def fetch_fundamentals(self, symbol: str) -> dict[str, Any]:
+        """Market cap / supply / last via CCXT ticker + market.info. Never invents a cap."""
+        ticker = self.fetch_ticker(symbol)
+        info: dict[str, Any] = {}
+        try:
+            market = self.exchange.market(symbol) or {}
+            raw_info = market.get("info") if isinstance(market.get("info"), dict) else {}
+            info.update(raw_info)
+        except Exception:
+            market = {}
+        tinfo = ticker.get("info") if isinstance(ticker.get("info"), dict) else {}
+        if tinfo:
+            info.update(tinfo)
+        price = coerce_price(ticker.get("last"), ticker.get("bid"), ticker.get("ask"))
+        supply = _first_positive(
+            info.get("circulatingSupply"),
+            info.get("circulating_supply"),
+            info.get("totalSupply"),
+            info.get("total_supply"),
+            info.get("maxSupply"),
+            info.get("supply"),
+            market.get("supply") if isinstance(market, dict) else None,
+        )
+        mcap = _first_positive(
+            info.get("marketCap"),
+            info.get("market_cap"),
+            info.get("marketCapUsd"),
+        )
+        if mcap is None and price > 0 and supply is not None:
+            mcap = price * supply
+        volume = _first_positive(
+            ticker.get("quoteVolume"),
+            info.get("quoteVolume"),
+            info.get("baseVolume"),
+        )
+        try:
+            is_swap = self._is_swap(symbol)
+        except Exception:
+            is_swap = ":USDT" in symbol
+        return {
+            "ok": price > 0,
+            "mocked": False,
+            "symbol": symbol,
+            "price": price if price > 0 else None,
+            "last": price if price > 0 else ticker.get("last"),
+            "market_cap_usdt": mcap,
+            "total_supply": supply,
+            "volume_24h_usdt": volume,
+            "is_swap": is_swap,
+            "source": "ccxt",
+            "error": ticker.get("error"),
+        }
+
+    def fetch_atr(self, symbol: str, timeframe: str = "1h", period: int = 14) -> float | None:
+        """True-range ATR from live Demo OHLCV. None if the venue has no candles."""
+        rows = self.fetch_ohlcv(symbol, timeframe, limit=max(period + 2, 16))
+        return compute_atr(rows, period)
 
     def fetch_open_book(self) -> list[dict[str, Any]]:
         """Every live Demo position with mark, entry, and unrealized PnL."""
@@ -1002,20 +1600,28 @@ class BitgetPaperConnector:
                 "pnl_pct": 0.0,
             }
         pos_side = _norm_side(str(existing.get("side") or side or "buy"))
-        qty = float(existing.get("contracts") or 0.0) * max(0.0, min(1.0, float(fraction)))
         entry = coerce_price(existing.get("entry_price"), (existing.get("raw") or {}).get("entryPrice"))
         ticker = self.fetch_ticker(symbol)
         mark = coerce_price(ticker.get("last"), ticker.get("bid"), ticker.get("ask"), entry)
+        qty, qty_why = self._partial_close_qty(
+            symbol,
+            float(existing.get("contracts") or 0.0),
+            fraction,
+            mark or entry or 1.0,
+        )
         if qty <= 0:
             return {
                 "ok": False,
-                "status": "FLAT",
+                "status": "SKIP_PARTIAL" if qty_why == "below_min" else "FLAT",
                 "symbol": symbol,
-                "error": "Quantity is zero",
+                "error": (
+                    "Partial size below Bitget min amount — holding runner"
+                    if qty_why == "below_min"
+                    else "Quantity is zero"
+                ),
                 "pnl_usdt": 0.0,
                 "pnl_pct": 0.0,
             }
-        qty = self._size_amount(symbol, qty, mark or entry or 1.0)
         close_side = "buy" if pos_side in {"sell", "short"} else "sell"
         is_swap = self._is_swap(symbol)
         hold = "short" if close_side == "buy" else "long"
@@ -1223,6 +1829,23 @@ def _usdt_fallback_universe(markets: dict[str, Any]) -> list[str]:
     return out
 
 
+def _is_spot_market(symbol: str, market: dict[str, Any] | None = None) -> bool:
+    """True only for a cash spot listing. Swap / future / :USDT perps are rejected."""
+    name = str(symbol or "")
+    if ":USDT" in name or name.endswith(":USDT"):
+        return False
+    row = market or {}
+    if not row:
+        return False
+    if row.get("swap") or row.get("future") or row.get("option"):
+        return False
+    if row.get("spot") is True:
+        return True
+    if row.get("spot") is False:
+        return False
+    return "/" in name and ":" not in name
+
+
 def _is_equity_market(symbol: str, market: dict[str, Any] | None = None) -> bool:
     """True for Bitget stock perps, rTokens, and US-equity-like Demo listings."""
     market = market or {}
@@ -1270,14 +1893,42 @@ def protective_prices(
     entry: float,
     side: str = "buy",
     atr: float | None = None,
+    *,
+    margin_usdt: float | None = None,
+    qty: float | None = None,
+    sl_margin_frac: float | None = None,
+    leverage: float | None = None,
+    take_profit_pct: float | None = None,
 ) -> tuple[float, float]:
     """SL/TP prices. Longs: SL below / TP above. Shorts: SL above / TP below.
 
-    When ATR is available, distance is 1.5× ATR (floored/capped) and TP is 2.5× SL.
+    When margin_usdt + sl_margin_frac are set, the stop is strictly the fraction
+    of invested margin (50% high-risk → 100% low-risk). ATR/2%/5% remains the
+    fallback for callers that do not pass a margin clip.
     """
     px = float(entry)
+    tp_override = TAKE_PROFIT_PCT
+    if take_profit_pct is not None:
+        try:
+            parsed_tp = float(take_profit_pct)
+        except (TypeError, ValueError):
+            parsed_tp = TAKE_PROFIT_PCT
+        if parsed_tp > 0:
+            tp_override = parsed_tp
+    if margin_usdt and sl_margin_frac and px > 0:
+        sl, tp = sl_tp_from_margin(
+            px,
+            side,
+            float(margin_usdt),
+            float(sl_margin_frac),
+            qty=qty,
+            leverage=float(leverage or SWAP_LEVERAGE),
+            take_profit_pct=tp_override,
+        )
+        if sl > 0 and tp > 0:
+            return sl, tp
     sl_pct = STOP_LOSS_PCT
-    tp_pct = TAKE_PROFIT_PCT
+    tp_pct = tp_override
     if atr is not None and px > 0:
         try:
             atr_pct = abs(float(atr)) / px
@@ -1289,6 +1940,19 @@ def protective_prices(
     if _norm_side(side) in {"sell", "short"}:
         return px * (1.0 + sl_pct), px * (1.0 - tp_pct)
     return px * (1.0 - sl_pct), px * (1.0 + tp_pct)
+
+
+def _first_positive(*values: Any) -> float | None:
+    for value in values:
+        if value is None or value == "":
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return None
 
 
 def unrealized_pnl(entry: float, mark: float, qty: float, side: str) -> tuple[float, float]:

@@ -83,8 +83,16 @@ class DeskLogicTests(unittest.TestCase):
 
     def test_trail_and_partial(self) -> None:
         pos = {"symbol": "NVDA/USDT:USDT", "side": "buy", "pnl_pct": 4.2}
-        self.assertTrue(_exit_reason(pos, None, {}, 4.2).startswith("PARTIAL"))
-        self.assertEqual(PARTIAL_ARM_PCT, 4.0)
+        self.assertEqual(_exit_reason(pos, None, {}, 4.2), "")
+        self.assertTrue(
+            _exit_reason(
+                {"symbol": "NVDA/USDT:USDT", "side": "buy", "pnl_pct": 26.0},
+                None,
+                {},
+                26.0,
+            ).startswith("PARTIAL")
+        )
+        self.assertEqual(PARTIAL_ARM_PCT, 25.0)
         self.assertEqual(TRAIL_ARM_PCT, 3.0)
         trailed = _exit_reason(
             {"symbol": "NVDA/USDT:USDT", "side": "buy", "pnl_pct": 2.0},

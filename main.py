@@ -33,6 +33,7 @@ from rich.text import Text
 from agents.analyst import (
     AnalystAgent,
     STAND_DOWN_SYMBOL,
+    detect_stay_away,
     is_idle_brief,
     is_none_symbol,
     session_clock,
@@ -44,14 +45,25 @@ from connectors.arbitrum import ArbitrumSepolia
 from connectors.bitget_paper import BitgetPaperConnector
 from core.config import Settings, load_settings
 from core.llm import QwenCortex
-from core.memory import BoardMemory
-from core.positions import PositionDesk
+from core.memory import (
+    DAILY_MAX_ENTRIES,
+    DAILY_RISK_PCT,
+    DAILY_WIN_STREAK,
+    BoardMemory,
+)
+from core.positions import (
+    PositionDesk,
+    is_occupied,
+    occupied_symbols,
+    strip_occupied_universe,
+)
 from core.schemas import AnalystBrief, BoardDecision, RiskReport
+from core.ta import RSI_PERIOD, SCALE_OUT_PCT, candle_veto, confluence_veto, rsi_zone
 from utils.commands import CommandDesk, TelegramCommandLoop, TerminalCommandLoop
 from utils.notifier import TelegramNotifier, send_startup_message
 
 LIVE_TRADING_ENABLED = False
-VERSION = "0.6.0-glasshouse"
+VERSION = "0.9.1-spotchat"
 HACKATHON = "Bitget AI Base Camp Hackathon S2"
 CYCLE_INTERVAL_SEC = 3600
 CYCLE_ERROR_BACKOFF_SEC = 300
@@ -191,6 +203,7 @@ def _dispatch_alerts(
         spread = ""
         if risk.spread_pct is not None:
             spread = f"{risk.spread_pct:.4f}%"
+        rsi_s = f"{float(risk.rsi):.2f}" if risk.rsi is not None else ""
         if status == "POSITION_ALREADY_OPEN":
             notifier.alert_position_open(
                 symbol=symbol,
@@ -218,6 +231,7 @@ def _dispatch_alerts(
                 model=risk.model or decision.model,
                 status=status or decision.consensus,
                 spread=spread,
+                rsi=rsi_s,
             )
             return
         if bool(order.get("ok")):
@@ -247,6 +261,7 @@ def _dispatch_alerts(
                 model=decision.model,
                 status=status,
                 spread=spread,
+                rsi=rsi_s,
             )
     except Exception:
         return
@@ -299,6 +314,34 @@ def _run_trading_cycle(
     )
     console.print()
     clock = session_clock()
+    daily = memory.daily_state()
+    equity_usdt: float | None = None
+    try:
+        if bitget is not None:
+            eq = bitget.fetch_account_equity()
+            equity_usdt = eq.get("equity_usdt")
+    except Exception as exc:
+        print(f"[DAILY] fetch_balance equity failed: {exc}", flush=True)
+        equity_usdt = None
+    budget = round(float(equity_usdt) * DAILY_RISK_PCT, 4) if equity_usdt else None
+    console.print(
+        kv_panel(
+            "DAILY RISK  ·  UTC",
+            [
+                ("day", str(daily.get("date") or "")),
+                ("entries", f"{int(daily.get('entries') or 0)}/{DAILY_MAX_ENTRIES}"),
+                ("wins", f"{int(daily.get('wins') or 0)}/{DAILY_WIN_STREAK}"),
+                ("sl_hits", str(int(daily.get("sl_hits") or 0))),
+                ("equity", "n/a" if equity_usdt is None else f"{equity_usdt:.2f} USDT"),
+                ("budget 6%", "n/a" if budget is None else f"{budget:.2f} USDT"),
+                ("deployed", f"{float(daily.get('deployed_usdt') or 0.0):.2f} USDT"),
+                ("halt", str(daily.get("halt") or daily.get("halt_reason") or "none")),
+                ("partial TP", f"+{SCALE_OUT_PCT:.0%} then trail"),
+            ],
+            border="red" if daily.get("halt") else "green",
+        )
+    )
+    console.print()
     try:
         universe = bitget.fetch_equity_universe() if bitget is not None else []
     except Exception:
@@ -340,24 +383,42 @@ def _run_trading_cycle(
         )
     console.print(wire)
     console.print()
-    sample = "  ".join(universe[:10]) + ("  …" if len(universe) > 10 else "")
+    phase("PHASE 3.4  ·  ANTI-STACK  ·  OPEN BOOK")
+    book: list[dict[str, Any]] = []
+    try:
+        book = desk.snapshot(bitget)
+    except Exception as exc:
+        console.print(f"[bold yellow]Position book unavailable:[/] {exc}")
+        book = []
+    occupied = occupied_symbols(book)
+    entry_universe = strip_occupied_universe(universe, book)
+    sample = "  ".join(entry_universe[:10]) + ("  …" if len(entry_universe) > 10 else "")
     console.print(
         kv_panel(
             "LIVE DEMO UNIVERSE",
             [
                 ("session", clock["line"]),
                 ("listed", str(len(universe))),
+                ("occupied", ", ".join(occupied) or "none"),
+                ("entry_book", str(len(entry_universe))),
                 ("source", str(getattr(bitget, "universe_source", None) or "unbound")),
                 ("sample", sample or "(empty — ORACLE must emit NONE)"),
             ],
             border="magenta",
         )
     )
+    if occupied:
+        console.print(
+            f"[bold yellow]ANTI-STACK[/]  ignoring {', '.join(occupied)} for NEW entries "
+            "(desk monitors them separately)."
+        )
     console.print()
 
-    console.print("[dim]ORACLE is scanning the global wire against the live Demo book…[/]")
+    console.print("[dim]ORACLE is scanning the global wire against the unoccupied Demo book…[/]")
     try:
-        brief: AnalystBrief = analyst.brief(triggers, universe)
+        brief: AnalystBrief = analyst.brief(
+            triggers, entry_universe, occupied=occupied
+        )
     except Exception as exc:
         brief = AnalystBrief(
             thesis="ORACLE degraded — live brief failed closed.",
@@ -377,12 +438,22 @@ def _run_trading_cycle(
         brief.side = "none"
         brief.conviction = 0
     else:
-        target = listed_demo_symbol(bitget, brief.primary_symbol, universe)
+        target = listed_demo_symbol(bitget, brief.primary_symbol, entry_universe)
         brief.primary_symbol = target
-        if is_none_symbol(target):
+        occupied_hit = is_occupied(target, book)
+        if is_none_symbol(target) or occupied_hit:
+            if occupied_hit:
+                console.print(
+                    f"[bold yellow]ANTI-STACK[/] ORACLE pick {target} is occupied — standing down."
+                )
             idle = True
             brief.side = "none"
             brief.conviction = 0
+            brief.primary_symbol = STAND_DOWN_SYMBOL
+            target = STAND_DOWN_SYMBOL
+    for flag in detect_stay_away(triggers, universe):
+        if flag not in brief.stay_away:
+            brief.stay_away.append(flag)
 
     notifier.alert_news_analysis(
         headlines=list(brief.wire_headlines or [t.headline for t in triggers]),
@@ -390,7 +461,7 @@ def _run_trading_cycle(
         news_bad=brief.news_bad,
         session=clock["line"],
         sources=[t.source for t in triggers],
-        universe_n=len(universe),
+        universe_n=len(entry_universe),
     )
     if brief.stay_away:
         notifier.alert_stay_away(
@@ -399,13 +470,7 @@ def _run_trading_cycle(
             session=clock["line"],
         )
 
-    phase("PHASE 3.5  ·  POSITION DESK")
-    book: list[dict[str, Any]] = []
-    try:
-        book = desk.snapshot(bitget)
-    except Exception as exc:
-        console.print(f"[bold yellow]Position book unavailable:[/] {exc}")
-        book = []
+    phase("PHASE 3.5  ·  POSITION DESK  ·  TRAILING SCAN")
     if not book:
         console.print("[dim]FLAT — no open Demo positions.[/]")
     else:
@@ -449,6 +514,11 @@ def _run_trading_cycle(
                 f"{action.get('reason') or ''}"
             )
         _emit_desk_actions(notifier, desk_actions)
+        for action in desk_actions:
+            try:
+                memory.note_close(action)
+            except Exception:
+                continue
     else:
         console.print("[dim]No autonomous close this cycle.[/]")
     console.print()
@@ -462,10 +532,13 @@ def _run_trading_cycle(
 
     ticker: dict[str, Any]
     book: dict[str, Any]
+    ta: dict[str, Any]
     last: float | None
     if idle:
         ticker = {"ok": False, "mocked": False, "last": None, "symbol": STAND_DOWN_SYMBOL}
         book = {"ok": False, "symbol": STAND_DOWN_SYMBOL}
+        ta = {"ok": False, "rsi": None, "symbol": STAND_DOWN_SYMBOL, "timeframe": "", "period": RSI_PERIOD}
+        fundamentals = {"ok": False, "symbol": STAND_DOWN_SYMBOL}
         last = None
         spread_s = "n/a"
     else:
@@ -488,6 +561,21 @@ def _run_trading_cycle(
         last = _safe_float(ticker.get("last"))
         spread = book.get("spread_pct")
         spread_s = f"{float(spread):.4f}%" if isinstance(spread, (int, float)) else "n/a"
+        try:
+            ta = bitget.fetch_ta_bundle(target) if bitget else {"ok": False, "rsi": None, "symbol": target}
+        except Exception as exc:
+            ta = {
+                "ok": False,
+                "rsi": None,
+                "symbol": target,
+                "timeframe": "",
+                "period": RSI_PERIOD,
+                "error": str(exc)[:160],
+            }
+        try:
+            fundamentals = bitget.fetch_fundamentals(target) if bitget else {"ok": False, "symbol": target}
+        except Exception as exc:
+            fundamentals = {"ok": False, "symbol": target, "error": str(exc)[:160]}
     console.print(
         kv_panel(
             "LIVE BOOK",
@@ -505,6 +593,47 @@ def _run_trading_cycle(
         )
     )
     console.print()
+    rsi_val = ta.get("rsi") if isinstance(ta.get("rsi"), (int, float)) else None
+    rsi_s = "n/a" if rsi_val is None else f"{float(rsi_val):.2f}"
+    zone = rsi_zone(rsi_val)
+    ta_reason = "" if idle else (confluence_veto(brief.side, rsi_val) or candle_veto(brief.side, ta))
+    if idle:
+        ta_line = "SKIPPED — ORACLE idle"
+        ta_border = "yellow"
+    elif ta_reason:
+        ta_line = ta_reason
+        ta_border = "red"
+    elif rsi_val is None and not ta.get("ok"):
+        ta_line = "SKIPPED — no OHLCV; news thesis proceeds without momentum veto"
+        ta_border = "yellow"
+    else:
+        ta_line = "PASS — news + candles + RSI agree"
+        ta_border = "green"
+    mcap = fundamentals.get("market_cap_usdt")
+    supply = fundamentals.get("total_supply")
+    console.print(
+        kv_panel(
+            "TA CONFLUENCE  ·  RSI + CANDLES + FUNDAMENTALS",
+            [
+                ("symbol", str(ta.get("symbol") or target)),
+                ("timeframe", str(ta.get("timeframe") or "—")),
+                ("rsi", rsi_s),
+                ("zone", zone),
+                ("structure", str(ta.get("structure") or "unmeasured")),
+                ("pattern", str(ta.get("pattern") or "none")),
+                ("volatility", str(ta.get("volatility") or "n/a")),
+                ("last", str(fundamentals.get("price") or last or "n/a")),
+                ("mcap", "n/a" if mcap is None else f"{float(mcap):,.0f}"),
+                ("supply", "n/a" if supply is None else f"{float(supply):,.0f}"),
+                ("vol 24h", str(fundamentals.get("volume_24h_usdt") or "n/a")),
+                ("side", str(brief.side or "none").upper()),
+                ("rule", "BUY RSI<70 & no breakdown  ·  SELL RSI>30 & no breakout"),
+                ("verdict", ta_line),
+            ],
+            border=ta_border,
+        )
+    )
+    console.print()
 
     phase("PHASE 4  ·  BOARD DEBATE")
     if idle:
@@ -518,9 +647,13 @@ def _run_trading_cycle(
             rationale=brief.rationale or "ORACLE STAND_DOWN: no actionable news.",
             llm_degraded=brief.llm_degraded,
             model=cortex.model_name,
+            rsi=rsi_val,
+            rsi_timeframe=str(ta.get("timeframe") or ""),
+            rsi_period=int(ta.get("period") or RSI_PERIOD),
+            ta_verdict="SKIPPED",
         )
     else:
-        console.print("[dim]SENTINEL is stress-testing rumor quality, L2 spread, and black-swan flags…[/]")
+        console.print("[dim]SENTINEL is stress-testing rumor quality, L2 spread, RSI confluence, and black-swan flags…[/]")
         try:
             risk = sentinel.evaluate(
                 brief,
@@ -528,6 +661,10 @@ def _run_trading_cycle(
                 settings.paper_notional_usdt,
                 tradable_symbol=target,
                 order_book=book,
+                ta=ta,
+                fundamentals=fundamentals,
+                daily=memory.daily_state(),
+                equity_usdt=equity_usdt,
             )
         except Exception as exc:
             notifier.alert_api_error(
@@ -543,7 +680,23 @@ def _run_trading_cycle(
                 rationale=f"SENTINEL degraded closed: {exc}"[:400],
                 llm_degraded=True,
                 model=cortex.model_name,
+                rsi=rsi_val,
+                rsi_timeframe=str(ta.get("timeframe") or ""),
+                rsi_period=int(ta.get("period") or RSI_PERIOD),
+                ta_verdict="VETO" if ta_reason else ("SKIPPED" if rsi_val is None else "PASS"),
             )
+    if risk.daily_halt:
+        try:
+            code = "CHOP" if "Choppy" in risk.daily_halt else (
+                "STOP_LOSS" if "Stop-loss" in risk.daily_halt else (
+                    "WIN_STREAK" if "Win-streak" in risk.daily_halt else (
+                        "MAX_TRADES" if "limit reached" in risk.daily_halt else "DAILY"
+                    )
+                )
+            )
+            memory.halt_day(code, risk.daily_halt)
+        except Exception:
+            pass
     if risk.spread_pct is not None:
         spread_s = f"{risk.spread_pct:.4f}%"
 
@@ -567,7 +720,9 @@ def _run_trading_cycle(
             Text(f"VERDICT  {risk.verdict}   FAKE-NEWS  {risk.fake_news_risk}", style=f"bold {risk_color}"),
             Text(
                 f"CAP  {risk.max_notional_usdt} USDT   MULT  {risk.size_multiplier}   "
-                f"SPREAD  {spread_s}   MODEL  {risk.model}",
+                f"SPREAD  {spread_s}   RSI  {rsi_s}   TA  {risk.ta_verdict}   "
+                f"RISK  {risk.asset_risk_score}   SL {risk.sl_margin_frac:.0%} margin   "
+                f"MODEL  {risk.model}",
                 style="dim",
             ),
             Text(""),
@@ -694,8 +849,10 @@ def _run_trading_cycle(
                     ),
                 ),
                 ("acct Δ", str(order.get("account_balance_change") if order.get("account_balance_change") is not None else "0.0")),
-                ("sl -2%", str(order.get("sl_price") or "—")),
-                ("tp +5%", str(order.get("tp_price") or "—")),
+                ("sl (margin)", str(order.get("sl_price") or risk.sl_price or "—")),
+                ("tp (scale 50%)", str(order.get("tp_price") or risk.tp_price or "—")),
+                ("margin USDT", str(order.get("margin_usdt") if order.get("margin_usdt") is not None else risk.margin_usdt or "—")),
+                ("sl_frac", str(order.get("sl_margin_frac") if order.get("sl_margin_frac") is not None else risk.sl_margin_frac)),
                 ("sl_order", str((order.get("sl_order") or {}).get("id") if isinstance(order.get("sl_order"), dict) else order.get("sl_error") or "—")),
                 ("tp_order", str((order.get("tp_order") or {}).get("id") if isinstance(order.get("tp_order"), dict) else order.get("tp_error") or "—")),
                 ("hash", str(order.get("reasoning_hash") or decision.reasoning_hash)),
@@ -884,8 +1041,16 @@ def _main() -> int:
     table.add_column("SUBSYSTEM", style="bold white", no_wrap=True)
     table.add_column("DETAIL", style="grey70")
     table.add_column("STATUS", justify="center")
-    table.add_row("Analyst Agent", "ORACLE · live RSS wire", status_dot(True))
-    table.add_row("Risk Manager", "SENTINEL · veto + L2 spread", status_dot(True))
+    table.add_row("Analyst Agent", "ORACLE · live RSS wire · anti-stack", status_dot(True))
+    table.add_row("Risk Manager", "SENTINEL · spread + RSI + candles + mcap", status_dot(True))
+    table.add_row("TA Confluence", "RSI(14) 15m · candles · BUY <70 · SELL >30", status_dot(True))
+    table.add_row("Dynamic SL", "50–100% of invested margin by asset risk", status_dot(True))
+    table.add_row("Scaled TP", f"+{SCALE_OUT_PCT:.0%} first 50% lock + trailing runner", status_dot(True))
+    table.add_row(
+        "Daily Limits",
+        f"{DAILY_MAX_ENTRIES} entries · {DAILY_WIN_STREAK} win-streak · {DAILY_RISK_PCT:.0%} equity cap",
+        status_dot(True),
+    )
     table.add_row("Executive Agent", "CHAIRMAN · attest + execute", status_dot(True))
     table.add_row("Bitget Hackathon - Qwen 3.8 Max", f"{cortex.backend} · {cortex.selected_model}", status_dot(cortex.backend != "offline"))
     table.add_row(
@@ -906,7 +1071,7 @@ def _main() -> int:
     )
     table.add_row(
         "Telegram Commands",
-        "/positions /close /closeall" if notifier.enabled and bitget is not None else "disarmed",
+        "/positions /close /closeall + Spot chatbox" if notifier.enabled and bitget is not None else "disarmed",
         status_dot(notifier.enabled and bitget is not None, label_ok="ARMED", label_bad="OFF"),
     )
     table.add_row(

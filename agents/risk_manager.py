@@ -6,6 +6,29 @@ from typing import Any
 
 from core.llm import API_QUOTA_VETO, API_TIMEOUT_VETO, QwenCortex
 from core.schemas import AnalystBrief, RiskReport
+from connectors.bitget_paper import SWAP_LEVERAGE, protective_prices
+from core.memory import (
+    DAILY_MAX_ENTRIES,
+    DAILY_RISK_PCT,
+    clip_notional_to_daily_budget,
+    daily_block_reason,
+)
+from core.ta import (
+    RSI_OVERBOUGHT,
+    RSI_OVERSOLD,
+    RSI_PERIOD,
+    SCALE_OUT_PCT,
+    SETUP_THRESHOLD,
+    candle_veto,
+    confluence_veto,
+    score_asset_risk,
+    setup_veto,
+    severe_tape_halt,
+    sl_margin_frac,
+    snapshot_fundamentals,
+    snapshot_ta,
+    ta_verdict,
+)
 
 CALLSIGN = "SENTINEL"
 SPREAD_VETO_PCT = 1.5
@@ -26,6 +49,23 @@ Evaluate:
 6. HARD RULE: if the live bid-ask spread is greater than 1.5%, you MUST VETO
    with reason exactly "Illiquid Market / High Spread". Python will enforce this
    even if you return CLEAR. Missing/unmeasured spread is a fail-safe VETO.
+7. TA CONFLUENCE (hard Python rail, applied after you return):
+   - BUY only if RSI(14) < 70. RSI >= 70 → VETO "VETO: RSI Overbought despite bullish news"
+   - SELL only if RSI(14) > 30. RSI <= 30 → VETO "VETO: RSI Oversold despite bearish news"
+   Unmeasured RSI does not veto. Do not invent an RSI reading.
+8. MULTI-FACTOR: combine news + fundamentals (mcap, supply, last, 24h volume)
+   + live candle structure/volatility. A structure BREAK against the news side
+   is a hard Python veto ("VETO: Candle structure contradicts news thesis").
+9. Return asset_risk_score 0-100. Python maps it onto a margin stop:
+   high risk → 50% of invested margin; low risk → up to 100% of invested margin.
+10. DAILY CAPITAL (Python-enforced): max 4 entries per UTC day; 3 winning
+    closes → hard stand-down; any stop-loss → hard stand-down; live OHLCV
+    chop/downtrend → hard stand-down. Deployed margin across the day cannot
+    exceed 6% of live fetch_balance equity (5–6% band). Do not use the whole book.
+11. SETUP SCORE (Python): News NLP + 15m/1h/4h confluence + volume + L2 walls
+    + VWAP pullback. Composite must be >= 90 or VETO
+    "VETO: Setup confidence below 90 — patience over activity".
+    Do not chase a news spike; wait for pullback. Opposing book walls veto.
 
 Verdicts:
 - CLEAR: trade may proceed at requested size
@@ -33,9 +73,11 @@ Verdicts:
 - VETO: Executive MUST stand down
 
 Output JSON only with keys:
-  verdict, fake_news_risk, black_swan_flags, max_notional_usdt, size_multiplier, rationale
+  verdict, fake_news_risk, black_swan_flags, max_notional_usdt, size_multiplier,
+  rationale, asset_risk_score
 - fake_news_risk: LOW | MEDIUM | HIGH
 - size_multiplier: 0.0-1.0
+- asset_risk_score: 0-100
 """
 
 
@@ -51,37 +93,62 @@ class RiskManagerAgent:
         paper_cap_usdt: float,
         tradable_symbol: str,
         order_book: dict[str, Any] | None = None,
+        ta: dict[str, Any] | None = None,
+        fundamentals: dict[str, Any] | None = None,
+        daily: dict[str, Any] | None = None,
+        equity_usdt: float | None = None,
     ) -> RiskReport:
         book = order_book or {}
         spread_pct = _spread_pct(book, ticker)
         illiquid = _is_illiquid(book, ticker, spread_pct)
         snapshot = _book_snapshot(book, ticker, spread_pct, illiquid)
+        ta_snap = snapshot_ta(ta)
+        fund = snapshot_fundamentals(fundamentals)
+        rsi = ta_snap.get("rsi")
+        rsi_tf = str(ta_snap.get("timeframe") or "")
+        rsi_period = int(ta_snap.get("period") or RSI_PERIOD)
+        last_px = _px(ticker.get("last"), fund.get("price"), ticker.get("ask"), ticker.get("bid"))
 
         user = (
             f"Analyst brief:\n{brief.model_dump()}\n\n"
             f"Ticker snapshot:\n{ticker}\n\n"
             f"L2 order book / spread (live):\n{snapshot}\n\n"
+            f"TA confluence (RSI + candles + volatility):\n{ta_snap}\n\n"
+            f"Fundamentals (CCXT):\n{fund}\n\n"
             f"Demo tradable symbol (executor proxy): {tradable_symbol}\n"
             "Do NOT veto just because the rToken name is unlisted on Bitget Demo. "
             "The executor will trade the Demo proxy above.\n"
             f"Paper notional cap USDT: {paper_cap_usdt}\n"
             f"HARD SPREAD RULE: veto when spread_pct > {SPREAD_VETO_PCT} "
             f"with reason '{VETO_REASON_SPREAD}'.\n"
+            f"HARD RSI RULE: BUY only if RSI < {RSI_OVERBOUGHT:.0f}; "
+            f"SELL only if RSI > {RSI_OVERSOLD:.0f}. "
+            "HARD CANDLE RULE: structure BREAK against the news side is a VETO.\n"
+            f"DAILY LIMITS: max {DAILY_MAX_ENTRIES} entries, win-streak 3, SL halt, "
+            f"{DAILY_RISK_PCT:.0%} equity cap. Live equity USDT={equity_usdt} daily={daily}.\n"
+            "Python enforces the exact VETO reason strings.\n"
             "Produce the JSON risk report now."
         )
         if API_TIMEOUT_VETO in f"{brief.thesis} {brief.rationale}" or API_QUOTA_VETO in f"{brief.thesis} {brief.rationale}":
             skip = API_QUOTA_VETO if API_QUOTA_VETO in f"{brief.thesis} {brief.rationale}" else API_TIMEOUT_VETO
             print(f"[API ERROR] SENTINEL skipping Bitget Hackathon - Qwen 3.8 Max — {skip}", flush=True)
-            return RiskReport(
+            return _stamp_report(
                 verdict="VETO",
-                fake_news_risk="HIGH",
-                black_swan_flags=[skip],
-                max_notional_usdt=min(paper_cap_usdt, 15.0),
-                size_multiplier=0.0,
+                fake_news="HIGH",
+                flags=[skip],
+                cap=min(paper_cap_usdt, 15.0),
+                multiplier=0.0,
                 rationale=skip,
                 spread_pct=spread_pct,
-                llm_degraded=True,
+                ta_snap=ta_snap,
+                fund=fund,
+                last_px=last_px,
+                brief=brief,
+                paper_cap=paper_cap_usdt,
+                degraded=True,
                 model=self.cortex.model_name,
+                daily=daily,
+                equity_usdt=equity_usdt,
             )
 
         fallback = {
@@ -114,20 +181,272 @@ class RiskManagerAgent:
                 f"{VETO_REASON_SPREAD} (spread={spread_bit} > {SPREAD_VETO_PCT}%). {rationale}"
             )
 
+        rsi_reason = confluence_veto(brief.side, rsi)
+        if rsi_reason:
+            verdict = "VETO"
+            multiplier = 0.0
+            if rsi_reason not in flags:
+                flags.append(rsi_reason)
+            rsi_bit = f"{float(rsi):.2f}" if rsi is not None else "n/a"
+            rationale = f"{rsi_reason} (RSI={rsi_bit} {rsi_tf or 'ohlcv'}). {rationale}"
+            print(
+                f"[TA] {rsi_reason}  RSI={rsi_bit} {rsi_tf}  "
+                f"{tradable_symbol}  side={brief.side}",
+                flush=True,
+            )
+        elif rsi is not None:
+            print(
+                f"[TA] PASS  RSI={float(rsi):.2f} {rsi_tf}  "
+                f"{tradable_symbol}  side={brief.side}  zone={ta_snap.get('zone')}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[TA] SKIPPED  RSI unmeasured  {tradable_symbol}  "
+                f"side={brief.side}  ({ta_snap.get('error') or 'no OHLCV'})",
+                flush=True,
+            )
+
+        candle_reason = candle_veto(brief.side, ta_snap)
+        if candle_reason:
+            verdict = "VETO"
+            multiplier = 0.0
+            if candle_reason not in flags:
+                flags.append(candle_reason)
+            rationale = (
+                f"{candle_reason} ({ta_snap.get('structure') or 'break'} "
+                f"{ta_snap.get('pattern') or ''}). {rationale}"
+            )
+            print(
+                f"[TA] {candle_reason}  {ta_snap.get('structure')}  "
+                f"{tradable_symbol}  side={brief.side}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[TA] CANDLES  structure={ta_snap.get('structure') or 'unmeasured'}  "
+                f"pattern={ta_snap.get('pattern') or 'none'}  "
+                f"vol={ta_snap.get('volatility') or 'n/a'}  {tradable_symbol}  "
+                f"ohlcv=bitget.fetch_ohlcv",
+                flush=True,
+            )
+
+        news_snap = {
+            "scored": bool(brief.wire_headlines)
+            or bool(brief.news_conflict)
+            or abs(float(brief.sentiment_score or 50.0) - 50.0) > 0.5,
+            "sentiment": brief.sentiment_score,
+            "credibility": brief.news_credibility,
+            "conflict": brief.news_conflict,
+        }
+        frames = ta_snap.get("frames") if isinstance(ta_snap.get("frames"), dict) else {}
+        if not frames:
+            frames = {"15m": dict(ta_snap)}
+        setup_reason, setup = setup_veto(
+            side=brief.side,
+            frames=frames,
+            book=book,
+            last=last_px,
+            news=news_snap,
+            conviction=int(brief.conviction or 0),
+        )
+        if setup_reason:
+            verdict = "VETO"
+            multiplier = 0.0
+            if setup_reason not in flags:
+                flags.append(setup_reason)
+            rationale = (
+                f"{setup_reason} (setup={setup.get('score')}/{SETUP_THRESHOLD} "
+                f"mtf={setup.get('align')} pullback={setup.get('pullback_ok')}). {rationale}"
+            )
+            print(
+                f"[SETUP] {setup_reason}  score={setup.get('score')}  "
+                f"mtf={setup.get('align')}  {tradable_symbol}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[SETUP] PASS  score={setup.get('score')}  "
+                f"mtf={setup.get('align')}  pullback={setup.get('pullback_ok')}  "
+                f"{tradable_symbol}",
+                flush=True,
+            )
+
+        chop = severe_tape_halt(ta_snap)
+        if chop:
+            verdict = "VETO"
+            multiplier = 0.0
+            if chop not in flags:
+                flags.append(chop)
+            rationale = f"{chop} (structure={ta_snap.get('structure')} vol={ta_snap.get('volatility')}). {rationale}"
+            print(f"[DAILY] {chop}", flush=True)
+
+        day_reason = daily_block_reason(daily)
+        if day_reason:
+            verdict = "VETO"
+            multiplier = 0.0
+            if day_reason not in flags:
+                flags.append(day_reason)
+            rationale = f"{day_reason}. {rationale}"
+            print(f"[DAILY] {day_reason}", flush=True)
+
         if verdict == "VETO":
             multiplier = 0.0
         cap = _cap(payload.get("max_notional_usdt"), paper_cap_usdt)
-        return RiskReport(
+        leverage = 1.0 if fund.get("is_swap") is False else SWAP_LEVERAGE
+        if verdict != "VETO":
+            requested = max(1.0, float(cap) * float(multiplier))
+            sized, budget_reason = clip_notional_to_daily_budget(
+                equity_usdt=equity_usdt,
+                daily=daily,
+                requested_notional=requested,
+                leverage=leverage,
+            )
+            if budget_reason:
+                verdict = "VETO"
+                multiplier = 0.0
+                if budget_reason not in flags:
+                    flags.append(budget_reason)
+                rationale = f"{budget_reason}. {rationale}"
+                print(f"[DAILY] {budget_reason}", flush=True)
+            else:
+                cap = sized
+                multiplier = 1.0
+                print(
+                    f"[DAILY] sized notional={cap} USDT  equity={equity_usdt}  "
+                    f"cap={DAILY_RISK_PCT:.0%}  ohlcv=live",
+                    flush=True,
+                )
+        return _stamp_report(
             verdict=verdict,
-            fake_news_risk=_fake(payload.get("fake_news_risk")),
-            black_swan_flags=flags,
-            max_notional_usdt=cap,
-            size_multiplier=multiplier,
+            fake_news=_fake(payload.get("fake_news_risk")),
+            flags=flags,
+            cap=cap,
+            multiplier=multiplier,
             rationale=rationale,
             spread_pct=spread_pct,
-            llm_degraded=degraded,
+            ta_snap=ta_snap,
+            fund=fund,
+            last_px=last_px,
+            brief=brief,
+            paper_cap=paper_cap_usdt,
+            degraded=degraded,
             model=self.cortex.model_name,
+            llm_score=payload.get("asset_risk_score"),
+            daily=daily,
+            equity_usdt=equity_usdt,
+            daily_halt=chop or day_reason or "",
+            setup=setup,
         )
+
+
+def _stamp_report(
+    *,
+    verdict: str,
+    fake_news: str,
+    flags: list[str],
+    cap: float,
+    multiplier: float,
+    rationale: str,
+    spread_pct: float | None,
+    ta_snap: dict[str, Any],
+    fund: dict[str, Any],
+    last_px: float | None,
+    brief: AnalystBrief,
+    paper_cap: float,
+    degraded: bool,
+    model: str,
+    llm_score: Any = None,
+    daily: dict[str, Any] | None = None,
+    equity_usdt: float | None = None,
+    daily_halt: str = "",
+    setup: dict[str, Any] | None = None,
+) -> RiskReport:
+    rsi = ta_snap.get("rsi")
+    py_score = score_asset_risk(
+        side=brief.side,
+        rsi=rsi,
+        atr_pct=ta_snap.get("atr_pct"),
+        candle_bias=str(ta_snap.get("bias") or ""),
+        structure=str(ta_snap.get("structure") or ""),
+        structure_break=bool(ta_snap.get("structure_break")),
+        fake_news_risk=fake_news,
+        spread_pct=spread_pct,
+        volume_24h=fund.get("volume_24h_usdt"),
+        notional_usdt=cap * max(multiplier, 0.0) if verdict != "VETO" else paper_cap,
+        market_cap_usdt=fund.get("market_cap_usdt"),
+        total_supply=fund.get("total_supply"),
+    )
+    try:
+        llm = float(llm_score) if llm_score is not None and llm_score != "" else None
+    except (TypeError, ValueError):
+        llm = None
+    if llm is not None:
+        llm = max(0.0, min(100.0, llm))
+        score = max(py_score, llm)
+    else:
+        score = py_score
+    frac = sl_margin_frac(score)
+    notional = 0.0 if verdict == "VETO" else max(1.0, float(cap) * float(multiplier))
+    leverage = 1.0 if fund.get("is_swap") is False else SWAP_LEVERAGE
+    margin = (notional / leverage) if notional > 0 else None
+    sl_px = None
+    tp_px = None
+    if last_px and last_px > 0 and margin and margin > 0 and verdict != "VETO":
+        qty = notional / last_px
+        sl_px, tp_px = protective_prices(
+            last_px,
+            brief.side,
+            margin_usdt=margin,
+            qty=qty,
+            sl_margin_frac=frac,
+            leverage=leverage,
+            take_profit_pct=SCALE_OUT_PCT,
+        )
+    print(
+        f"[RISK] score={score:.1f}  sl_margin={frac:.0%}  "
+        f"margin={margin if margin is not None else 'n/a'}  "
+        f"mcap={fund.get('market_cap_usdt') or 'n/a'}  "
+        f"structure={ta_snap.get('structure') or 'n/a'}",
+        flush=True,
+    )
+    return RiskReport(
+        verdict=verdict,  # type: ignore[arg-type]
+        fake_news_risk=fake_news,  # type: ignore[arg-type]
+        black_swan_flags=flags,
+        max_notional_usdt=cap,
+        size_multiplier=multiplier,
+        rationale=rationale,
+        spread_pct=spread_pct,
+        rsi=rsi,
+        rsi_timeframe=str(ta_snap.get("timeframe") or ""),
+        rsi_period=int(ta_snap.get("period") or RSI_PERIOD),
+        ta_verdict=ta_verdict(brief.side, rsi),  # type: ignore[arg-type]
+        asset_risk_score=score,
+        sl_margin_frac=frac,
+        margin_usdt=None if margin is None else round(float(margin), 6),
+        sl_price=sl_px,
+        tp_price=tp_px,
+        candle_structure=str(ta_snap.get("structure") or ""),
+        candle_bias=str(ta_snap.get("bias") or ""),
+        candle_pattern=str(ta_snap.get("pattern") or ""),
+        volatility=str(ta_snap.get("volatility") or ""),
+        market_cap_usdt=fund.get("market_cap_usdt"),
+        total_supply=fund.get("total_supply"),
+        last_price=last_px,
+        fund_ok=bool(fund.get("ok")),
+        daily_halt=str(daily_halt or daily_block_reason(daily) or ""),
+        equity_usdt=equity_usdt,
+        daily_budget_usdt=(
+            round(float(equity_usdt) * DAILY_RISK_PCT, 6) if equity_usdt else None
+        ),
+        daily_deployed_usdt=(
+            float((daily or {}).get("deployed_usdt") or 0.0) if daily else None
+        ),
+        daily_entries=int((daily or {}).get("entries") or 0) if daily else 0,
+        llm_degraded=degraded,
+        model=model,
+    )
 
 
 def _spread_pct(book: dict[str, Any], ticker: dict[str, Any]) -> float | None:

@@ -15,6 +15,7 @@ from xml.etree import ElementTree as ET
 from core.llm import API_QUOTA_VETO, API_TIMEOUT_VETO, QwenCortex, is_quota_fault
 from core.memory import BoardMemory
 from core.retry import call_with_backoff
+from core.news import score_wire
 from core.schemas import AnalystBrief, WeekendTrigger
 
 CALLSIGN = "ORACLE"
@@ -124,6 +125,8 @@ Rules:
   primary_symbol="NONE" with side="none" and conviction=0.
 - NEVER default to NVDA. NEVER assume BUY. If the tape is mixed, stale, or
   names a stock that is not listed, STAND DOWN with NONE / none / 0.
+- OCCUPIED names already have a live Demo position. Never pick them for a NEW
+  entry. Python strips them from the universe so you do not spend tokens stacking.
 - Scan ANY equity or sector on the wire (tech, energy, banks, China ADRs,
   Europe, semis, retail, bio). Map the dominant name onto the live universe.
 - If several listed names hit, pick the single highest-conviction expression
@@ -139,6 +142,8 @@ Rules:
 - stay_away: array of short strings ("NFLX — earnings miss / guidance cut")
 - news_good / news_bad: concise market-context summaries (what is working /
   what is hurting on THIS wire)
+- Python injects a WIRE SENTIMENT SCORE (0-100) with source credibility.
+  Do not fight a clearly conflicted or weak tape. Prefer NONE over a 55/100 guess.
 """
 
 
@@ -157,17 +162,33 @@ class AnalystAgent:
         triggers: list[WeekendTrigger],
         universe: list[str] | tuple[str, ...] | str,
         preferred_symbol: str | None = None,
+        occupied: list[str] | tuple[str, ...] | None = None,
     ) -> AnalystBrief:
-        symbols = _normalize_universe(universe, preferred_symbol)
+        occupied_list = [str(s).strip() for s in (occupied or []) if str(s).strip()]
+        blocked = {_base_ticker(s) for s in occupied_list if _base_ticker(s)}
+        symbols = [
+            s
+            for s in _normalize_universe(universe, preferred_symbol)
+            if _base_ticker(s) not in blocked
+        ]
         clock = session_clock()
         wire = [t.model_dump() for t in triggers]
         headlines = [t.headline for t in triggers if t.headline]
         mem = self.memory.prompt_block() if self.memory is not None else "BOARD MEMORY: none."
         listed = _universe_prompt_block(symbols)
         heuristic_avoid = detect_stay_away(triggers, symbols)
+        wire_score = score_wire(triggers)
+        occ_block = ""
+        if occupied_list:
+            occ_block = (
+                "OCCUPIED BOOK — a Demo position is already open. Do NOT pick these "
+                "for a NEW entry. Do not stack. Dedicated desk monitoring handles them.\n"
+                f"Occupied: {', '.join(occupied_list)}\n\n"
+            )
         user = (
             f"{mem}\n\n"
             f"SESSION CLOCK (authoritative — do not guess the day or session):\n{clock['prompt']}\n\n"
+            f"{occ_block}"
             "Live financial RSS wire (newest first). These are real headlines, not desk fiction:\n"
             f"{_wire_for_prompt(wire)}\n\n"
             "LIVE UNIVERSE from Bitget Demo load_markets() (equity / stock perps / rTokens).\n"
@@ -177,6 +198,10 @@ class AnalystAgent:
             'primary_symbol="NONE", side="none", conviction=0. NEVER default to NVDA. NEVER assume BUY.\n'
             "Summarize news_good / news_bad. Fill stay_away for toxic names. "
             "selection_reason must explain why this name beat the other listed candidates.\n"
+            f"PYTHON WIRE SENTIMENT (source-weighted, 0-100): {wire_score.get('sentiment')} "
+            f"cred={wire_score.get('credibility')} conflict={wire_score.get('conflict')} "
+            f"impact={wire_score.get('impact')} n={wire_score.get('n')}. "
+            "If this is conflicted or near 50, STAND DOWN.\n"
             "Produce the JSON brief now. Do not invent catalysts absent from the wire."
         )
         # Static stand-down object only. Never splice raw RSS into thesis/rationale —
@@ -236,6 +261,12 @@ class AnalystAgent:
         if picked == STAND_DOWN_SYMBOL:
             side = "none"
             conviction = 0
+        focused = score_wire(triggers, ticker=picked) if picked != STAND_DOWN_SYMBOL else wire_score
+        if side in {"buy", "sell"} and focused.get("scored"):
+            if (side == "buy" and float(focused.get("sentiment") or 50) < 55) or (
+                side == "sell" and float(focused.get("sentiment") or 50) > 45
+            ):
+                conviction = min(conviction, 45)
         return AnalystBrief(
             thesis=_safe_text(payload.get("thesis"), fallback["thesis"]),
             monday_gap_bias=_gap(payload.get("monday_gap_bias")),
@@ -250,6 +281,10 @@ class AnalystAgent:
             news_bad=_safe_text(payload.get("news_bad")),
             stay_away=stay[:12],
             selection_reason=_safe_text(payload.get("selection_reason")),
+            sentiment_score=float(focused.get("sentiment") or 50.0),
+            news_credibility=float(focused.get("credibility") or 0.5),
+            news_conflict=bool(focused.get("conflict")),
+            news_impact=str(focused.get("impact") or "low"),
             llm_degraded=degraded,
             model=self.cortex.model_name,
         )

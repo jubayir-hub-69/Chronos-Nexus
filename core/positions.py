@@ -10,9 +10,9 @@ from typing import Any
 
 from core.config import PROJECT_ROOT
 from core.schemas import AnalystBrief
+from core.ta import SCALE_OUT_PCT, ratchet_trail_sl, structure_break_against
 from connectors.bitget_paper import (
     STOP_LOSS_PCT,
-    TAKE_PROFIT_PCT,
     BitgetPaperConnector,
     coerce_price,
     unrealized_pnl,
@@ -21,7 +21,7 @@ from connectors.bitget_paper import (
 DESK_PATH = PROJECT_ROOT / "data" / "desk.json"
 TRAIL_ARM_PCT = 3.0
 TRAIL_GIVEBACK_PCT = 1.0
-PARTIAL_ARM_PCT = 4.0
+PARTIAL_ARM_PCT = SCALE_OUT_PCT * 100.0  # +25% PnL before first 50% booking
 PARTIAL_FRACTION = 0.5
 FLIP_CONVICTION = 55
 _LOCK = threading.Lock()
@@ -52,6 +52,14 @@ class PositionDesk:
             if meta.get("thesis"):
                 row["thesis"] = meta["thesis"]
             row["high_pnl_pct"] = float(meta.get("high_pnl_pct") or row.get("pnl_pct") or 0.0)
+            if meta.get("trail_sl_price"):
+                row["trail_sl_price"] = meta["trail_sl_price"]
+            if meta.get("partial_taken"):
+                row["partial_taken"] = True
+            if meta.get("margin_usdt") is not None:
+                row["margin_usdt"] = meta["margin_usdt"]
+            if meta.get("sl_margin_frac") is not None:
+                row["sl_margin_frac"] = meta["sl_margin_frac"]
         return live
 
     def record_open(self, order: dict[str, Any], brief: AnalystBrief | None = None) -> None:
@@ -77,6 +85,17 @@ class PositionDesk:
                 "order_id": order.get("order_id"),
                 "high_pnl_pct": 0.0,
                 "partial_taken": False,
+                "trail_sl_price": None,
+                "margin_usdt": order.get("margin_usdt"),
+                "sl_margin_frac": order.get("sl_margin_frac"),
+                "sl_order_id": (
+                    (order.get("sl_order") or {}).get("id")
+                    if isinstance(order.get("sl_order"), dict)
+                    else order.get("sl_order_id")
+                ),
+                "risk_score": (order.get("board") or {}).get("risk", {}).get("asset_risk_score")
+                if isinstance(order.get("board"), dict)
+                else None,
             }
             payload["positions"] = rows
             payload["updated"] = datetime.now(timezone.utc).isoformat()
@@ -124,8 +143,27 @@ class PositionDesk:
             pnl_pct = float(pos.get("pnl_pct") or 0.0)
             high = max(float(meta.get("high_pnl_pct") or 0.0), pnl_pct)
             self._touch_high(key, high)
+            candles = None
+            try:
+                raw_ta = bitget.fetch_ta_bundle(symbol)
+                candles = raw_ta if isinstance(raw_ta, dict) else None
+                if candles:
+                    print(
+                        f"[DESK] SCAN  {symbol}  {side}  "
+                        f"structure={candles.get('structure')}  "
+                        f"pattern={candles.get('pattern')}  "
+                        f"rsi={candles.get('rsi')}  "
+                        f"pnl={pnl_pct:+.2f}%",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(f"[DESK] candle scan skipped {symbol}: {exc}", flush=True)
+                candles = None
 
-            reason = _exit_reason(pos, brief, meta, high)
+            if bool(meta.get("partial_taken")):
+                self._ratchet_runner(bitget, pos, meta, key)
+
+            reason = _exit_reason(pos, brief, meta, high, candles=candles)
             if not reason:
                 continue
             fraction = PARTIAL_FRACTION if reason.startswith("PARTIAL") else 1.0
@@ -154,7 +192,26 @@ class PositionDesk:
             if result.get("ok") and fraction >= 0.999:
                 self.drop(symbol, side)
             elif result.get("ok"):
-                self._mark_partial(key)
+                remaining = abs(float(pos.get("contracts") or 0.0)) * (1.0 - PARTIAL_FRACTION)
+                self._mark_partial(key, remaining_qty=remaining)
+                entry = coerce_price(pos.get("entry_price"), meta.get("entry_price"))
+                self._set_trail_sl(key, entry)
+                try:
+                    upd = bitget.update_stop_loss(
+                        symbol,
+                        side,
+                        remaining,
+                        entry,
+                        old_order_id=str(meta.get("sl_order_id") or "") or None,
+                    )
+                    if upd.get("sl_order_id"):
+                        self._set_sl_order(key, str(upd["sl_order_id"]), upd.get("sl_price"))
+                    print(
+                        f"[DESK] PARTIAL  {symbol}  50% locked  trail SL → breakeven {entry}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(f"[DESK] trail SL after partial failed: {exc}", flush=True)
         return actions
 
     def _classify_vanished(
@@ -208,16 +265,84 @@ class PositionDesk:
                 payload["positions"] = rows
                 self._write(payload)
 
-    def _mark_partial(self, key: str) -> None:
+    def _mark_partial(self, key: str, remaining_qty: float | None = None) -> None:
         with _LOCK:
             payload = self._read()
             rows = payload.get("positions") if isinstance(payload.get("positions"), dict) else {}
             row = rows.get(key)
             if isinstance(row, dict):
                 row["partial_taken"] = True
+                if remaining_qty is not None:
+                    row["qty"] = float(remaining_qty)
                 rows[key] = row
                 payload["positions"] = rows
                 self._write(payload)
+
+    def _set_trail_sl(self, key: str, price: float) -> None:
+        with _LOCK:
+            payload = self._read()
+            rows = payload.get("positions") if isinstance(payload.get("positions"), dict) else {}
+            row = rows.get(key)
+            if isinstance(row, dict) and price and float(price) > 0:
+                row["trail_sl_price"] = float(price)
+                rows[key] = row
+                payload["positions"] = rows
+                self._write(payload)
+
+    def _set_sl_order(self, key: str, order_id: str, sl_price: Any = None) -> None:
+        with _LOCK:
+            payload = self._read()
+            rows = payload.get("positions") if isinstance(payload.get("positions"), dict) else {}
+            row = rows.get(key)
+            if isinstance(row, dict):
+                row["sl_order_id"] = order_id
+                if sl_price:
+                    row["sl_price"] = sl_price
+                    row["trail_sl_price"] = sl_price
+                rows[key] = row
+                payload["positions"] = rows
+                self._write(payload)
+
+    def _ratchet_runner(
+        self,
+        bitget: BitgetPaperConnector,
+        pos: dict[str, Any],
+        meta: dict[str, Any],
+        key: str,
+    ) -> None:
+        """Move the remaining 50% stop toward the money. Never loosens past breakeven."""
+        side = str(pos.get("side") or meta.get("side") or "buy")
+        entry = coerce_price(pos.get("entry_price"), meta.get("entry_price"))
+        mark = coerce_price(pos.get("mark_price"))
+        if entry <= 0 or mark <= 0:
+            return
+        current = coerce_price(meta.get("trail_sl_price"), pos.get("trail_sl_price"), entry)
+        new_sl = ratchet_trail_sl(side, entry, mark, current)
+        if new_sl <= 0:
+            return
+        moved = abs(new_sl - current) / max(current, entry, 1e-9) > 0.0005
+        if not moved and current > 0:
+            return
+        self._set_trail_sl(key, new_sl)
+        pos["trail_sl_price"] = new_sl
+        meta["trail_sl_price"] = new_sl
+        qty = float(pos.get("contracts") or meta.get("qty") or 0.0)
+        try:
+            upd = bitget.update_stop_loss(
+                str(pos.get("symbol")),
+                side,
+                qty,
+                new_sl,
+                old_order_id=str(meta.get("sl_order_id") or "") or None,
+            )
+            if upd.get("sl_order_id"):
+                self._set_sl_order(key, str(upd["sl_order_id"]), new_sl)
+            print(
+                f"[DESK] TRAIL_SL  {pos.get('symbol')}  {current} → {new_sl}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[DESK] TRAIL_SL venue update failed (local trail kept): {exc}", flush=True)
 
     def _read(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -237,6 +362,46 @@ class PositionDesk:
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(self.path)
+
+
+def occupied_symbols(book: list[dict[str, Any]] | None) -> list[str]:
+    """Live Demo names that already have a position — banned from NEW entries."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for pos in book or []:
+        if not pos.get("open"):
+            continue
+        symbol = str(pos.get("symbol") or "").strip()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        out.append(symbol)
+    return out
+
+
+def occupied_roots(book: list[dict[str, Any]] | None) -> set[str]:
+    return {ticker_root(s) for s in occupied_symbols(book) if ticker_root(s)}
+
+
+def strip_occupied_universe(
+    universe: list[str] | tuple[str, ...] | None,
+    book: list[dict[str, Any]] | None,
+) -> list[str]:
+    blocked = occupied_roots(book)
+    out: list[str] = []
+    for symbol in universe or []:
+        name = str(symbol).strip()
+        if not name:
+            continue
+        if ticker_root(name) in blocked:
+            continue
+        out.append(name)
+    return out
+
+
+def is_occupied(symbol: str, book: list[dict[str, Any]] | None) -> bool:
+    root = ticker_root(symbol)
+    return bool(root) and root in occupied_roots(book)
 
 
 def ticker_root(symbol: str) -> str:
@@ -269,30 +434,39 @@ def _exit_reason(
     brief: AnalystBrief | None,
     meta: dict[str, Any],
     high: float,
+    candles: dict[str, Any] | None = None,
 ) -> str:
     pnl_pct = float(pos.get("pnl_pct") or 0.0)
     side = str(pos.get("side") or "buy")
     mark = coerce_price(pos.get("mark_price"))
     sl = coerce_price(pos.get("sl_price"), meta.get("sl_price"))
     tp = coerce_price(pos.get("tp_price"), meta.get("tp_price"))
+    trail = coerce_price(pos.get("trail_sl_price"), meta.get("trail_sl_price"))
     if sl > 0 and _hit_level(side, mark, sl, stop=True):
         return "SL"
-    if tp > 0 and _hit_level(side, mark, tp, stop=False):
+    if trail > 0 and _hit_level(side, mark, trail, stop=True):
+        return "TRAIL"
+    if tp > 0 and _hit_level(side, mark, tp, stop=False) and bool(meta.get("partial_taken")):
         return "TP"
     if pnl_pct <= -STOP_LOSS_PCT * 100.0:
         return "SL"
-    if pnl_pct >= TAKE_PROFIT_PCT * 100.0:
-        return "TP"
     invalid = _thesis_invalidated(pos, brief)
     if invalid:
         return f"THESIS {invalid}"
-    if (
-        pnl_pct >= PARTIAL_ARM_PCT
-        and not bool(meta.get("partial_taken"))
-        and pnl_pct < TAKE_PROFIT_PCT * 100.0
-    ):
+    if candles and structure_break_against(side, candles):
+        return (
+            f"STRUCTURE {candles.get('structure') or 'break'} "
+            f"{candles.get('pattern') or ''}".strip()
+        )
+    if pnl_pct >= PARTIAL_ARM_PCT and not bool(meta.get("partial_taken")):
         return "PARTIAL_TP"
-    if high >= TRAIL_ARM_PCT and (high - pnl_pct) >= TRAIL_GIVEBACK_PCT:
+    if bool(meta.get("partial_taken")) and high >= PARTIAL_ARM_PCT and (
+        high - pnl_pct
+    ) >= TRAIL_GIVEBACK_PCT:
+        return "TRAIL"
+    if bool(meta.get("partial_taken")) and high >= TRAIL_ARM_PCT and (
+        high - pnl_pct
+    ) >= TRAIL_GIVEBACK_PCT:
         return "TRAIL"
     return ""
 
@@ -341,6 +515,8 @@ def _kind(reason: str) -> str:
         return "SL"
     if "PARTIAL" in raw:
         return "PARTIAL"
+    if "STRUCTURE" in raw:
+        return "STRUCTURE"
     if raw.startswith("TP") or "TP" in raw:
         return "TP"
     if "TRAIL" in raw:

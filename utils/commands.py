@@ -15,23 +15,39 @@ from core.config import PROJECT_ROOT
 from core.positions import PositionDesk, ticker_root
 from connectors.bitget_paper import BitgetPaperConnector
 from utils.notifier import TelegramNotifier
+from utils.spot_chat import (
+    CALLBACK_CANCEL,
+    CALLBACK_CONFIRM,
+    bind_message,
+    cancelled_html,
+    confirm_keyboard,
+    consume_ticket,
+    issue_ticket,
+    parse_callback,
+    parse_spot_intent,
+    preview_html,
+    receipt_html,
+    timeline_html,
+)
 
 OFFSET_PATH = PROJECT_ROOT / "data" / "telegram_offset.json"
 TELEGRAM_UPDATES = "https://api.telegram.org/bot{token}/getUpdates"
 HELP_PLAIN = (
     "CHRONOS-NEXUS COMMANDS\n"
-    "Manual open is disabled. Close override is yours.\n\n"
+    "AI desk opens are automated only. Manual chatbox is Bitget SPOT.\n\n"
     "/positions          live book + PnL\n"
     "/close SYMBOL       market-close one name\n"
     "/closeall           flatten the whole Demo book\n"
+    "NVDA/USDT BUY $10   Spot preview + confirm buttons\n"
     "/help               this list"
 )
 HELP_HTML = (
     "<b>CHRONOS-NEXUS COMMANDS</b>\n"
-    "Manual open is disabled. Close override is yours.\n\n"
+    "AI cycle is untouched. Manual chatbox is <b>Bitget Spot</b> only.\n\n"
     "<code>/positions</code> — live book + PnL\n"
     "<code>/close SYMBOL</code> — market-close one name\n"
     "<code>/closeall</code> — flatten the whole Demo book\n"
+    "<code>NVDA/USDT BUY $10</code> — Spot preview, then Confirm / Cancel\n"
     "<code>/help</code> — this list"
 )
 
@@ -95,7 +111,10 @@ class CommandDesk:
         if cmd == "close":
             return self._cmd_close(arg, source=source)
         if cmd in {"buy", "sell", "open", "long", "short"}:
-            msg = "REFUSED — manual open is disabled. Use /close or /closeall."
+            msg = (
+                "REFUSED — manual open is disabled on the AI desk. "
+                "For a Bitget Spot chatbox fill send: NVDA/USDT BUY $10"
+            )
             return CommandResult(cmd, False, msg, f"<b>{msg}</b>", [])
         msg = f"Unknown command /{cmd}. Try /help."
         return CommandResult(cmd, False, msg, f"Unknown command <code>/{cmd}</code>. Try /help.", [])
@@ -245,7 +264,10 @@ class TelegramCommandLoop:
             target=self._run, daemon=True, name="chronos-telegram-commands"
         )
         self._thread.start()
-        print("[TELEGRAM] command loop armed  /positions /close /closeall", flush=True)
+        print(
+            "[TELEGRAM] command loop armed  /positions /close /closeall  + Spot chatbox",
+            flush=True,
+        )
 
     def stop(self) -> None:
         self._stop.set()
@@ -264,7 +286,10 @@ class TelegramCommandLoop:
                 time.sleep(3.0)
 
     def _poll(self, offset: int) -> tuple[list[dict[str, Any]], int]:
-        params: dict[str, Any] = {"timeout": 20, "allowed_updates": json.dumps(["message"])}
+        params: dict[str, Any] = {
+            "timeout": 20,
+            "allowed_updates": json.dumps(["message", "callback_query"]),
+        }
         if offset:
             params["offset"] = offset
         resp = requests.get(
@@ -285,6 +310,10 @@ class TelegramCommandLoop:
         return updates, nxt
 
     def _handle(self, update: dict[str, Any]) -> None:
+        callback = update.get("callback_query") if isinstance(update.get("callback_query"), dict) else None
+        if callback:
+            self._handle_callback(callback)
+            return
         message = update.get("message") if isinstance(update.get("message"), dict) else {}
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         chat_id = str(chat.get("id") or "")
@@ -293,11 +322,134 @@ class TelegramCommandLoop:
         text = str(message.get("text") or "").strip()
         if not text:
             return
+        intent = parse_spot_intent(text)
+        if intent is not None:
+            self._preview_spot(intent, chat_id)
+            return
         result = self.commands.handle(text, source="telegram")
         if not result.cmd:
             return
         if result.html:
             self.notifier.reply(result.html)
+
+    def _preview_spot(self, intent: Any, chat_id: str) -> None:
+        bitget = self.commands.bitget
+        if bitget is None:
+            self.notifier.reply("<b>Bitget Demo rail unbound</b> — cannot preview a Spot ticket.")
+            return
+        try:
+            quote = bitget.fetch_spot_quote(intent.symbol)
+        except Exception as exc:
+            self.notifier.reply(f"<b>Spot ticker failed</b>\n{exc}")
+            return
+        symbol = str(quote.get("symbol") or "")
+        last = float(quote.get("last") or 0.0)
+        if not quote.get("ok") or last <= 0 or not symbol:
+            err = quote.get("error") or f"{intent.symbol} is not a Bitget Spot listing."
+            self.notifier.reply(
+                "<b>SPOT PREVIEW REJECTED</b>\n"
+                f"{err}\n"
+                "Manual chat trades are <b>Spot only</b> — futures/perps are reserved for the AI cycle."
+            )
+            return
+        try:
+            balance = float(bitget.fetch_spot_usdt_free())
+        except Exception:
+            balance = 0.0
+        qty = intent.quote_usdt / last
+        ticket = issue_ticket(
+            chat_id=chat_id,
+            symbol=symbol,
+            side=intent.side,
+            quote_usdt=intent.quote_usdt,
+            last=last,
+            qty=qty,
+            balance_usdt=balance,
+        )
+        sent = self.notifier.send_html_sync(
+            preview_html(ticket),
+            reply_markup=confirm_keyboard(ticket.id),
+            chat_id=chat_id,
+        )
+        mid = sent.get("message_id")
+        if mid:
+            bind_message(ticket.id, int(mid))
+
+    def _handle_callback(self, callback: dict[str, Any]) -> None:
+        cq_id = str(callback.get("id") or "")
+        data = str(callback.get("data") or "")
+        message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        chat_id = str(chat.get("id") or "")
+        message_id = message.get("message_id")
+        if chat_id != str(self.notifier.chat_id):
+            self.notifier.answer_callback(cq_id, "Ignored.")
+            return
+        parsed = parse_callback(data)
+        if parsed is None:
+            self.notifier.answer_callback(cq_id, "Unknown button.")
+            return
+        action, ticket_id = parsed
+        ticket = consume_ticket(ticket_id, chat_id=chat_id, action=action)
+        if ticket is None:
+            self.notifier.answer_callback(cq_id, "Expired or already used.")
+            if message_id:
+                self.notifier.edit_html(
+                    int(message_id),
+                    "<b>CHRONOS-NEXUS</b>\nThis Spot preview expired or was already used.",
+                    chat_id=chat_id,
+                )
+            return
+        if action == CALLBACK_CANCEL:
+            self.notifier.answer_callback(cq_id, "Cancelled.")
+            self.notifier.edit_html(
+                int(message_id or ticket.message_id or 0),
+                cancelled_html(ticket),
+                chat_id=chat_id,
+            )
+            return
+        self.notifier.answer_callback(cq_id, "Submitting Spot order…")
+        self._execute_spot(ticket, int(message_id or ticket.message_id or 0), chat_id)
+
+    def _execute_spot(self, ticket: Any, message_id: int, chat_id: str) -> None:
+        bitget = self.commands.bitget
+        edit = self.notifier.edit_html
+        if bitget is None:
+            edit(message_id, "<b>Bitget unbound</b> — Spot order not sent.", chat_id=chat_id)
+            return
+        edit(message_id, timeline_html(ticket, "processing"), chat_id=chat_id)
+        edit(message_id, timeline_html(ticket, "balance"), chat_id=chat_id)
+        try:
+            free = float(bitget.fetch_spot_usdt_free())
+        except Exception as exc:
+            edit(
+                message_id,
+                timeline_html(ticket, "balance", f"Balance check failed: {exc}"),
+                chat_id=chat_id,
+            )
+            return
+        if ticket.side == "buy" and free + 1e-9 < ticket.quote_usdt:
+            edit(
+                message_id,
+                receipt_html(
+                    ticket,
+                    {
+                        "ok": False,
+                        "status": "INSUFFICIENT_MARGIN",
+                        "error": f"Spot USDT free {free:.4f} < {ticket.quote_usdt:.2f}",
+                        "symbol": ticket.symbol,
+                    },
+                ),
+                chat_id=chat_id,
+            )
+            return
+        edit(message_id, timeline_html(ticket, "submit"), chat_id=chat_id)
+        try:
+            order = bitget.execute_spot_market(ticket.symbol, ticket.side, ticket.quote_usdt)
+        except Exception as exc:
+            order = {"ok": False, "status": "ERROR", "error": str(exc)[:400], "symbol": ticket.symbol}
+        edit(message_id, timeline_html(ticket, "done"), chat_id=chat_id)
+        edit(message_id, receipt_html(ticket, order), chat_id=chat_id)
 
 
 class TerminalCommandLoop:
@@ -339,6 +491,11 @@ class TerminalCommandLoop:
                 continue
             text = (line or "").strip()
             if not text:
+                continue
+            if parse_spot_intent(text):
+                self.printer(
+                    "Spot chatbox is Telegram-only. Send NVDA/USDT BUY $10 in Telegram to preview + confirm."
+                )
                 continue
             try:
                 result = self.commands.handle(text, source="terminal")

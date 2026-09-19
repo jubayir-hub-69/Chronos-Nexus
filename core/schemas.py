@@ -39,6 +39,10 @@ class AnalystBrief(BaseModel):
     news_bad: str = ""
     stay_away: list[str] = Field(default_factory=list)
     selection_reason: str = ""
+    sentiment_score: float = 50.0
+    news_credibility: float = 0.5
+    news_conflict: bool = False
+    news_impact: str = "low"
     llm_degraded: bool = False
     model: str = ""
 
@@ -52,6 +56,36 @@ class RiskReport(BaseModel):
     size_multiplier: float = 1.0
     rationale: str
     spread_pct: float | None = None
+    rsi: float | None = None
+    rsi_timeframe: str = ""
+    rsi_period: int = 14
+    ta_verdict: Literal["PASS", "VETO", "SKIPPED"] = "SKIPPED"
+    asset_risk_score: float = 50.0
+    sl_margin_frac: float = 0.75
+    margin_usdt: float | None = None
+    sl_price: float | None = None
+    tp_price: float | None = None
+    candle_structure: str = ""
+    candle_bias: str = ""
+    candle_pattern: str = ""
+    volatility: str = ""
+    market_cap_usdt: float | None = None
+    total_supply: float | None = None
+    last_price: float | None = None
+    fund_ok: bool = False
+    daily_halt: str = ""
+    equity_usdt: float | None = None
+    daily_budget_usdt: float | None = None
+    daily_deployed_usdt: float | None = None
+    daily_entries: int = 0
+    setup_score: float = 0.0
+    setup_threshold: float = 90.0
+    mtf_align: str = ""
+    book_imbalance: float | None = None
+    rvol: float | None = None
+    vwap_dev_pct: float | None = None
+    pullback_ok: bool = False
+    sentiment_score: float | None = None
     llm_degraded: bool = False
     model: str = ""
 

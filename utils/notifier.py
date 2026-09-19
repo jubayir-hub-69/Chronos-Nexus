@@ -17,8 +17,11 @@ TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_PHOTO = "https://api.telegram.org/bot{token}/sendPhoto"
 STARTUP_TEXT = (
     "Chronos-Nexus is ONLINE — glasshouse desk, SL/TP armed, hourly tape scan.\n"
-    "Commands: /positions  /close SYMBOL  /closeall  /help"
+    "Commands: /positions  /close SYMBOL  /closeall  /help\n"
+    "Spot chatbox: NVDA/USDT BUY $10  (confirm in-chat, Spot market only)"
 )
+TELEGRAM_EDIT = "https://api.telegram.org/bot{token}/editMessageText"
+TELEGRAM_CALLBACK = "https://api.telegram.org/bot{token}/answerCallbackQuery"
 _TELEGRAM_MAX = 3900
 _INFLIGHT: list[threading.Thread] = []
 _INFLIGHT_LOCK = threading.Lock()
@@ -204,6 +207,7 @@ class TelegramNotifier:
         model: str = "",
         status: str = "",
         spread: str = "",
+        rsi: str = "",
     ) -> None:
         flag_bit = ", ".join(flags or []) or "none"
         title = "SENTINEL <b>VETO</b>  ·  trade skipped"
@@ -218,6 +222,8 @@ class TelegramNotifier:
         ]
         if spread:
             lines.append(f"<b>Spread:</b> <code>{_html(spread)}</code>")
+        if rsi:
+            lines.append(f"<b>RSI(14):</b> <code>{_html(rsi)}</code>")
         lines.append(f"<b>Flags:</b> <code>{_html(flag_bit)}</code>")
         if model:
             lines.append(f"<b>Model:</b> <code>{_html(model or '—')}</code>")
@@ -359,6 +365,88 @@ class TelegramNotifier:
     def reply(self, text: str) -> None:
         """Synchronous-feel reply used by the command loop (still never raises)."""
         self.send_async(text)
+
+    def send_html_sync(
+        self,
+        text: str,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+        chat_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Blocking send used by the chatbox thread. Returns Telegram result or {}."""
+        if not self.enabled:
+            return {}
+        payload: dict[str, Any] = {
+            "chat_id": str(chat_id or self.chat_id),
+            "text": _clip_telegram(text),
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        try:
+            return self._telegram_post(TELEGRAM_API.format(token=self.token), payload)
+        except Exception as exc:
+            print(f"[TELEGRAM ERROR] send_html_sync: {exc}", flush=True)
+            return {}
+
+    def edit_html(
+        self,
+        message_id: int,
+        text: str,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+        chat_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not self.enabled or not message_id:
+            return {}
+        payload: dict[str, Any] = {
+            "chat_id": str(chat_id or self.chat_id),
+            "message_id": int(message_id),
+            "text": _clip_telegram(text),
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        else:
+            payload["reply_markup"] = {"inline_keyboard": []}
+        try:
+            return self._telegram_post(TELEGRAM_EDIT.format(token=self.token), payload)
+        except Exception as exc:
+            print(f"[TELEGRAM ERROR] edit_html: {exc}", flush=True)
+            return {}
+
+    def answer_callback(self, callback_query_id: str, text: str = "") -> None:
+        if not self.enabled or not callback_query_id:
+            return
+        payload: dict[str, Any] = {"callback_query_id": str(callback_query_id)}
+        if text:
+            payload["text"] = text[:180]
+        try:
+            self._telegram_post(TELEGRAM_CALLBACK.format(token=self.token), payload)
+        except Exception as exc:
+            print(f"[TELEGRAM ERROR] answer_callback: {exc}", flush=True)
+
+    def _telegram_post(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        def _once() -> dict[str, Any]:
+            resp = requests.post(url, json=payload, timeout=12)
+            body = ""
+            try:
+                body = resp.text[:300]
+            except Exception:
+                body = ""
+            if resp.status_code == 429:
+                raise TimeoutError(f"429 telegram rate limit {body}")
+            if resp.status_code >= 400:
+                raise RuntimeError(f"telegram HTTP {resp.status_code}: {body}")
+            data = resp.json() if resp.content else {}
+            if isinstance(data, dict) and data.get("ok") is False:
+                raise RuntimeError(str(data.get("description") or "telegram call failed"))
+            result = data.get("result") if isinstance(data, dict) else None
+            return result if isinstance(result, dict) else {}
+
+        return call_with_backoff(_once, attempts=3, label="telegram.api")
 
     def send_photo_async(self, png: bytes, caption: str) -> None:
         if not self.enabled:
