@@ -19,7 +19,9 @@ TICKET_TTL_S = 300
 CALLBACK_CONFIRM = "s1"
 CALLBACK_CANCEL = "s0"
 MIN_QUOTE_USDT = 1.0
-MAX_QUOTE_USDT = 10_000.0
+# Overflow guard only. Wallet / execute_spot_market is the real size gate
+# (e.g. "SOL/USDT BUY $999999" must parse, then reject on insufficient USDT).
+MAX_QUOTE_USDT = 1_000_000_000.0
 
 _LOCK = threading.Lock()
 _TICKETS: dict[str, "SpotTicket"] = {}
@@ -55,6 +57,11 @@ _DESK_CMDS = {
     "help",
     "start",
     "?",
+    "price",
+    "px",
+    "balance",
+    "bal",
+    "balances",
 }
 
 
@@ -96,6 +103,8 @@ def parse_spot_intent(text: str) -> SpotIntent | None:
     try:
         amount = float(match.group("amount"))
     except (TypeError, ValueError):
+        return None
+    if amount != amount or amount in {float("inf"), float("-inf")}:
         return None
     if amount < MIN_QUOTE_USDT or amount > MAX_QUOTE_USDT:
         return None

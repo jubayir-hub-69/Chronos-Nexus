@@ -7,6 +7,10 @@ from typing import Any
 
 SOURCE_WEIGHT: dict[str, float] = {
     "CNBC": 1.00,
+    "Bloomberg": 1.00,
+    "Reuters": 0.98,
+    "WSJ": 0.96,
+    "Financial Times": 0.95,
     "Yahoo Finance": 0.88,
     "MarketWatch": 0.82,
     "CoinTelegraph": 0.52,
@@ -36,6 +40,10 @@ _BULL: tuple[tuple[str, float], ...] = (
     ("bullish", 6.0),
     ("strong demand", 8.0),
     ("beat", 7.0),
+    ("rate cut", 10.0),
+    ("dovish", 9.0),
+    ("soft landing", 8.0),
+    ("risk-on", 6.0),
 )
 
 _BEAR: tuple[tuple[str, float], ...] = (
@@ -67,6 +75,11 @@ _BEAR: tuple[tuple[str, float], ...] = (
     ("default", 16.0),
     ("restatement", 14.0),
     ("whistleblower", 12.0),
+    ("hawkish", 9.0),
+    ("rate hike", 10.0),
+    ("hot cpi", 12.0),
+    ("recession", 14.0),
+    ("risk-off", 6.0),
 )
 
 _HIGH_IMPACT: tuple[str, ...] = (
@@ -82,8 +95,29 @@ _HIGH_IMPACT: tuple[str, ...] = (
     "sanction",
     "fda",
     "sec ",
+    "fomc",
+    "payrolls",
+    "nfp",
+    "powell",
 )
 _RUMOR: tuple[str, ...] = ("rumor", "unconfirmed", "sources say", "might", "could", " reportedly")
+_MACRO: tuple[str, ...] = (
+    "fed ",
+    "fomc",
+    "powell",
+    "cpi",
+    "pce",
+    "nfp",
+    "payrolls",
+    "treasury",
+    "yield",
+    "dxy",
+    "oil ",
+    "opec",
+    "geopolit",
+    "tariff",
+    "sanction",
+)
 
 VETO_REASON_NEWS = "VETO: News sentiment too weak or conflicted"
 
@@ -98,6 +132,10 @@ def score_headline(headline: str, source: str = "", published: str = "", detail:
         cred *= 0.55
     recency = _recency_weight(published)
     impact = "high" if any(tok in blob for tok in _HIGH_IMPACT) else ("medium" if bull + bear >= 10 else "low")
+    macro = any(tok in blob for tok in _MACRO)
+    if macro and impact != "high":
+        impact = "high"
+    # Log-odds style: source credibility and recency shrink the move toward 50.
     sentiment = max(0.0, min(100.0, 50.0 + (raw - 50.0) * cred * recency))
     direction = "bull" if sentiment >= 58 else ("bear" if sentiment <= 42 else "neutral")
     return {
@@ -105,6 +143,7 @@ def score_headline(headline: str, source: str = "", published: str = "", detail:
         "credibility": round(cred, 3),
         "recency": round(recency, 3),
         "impact": impact,
+        "macro": macro,
         "direction": direction,
         "source": source,
         "headline": headline,
@@ -155,6 +194,8 @@ def score_wire(
             "n": 0,
             "direction": "neutral",
             "impact": "low",
+            "macro": False,
+            "conviction": 0,
             "headlines": [],
         }
     focused = [r for r in rows if r.get("focused")] or rows
@@ -177,6 +218,16 @@ def score_wire(
         "medium" if any(r["impact"] == "medium" for r in focused) else "low"
     )
     direction = "bull" if sentiment >= 58 else ("bear" if sentiment <= 42 else "neutral")
+    macro = any(bool(r.get("macro")) for r in focused)
+    conv = conviction_score("buy" if direction == "bull" else ("sell" if direction == "bear" else "none"), {
+        "scored": True,
+        "sentiment": sentiment,
+        "credibility": cred,
+        "conflict": conflict,
+        "impact": impact,
+        "macro": macro,
+        "recency": sum(float(r.get("recency") or 0.8) for r in focused) / max(len(focused), 1),
+    })
     return {
         "scored": True,
         "sentiment": round(sentiment, 2),
@@ -185,6 +236,8 @@ def score_wire(
         "n": len(focused),
         "direction": direction,
         "impact": impact,
+        "macro": macro,
+        "conviction": conv,
         "headlines": focused[:8],
     }
 
@@ -205,6 +258,43 @@ def news_veto(side: str, news: dict[str, Any] | None) -> str:
     if side_n == "sell" and sentiment > 42:
         return VETO_REASON_NEWS
     return ""
+
+
+def conviction_score(side: str, news: dict[str, Any] | None) -> int:
+    """0–100 institutional conviction: |sentiment-50| × credibility × recency × impact × side-align.
+
+    Neutral tape cannot print a high conviction. Conflicted tape is capped at 20.
+    """
+    payload = news if isinstance(news, dict) else {}
+    if not payload.get("scored"):
+        return 0
+    try:
+        sentiment = float(payload.get("sentiment") or 50.0)
+    except (TypeError, ValueError):
+        sentiment = 50.0
+    try:
+        cred = float(payload.get("credibility") or 0.5)
+    except (TypeError, ValueError):
+        cred = 0.5
+    try:
+        recency = float(payload.get("recency") or 0.8)
+    except (TypeError, ValueError):
+        recency = 0.8
+    impact = str(payload.get("impact") or "low").lower()
+    impact_w = {"high": 1.15, "medium": 1.0, "low": 0.72}.get(impact, 0.8)
+    if payload.get("macro"):
+        impact_w *= 1.08
+    stretch = abs(sentiment - 50.0) / 50.0
+    side_n = (side or "").strip().lower()
+    aligned = (side_n == "buy" and sentiment >= 58) or (side_n == "sell" and sentiment <= 42)
+    if payload.get("conflict"):
+        return 20
+    if side_n in {"buy", "sell"} and not aligned:
+        return min(40, int(round(35.0 * cred)))
+    raw = 100.0 * stretch * max(0.15, cred) * max(0.25, recency) * impact_w
+    # Map a 0.5 stretch at full cred/recency/high-impact (~0.66) into the 70–95 band.
+    score = 50.0 + raw * 0.9
+    return int(max(0, min(100, round(score))))
 
 
 def _recency_weight(published: str) -> float:

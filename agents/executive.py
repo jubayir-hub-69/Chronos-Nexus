@@ -35,6 +35,7 @@ Hard rules the Python chair will also enforce:
 - Daily hard stand-down (4 entries, 3 wins, any SL, chop/downtrend, 6% equity cap) → STAND_DOWN / VETOED
 - ORACLE idle (primary_symbol=NONE, side=none, conviction=0, or Qwen timeout) → STAND_DOWN
 - No live last price → STAND_DOWN / DEGRADED
+- Last price is the live Bitget MAINNET BBO peg (BUY=best ask, SELL=best bid), never a sandbox mid.
 - CLEAR or REDUCE → EXECUTE (REDUCE already cut size; it is not a veto)
 - NEVER invent NVDA or a BUY when ORACLE stood down.
 - The Demo symbol may be a proxy (e.g. BTC/USDT) when rTokens are not listed on Bitget Demo. That is a venue constraint, not a reason to stand down.
@@ -82,7 +83,7 @@ class ExecutiveAgent:
             f"ORACLE brief:\n{brief.model_dump()}\n\n"
             f"SENTINEL report:\n{risk.model_dump()}\n\n"
             f"Tradable Demo symbol (proxy if rToken unlisted): {tradable_symbol}\n"
-            f"Last price: {last_price}\n"
+            f"Live mainnet BBO peg (BUY=ask, SELL=bid): {last_price}\n"
             f"TA confluence: RSI({risk.rsi_period or 14})={rsi_bit} "
             f"{risk.rsi_timeframe or ''} ta_verdict={risk.ta_verdict} "
             f"structure={risk.candle_structure or 'n/a'} "

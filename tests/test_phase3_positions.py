@@ -136,6 +136,14 @@ class CommandParseTests(unittest.TestCase):
         self.assertEqual(parse_command("closeall"), ("closeall", ""))
         self.assertEqual(parse_command("flatten"), ("closeall", ""))
         self.assertEqual(parse_command("/help"), ("help", ""))
+        self.assertEqual(parse_command("/price BGB"), ("price", "BGB"))
+        self.assertEqual(parse_command("/balance"), ("balance", ""))
+        self.assertEqual(parse_command("/balance USDT"), ("balance", "USDT"))
+        self.assertEqual(parse_command("/balance nvda"), ("balance", "nvda"))
+        self.assertEqual(parse_command("SOL/USDT BUY $999999"), ("", ""))
+        self.assertEqual(parse_command("/SOL/USDT BUY $10"), ("", ""))
+        self.assertEqual(parse_command("hello world"), ("", ""))
+        self.assertEqual(parse_command("/unknowncmd"), ("unknowncmd", ""))
 
     def test_manual_open_is_refused(self) -> None:
         desk = CommandDesk(None, PositionDesk())

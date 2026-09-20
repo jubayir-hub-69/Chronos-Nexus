@@ -35,6 +35,86 @@ TRAIL_LOCK_PCT = 0.01
 ATR_PERIOD = 14
 VOL_HIGH_ATR_PCT = 0.04
 VOL_MED_ATR_PCT = 0.015
+# Live mainnet BBO vs markPrice. Wider than the 1.5% L2 spread veto so a
+# marketable ask can sit off mark without being a sandbox print anomaly.
+BBO_MARK_DIVERGENCE_PCT = 2.0
+VETO_REASON_MARK = "VETO: Live BBO diverges from markPrice"
+
+
+def _pos_px(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def bbo_peg_price(side: str, bid: Any, ask: Any) -> float | None:
+    """Best execution: BUY lifts the ask, SELL/CLOSE hits the bid. Never a mid."""
+    side_n = (side or "").strip().lower()
+    bid_f = _pos_px(bid)
+    ask_f = _pos_px(ask)
+    if side_n in {"buy", "long", "cover"}:
+        return ask_f
+    if side_n in {"sell", "short"}:
+        return bid_f
+    return None
+
+
+def extract_mark_price(*sources: Any) -> float | None:
+    """First positive mark/index from ticker dicts or scalars. Bitget uses markPrice."""
+    for src in sources:
+        if src is None or src == "":
+            continue
+        if isinstance(src, dict):
+            info = src.get("info") if isinstance(src.get("info"), dict) else {}
+            found = extract_mark_price(
+                src.get("mark"),
+                src.get("markPrice"),
+                src.get("index"),
+                src.get("indexPrice"),
+                info.get("markPrice") if info else None,
+                info.get("markPr") if info else None,
+                info.get("indexPrice") if info else None,
+            )
+            if found:
+                return found
+            continue
+        got = _pos_px(src)
+        if got:
+            return got
+    return None
+
+
+def mark_divergence_pct(px: Any, mark: Any) -> float | None:
+    price = _pos_px(px)
+    mark_f = _pos_px(mark)
+    if price is None or mark_f is None:
+        return None
+    return abs(price - mark_f) / mark_f * 100.0
+
+
+def bbo_sane_vs_mark(
+    *,
+    peg: Any,
+    mark: Any,
+    is_contract: bool,
+    max_pct: float = BBO_MARK_DIVERGENCE_PCT,
+) -> bool:
+    """Spot: BBO is enough. Swap/rToken perps: refuse a BBO that has blown off mark."""
+    if _pos_px(peg) is None:
+        return False
+    if not is_contract:
+        return True
+    mark_f = _pos_px(mark)
+    if mark_f is None:
+        return True
+    div = mark_divergence_pct(peg, mark_f)
+    if div is None:
+        return True
+    return div <= float(max_pct)
 
 
 def compute_rsi(closes: Sequence[Any], period: int = RSI_PERIOD) -> float | None:
@@ -184,6 +264,10 @@ def snapshot_ta(ta: dict[str, Any] | None) -> dict[str, Any]:
         "rvol",
         "vwap",
         "vwap_dev_pct",
+        "poc",
+        "vah",
+        "val",
+        "in_value_area",
         "mtf",
         "frames",
         "align",
@@ -410,6 +494,79 @@ def analyze_volume(rows: Sequence[Any]) -> dict[str, Any]:
     }
 
 
+def analyze_volume_profile(rows: Sequence[Any], bins: int = 20) -> dict[str, Any]:
+    """Session volume profile from OHLCV: POC + 70% value area.
+
+    Fake breakouts print outside the value area on thin volume.
+    """
+    points: list[tuple[float, float]] = []
+    last_close = None
+    for row in rows or []:
+        try:
+            high = float(row[2])
+            low = float(row[3])
+            close = float(row[4])
+            vol = float(row[5]) if len(row) > 5 else 0.0
+        except (TypeError, ValueError, IndexError):
+            continue
+        if min(high, low, close) <= 0:
+            continue
+        typical = (high + low + close) / 3.0
+        points.append((typical, max(vol, 0.0)))
+        last_close = close
+    if len(points) < 8 or last_close is None:
+        return {
+            "ok": False,
+            "poc": None,
+            "vah": None,
+            "val": None,
+            "in_value_area": None,
+            "last_vs_poc_pct": None,
+        }
+    lo = min(p for p, _ in points)
+    hi = max(p for p, _ in points)
+    if hi <= lo:
+        return {
+            "ok": False,
+            "poc": lo,
+            "vah": hi,
+            "val": lo,
+            "in_value_area": True,
+            "last_vs_poc_pct": 0.0,
+        }
+    width = (hi - lo) / float(max(int(bins), 4))
+    hist = [0.0] * max(int(bins), 4)
+    for px, vol in points:
+        idx = min(len(hist) - 1, max(0, int((px - lo) / width)))
+        hist[idx] += vol
+    poc_i = max(range(len(hist)), key=lambda i: hist[i])
+    poc = lo + (poc_i + 0.5) * width
+    total = sum(hist)
+    target = total * 0.70
+    lo_i = hi_i = poc_i
+    covered = hist[poc_i]
+    while covered < target and (lo_i > 0 or hi_i < len(hist) - 1):
+        left = hist[lo_i - 1] if lo_i > 0 else -1.0
+        right = hist[hi_i + 1] if hi_i < len(hist) - 1 else -1.0
+        if right >= left:
+            hi_i += 1
+            covered += hist[hi_i]
+        else:
+            lo_i -= 1
+            covered += hist[lo_i]
+    val = lo + lo_i * width
+    vah = lo + (hi_i + 1) * width
+    in_va = val <= last_close <= vah
+    return {
+        "ok": True,
+        "poc": round(poc, 8),
+        "vah": round(vah, 8),
+        "val": round(val, 8),
+        "in_value_area": in_va,
+        "last_vs_poc_pct": round((last_close - poc) / poc * 100.0, 4) if poc else None,
+    }
+
+
 def analyze_book(book: dict[str, Any] | None, *, side: str = "", last: float | None = None) -> dict[str, Any]:
     """L2 imbalance + opposing walls. Uses CCXT fetch_order_book levels."""
     payload = book if isinstance(book, dict) else {}
@@ -427,9 +584,9 @@ def analyze_book(book: dict[str, Any] | None, *, side: str = "", last: float | N
     bid_wall = _wall(bids, px, above=False)
     side_n = (side or "").strip().lower()
     veto = ""
-    if side_n == "buy" and ask_wall:
+    if side_n == "buy" and (ask_wall or imbalance <= -0.35):
         veto = VETO_REASON_WALL
-    if side_n == "sell" and bid_wall:
+    if side_n == "sell" and (bid_wall or imbalance >= 0.35):
         veto = VETO_REASON_WALL
     return {
         "ok": bool(bids or asks),
@@ -488,6 +645,7 @@ def enrich_ohlcv(rows: Sequence[Any], timeframe: str) -> dict[str, Any]:
             continue
     vwap = compute_vwap(rows)
     volume = analyze_volume(rows)
+    profile = analyze_volume_profile(rows)
     candles["rsi"] = compute_rsi(closes)
     candles["timeframe"] = timeframe
     candles["vwap"] = vwap.get("vwap")
@@ -495,8 +653,12 @@ def enrich_ohlcv(rows: Sequence[Any], timeframe: str) -> dict[str, Any]:
     candles["rvol"] = volume.get("rvol")
     candles["avg_vol"] = volume.get("avg_vol")
     candles["last_vol"] = volume.get("last_vol")
+    candles["poc"] = profile.get("poc")
+    candles["vah"] = profile.get("vah")
+    candles["val"] = profile.get("val")
+    candles["in_value_area"] = profile.get("in_value_area")
     candles["bars"] = len(closes)
-    candles["ok"] = bool(candles.get("ok") or vwap.get("ok") or volume.get("ok"))
+    candles["ok"] = bool(candles.get("ok") or vwap.get("ok") or volume.get("ok") or profile.get("ok"))
     return candles
 
 
@@ -531,14 +693,20 @@ def _frame_dir(frame: dict[str, Any]) -> int:
 
 
 def detect_fakeout(entry: dict[str, Any] | None) -> bool:
+    """Break without volume, or a break that prints outside the value area on thin tape."""
     frame = entry if isinstance(entry, dict) else {}
     if not frame.get("structure_break"):
         return False
     rvol = frame.get("rvol")
     try:
-        return float(rvol) < 0.85
+        rv = float(rvol) if rvol is not None else None
     except (TypeError, ValueError):
-        return False
+        rv = None
+    if rv is not None and rv < 0.85:
+        return True
+    if frame.get("in_value_area") is False and (rv is None or rv < 1.1):
+        return True
+    return False
 
 
 def detect_pullback(side: str, entry: dict[str, Any] | None, align: str) -> bool:

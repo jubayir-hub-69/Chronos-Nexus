@@ -38,6 +38,8 @@ HELP_PLAIN = (
     "/positions          live book + PnL\n"
     "/close SYMBOL       market-close one name\n"
     "/closeall           flatten the whole Demo book\n"
+    "/price SYMBOL       live mainnet last / bid / ask\n"
+    "/balance SYMBOL     wallet free + total for one asset\n"
     "NVDA/USDT BUY $10   Spot preview + confirm buttons\n"
     "/help               this list"
 )
@@ -47,6 +49,8 @@ HELP_HTML = (
     "<code>/positions</code> — live book + PnL\n"
     "<code>/close SYMBOL</code> — market-close one name\n"
     "<code>/closeall</code> — flatten the whole Demo book\n"
+    "<code>/price SYMBOL</code> — live Bitget mainnet last / bid / ask\n"
+    "<code>/balance SYMBOL</code> — wallet free + total for one asset\n"
     "<code>NVDA/USDT BUY $10</code> — Spot preview, then Confirm / Cancel\n"
     "<code>/help</code> — this list"
 )
@@ -61,17 +65,50 @@ class CommandResult:
     closes: list[dict[str, Any]] = field(default_factory=list)
 
 
+_DESK_COMMANDS = {
+    "positions",
+    "pos",
+    "p",
+    "close",
+    "closeall",
+    "flatten",
+    "flat",
+    "help",
+    "start",
+    "?",
+    "buy",
+    "sell",
+    "open",
+    "long",
+    "short",
+    "price",
+    "px",
+    "balance",
+    "bal",
+    "balances",
+}
+
+
 def parse_command(text: str) -> tuple[str, str]:
-    """Return (cmd, arg). cmd is lowercase without a leading slash. Empty cmd if not a command."""
+    """Return (cmd, arg). cmd is lowercase without a leading slash. Empty cmd if not a command.
+
+    Trading pairs such as SOL/USDT are tickers, never Telegram slash commands.
+    Bare words that are not desk commands are ignored (not 'unknown /sol/usdt').
+    """
     raw = (text or "").strip()
     if not raw:
         return "", ""
-    if raw.startswith("/"):
+    had_slash = raw.startswith("/")
+    if had_slash:
         raw = raw[1:]
     parts = raw.split()
     if not parts:
         return "", ""
-    cmd = parts[0].split("@")[0].lower()
+    token = parts[0].split("@")[0]
+    # SOL/USDT, BTC/USDT:USDT, etc. — the slash is a pair separator, not /help.
+    if "/" in token or ":" in token:
+        return "", ""
+    cmd = token.lower()
     aliases = {
         "pos": "positions",
         "p": "positions",
@@ -79,10 +116,15 @@ def parse_command(text: str) -> tuple[str, str]:
         "flat": "closeall",
         "start": "help",
         "?": "help",
+        "px": "price",
+        "bal": "balance",
+        "balances": "balance",
     }
-    cmd = aliases.get(cmd, cmd)
+    mapped = aliases.get(cmd, cmd)
+    if mapped not in _DESK_COMMANDS and not had_slash:
+        return "", ""
     arg = " ".join(parts[1:]).strip()
-    return cmd, arg
+    return mapped, arg
 
 
 class CommandDesk:
@@ -110,6 +152,10 @@ class CommandDesk:
             return self._cmd_closeall(source=source)
         if cmd == "close":
             return self._cmd_close(arg, source=source)
+        if cmd == "price":
+            return self._cmd_price(arg)
+        if cmd == "balance":
+            return self._cmd_balance(arg)
         if cmd in {"buy", "sell", "open", "long", "short"}:
             msg = (
                 "REFUSED — manual open is disabled on the AI desk. "
@@ -160,6 +206,99 @@ class CommandDesk:
             "\n".join(html_lines).rstrip(),
             [],
         )
+
+    def _cmd_price(self, arg: str) -> CommandResult:
+        if self.bitget is None:
+            msg = "Bitget rail unbound — cannot fetch a live price."
+            return CommandResult("price", False, msg, msg, [])
+        query = (arg or "").strip()
+        if not query:
+            msg = "Usage: /price SYMBOL   e.g. /price BGB  or  /price BGB/USDT"
+            return CommandResult(
+                "price",
+                False,
+                msg,
+                "Usage: <code>/price SYMBOL</code> — e.g. <code>/price BGB</code>",
+                [],
+            )
+        try:
+            quote = self.bitget.fetch_live_price(query)
+        except Exception as exc:
+            msg = f"Price lookup failed for {query}: {exc}"
+            return CommandResult("price", False, msg, f"<b>Price lookup failed</b>\n{exc}", [])
+        last = _safe_px(quote.get("last"), quote.get("ask"), quote.get("bid"), quote.get("mark"))
+        if last <= 0 or not quote.get("ok"):
+            err = quote.get("error") or f"No live mainnet price for {query}."
+            return CommandResult(
+                "price",
+                False,
+                err,
+                f"<b>NO LIVE PRICE</b>\n<code>{query}</code>\n{err}",
+                [],
+            )
+        symbol = str(quote.get("symbol") or query).upper()
+        bid = _safe_px(quote.get("bid"))
+        ask = _safe_px(quote.get("ask"))
+        mark = _safe_px(quote.get("mark"))
+        source = str(quote.get("source") or "bitget.mainnet")
+        plain = (
+            f"LIVE PRICE  {symbol}\n"
+            f"last {last}\n"
+            f"bid  {bid if bid > 0 else 'n/a'}\n"
+            f"ask  {ask if ask > 0 else 'n/a'}\n"
+            f"feed {source}"
+        )
+        html_lines = [
+            "<b>CHRONOS-NEXUS</b>",
+            "📡 <b>LIVE PRICE</b>  ·  Bitget mainnet",
+            "",
+            f"<b>Symbol:</b> <code>{symbol}</code>",
+            f"<b>Last:</b> <code>{last}</code>",
+            f"<b>Bid:</b> <code>{bid if bid > 0 else 'n/a'}</code>",
+            f"<b>Ask:</b> <code>{ask if ask > 0 else 'n/a'}</code>",
+        ]
+        if mark > 0:
+            html_lines.append(f"<b>Mark:</b> <code>{mark}</code>")
+            plain += f"\nmark {mark}"
+        html_lines.append(f"<b>Feed:</b> <code>{source}</code>")
+        return CommandResult("price", True, plain, "\n".join(html_lines), [])
+
+    def _cmd_balance(self, arg: str) -> CommandResult:
+        coin = _wallet_coin(arg)
+        if not coin:
+            msg = "Please specify a token (e.g., /balance USDT or /balance NVDA)"
+            return CommandResult("balance", False, msg, msg, [])
+        if self.bitget is None:
+            msg = "Bitget rail unbound — cannot read the wallet."
+            return CommandResult("balance", False, msg, msg, [])
+        try:
+            payload = self.bitget.fetch_asset_balance(coin)
+        except Exception as exc:
+            msg = f"Wallet lookup failed: {exc}"
+            return CommandResult("balance", False, msg, f"<b>Wallet lookup failed</b>\n{exc}", [])
+        free = _amt0(payload.get("free"))
+        total = _amt0(payload.get("total"))
+        found = bool(payload.get("found"))
+        if not found or (free <= 0 and total <= 0):
+            msg = f"0.00 {coin} found in wallet."
+            return CommandResult(
+                "balance",
+                True,
+                msg,
+                f"<code>0.00 {coin}</code> found in wallet.",
+                [],
+            )
+        label = str(payload.get("coin") or coin).upper()
+        plain = f"{label}\nfree  {free:.8f}\ntotal {total:.8f}"
+        html = "\n".join(
+            [
+                "<b>CHRONOS-NEXUS</b>",
+                f"<code>{label}</code>",
+                f"free <code>{free:.8f}</code>",
+                f"total <code>{total:.8f}</code>",
+            ]
+        )
+        return CommandResult("balance", True, plain, html, [])
 
     def _cmd_close(self, arg: str, *, source: str) -> CommandResult:
         if self.bitget is None:
@@ -338,12 +477,12 @@ class TelegramCommandLoop:
             self.notifier.reply("<b>Bitget Demo rail unbound</b> — cannot preview a Spot ticket.")
             return
         try:
-            quote = bitget.fetch_spot_quote(intent.symbol)
+            quote = bitget.fetch_spot_quote(intent.symbol, side=intent.side)
         except Exception as exc:
             self.notifier.reply(f"<b>Spot ticker failed</b>\n{exc}")
             return
-        symbol = str(quote.get("symbol") or "")
-        last = float(quote.get("last") or 0.0)
+        symbol = str(quote.get("symbol") or intent.symbol or "")
+        last = _safe_px(quote.get("peg"), quote.get("last"), quote.get("ask"), quote.get("bid"))
         if not quote.get("ok") or last <= 0 or not symbol:
             err = quote.get("error") or f"{intent.symbol} is not a Bitget Spot listing."
             self.notifier.reply(
@@ -507,6 +646,46 @@ class TerminalCommandLoop:
                 continue
             if result.plain:
                 self.printer(result.plain)
+
+
+def _safe_px(*values: Any) -> float:
+    """First finite positive number. Never raises on None."""
+    for value in values:
+        if value is None or value == "":
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed == parsed and parsed not in {float("inf"), float("-inf")} and parsed > 0:
+            return parsed
+    return 0.0
+
+
+def _amt0(value: Any) -> float:
+    """Finite wallet amount ≥ 0. None-safe."""
+    if value is None or value == "":
+        return 0.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if parsed != parsed or parsed in {float("inf"), float("-inf")}:
+        return 0.0
+    return max(0.0, parsed)
+
+
+def _wallet_coin(arg: str) -> str:
+    """Asset id from /balance SYMBOL. Pairs collapse to the base (NVDA/USDT → NVDA)."""
+    raw = (arg or "").strip()
+    if not raw:
+        return ""
+    token = raw.split()[0].split("@")[0].upper().replace("USDT:USDT", "USDT")
+    if token.endswith(":USDT"):
+        token = token[: -len(":USDT")]
+    if "/" in token:
+        token = token.split("/", 1)[0]
+    return token.strip()
 
 
 def _match_symbol(query: str, book: list[dict[str, Any]]) -> dict[str, Any] | None:

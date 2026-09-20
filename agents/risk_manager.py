@@ -19,8 +19,12 @@ from core.ta import (
     RSI_PERIOD,
     SCALE_OUT_PCT,
     SETUP_THRESHOLD,
+    VETO_REASON_MARK,
+    bbo_peg_price,
+    bbo_sane_vs_mark,
     candle_veto,
     confluence_veto,
+    extract_mark_price,
     score_asset_risk,
     setup_veto,
     severe_tape_halt,
@@ -47,7 +51,9 @@ Evaluate:
 4. Concentration: one-name AI beta vs a basket.
 5. Size: paper notional must stay tiny (default cap 15 USDT, never above 50).
 6. HARD RULE: if the live bid-ask spread is greater than 1.5%, you MUST VETO
-   with reason exactly "Illiquid Market / High Spread". Python will enforce this
+   with reason exactly "Illiquid Market / High Spread". Python will enforce this.
+   Size and last_price are the live MAINNET BBO (BUY=ask, SELL=bid), never a
+   sandbox mid. Contracts/rToken perps that diverge from markPrice are a VETO.
    even if you return CLEAR. Missing/unmeasured spread is a fail-safe VETO.
 7. TA CONFLUENCE (hard Python rail, applied after you return):
    - BUY only if RSI(14) < 70. RSI >= 70 → VETO "VETO: RSI Overbought despite bullish news"
@@ -107,7 +113,17 @@ class RiskManagerAgent:
         rsi = ta_snap.get("rsi")
         rsi_tf = str(ta_snap.get("timeframe") or "")
         rsi_period = int(ta_snap.get("period") or RSI_PERIOD)
-        last_px = _px(ticker.get("last"), fund.get("price"), ticker.get("ask"), ticker.get("bid"))
+        bid_px = _px(book.get("best_bid"), ticker.get("bid"))
+        ask_px = _px(book.get("best_ask"), ticker.get("ask"))
+        peg_px = bbo_peg_price(brief.side, bid_px, ask_px)
+        last_px = peg_px or _px(
+            ticker.get("mark"),
+            ticker.get("last"),
+            fund.get("price"),
+            ask_px,
+            bid_px,
+        )
+        mark_px = extract_mark_price(ticker, book)
 
         user = (
             f"Analyst brief:\n{brief.model_dump()}\n\n"
@@ -181,6 +197,16 @@ class RiskManagerAgent:
                 f"{VETO_REASON_SPREAD} (spread={spread_bit} > {SPREAD_VETO_PCT}%). {rationale}"
             )
 
+        is_contract = ":" in str(tradable_symbol or "") or bool(fund.get("is_swap"))
+        if peg_px and not bbo_sane_vs_mark(peg=peg_px, mark=mark_px, is_contract=is_contract):
+            verdict = "VETO"
+            multiplier = 0.0
+            if VETO_REASON_MARK not in flags:
+                flags.append(VETO_REASON_MARK)
+            rationale = (
+                f"{VETO_REASON_MARK} (peg={peg_px} mark={mark_px}). {rationale}"
+            )
+
         rsi_reason = confluence_veto(brief.side, rsi)
         if rsi_reason:
             verdict = "VETO"
@@ -238,6 +264,7 @@ class RiskManagerAgent:
             "sentiment": brief.sentiment_score,
             "credibility": brief.news_credibility,
             "conflict": brief.news_conflict,
+            "impact": brief.news_impact,
         }
         frames = ta_snap.get("frames") if isinstance(ta_snap.get("frames"), dict) else {}
         if not frames:
@@ -251,14 +278,17 @@ class RiskManagerAgent:
             conviction=int(brief.conviction or 0),
         )
         if setup_reason:
+            already = verdict == "VETO"
             verdict = "VETO"
             multiplier = 0.0
             if setup_reason not in flags:
                 flags.append(setup_reason)
-            rationale = (
+            setup_bit = (
                 f"{setup_reason} (setup={setup.get('score')}/{SETUP_THRESHOLD} "
-                f"mtf={setup.get('align')} pullback={setup.get('pullback_ok')}). {rationale}"
+                f"mtf={setup.get('align')} pullback={setup.get('pullback_ok')})"
             )
+            # Keep the first hard rail (RSI / candle / spread) at the front of rationale.
+            rationale = f"{rationale} {setup_bit}." if already else f"{setup_bit}. {rationale}"
             print(
                 f"[SETUP] {setup_reason}  score={setup.get('score')}  "
                 f"mtf={setup.get('align')}  {tradable_symbol}",
@@ -444,6 +474,18 @@ def _stamp_report(
             float((daily or {}).get("deployed_usdt") or 0.0) if daily else None
         ),
         daily_entries=int((daily or {}).get("entries") or 0) if daily else 0,
+        setup_score=float((setup or {}).get("score") or 0.0),
+        setup_threshold=float((setup or {}).get("threshold") or SETUP_THRESHOLD),
+        mtf_align=str((setup or {}).get("align") or ta_snap.get("mtf") or ""),
+        book_imbalance=(
+            (setup or {}).get("book", {}).get("imbalance")
+            if isinstance((setup or {}).get("book"), dict)
+            else None
+        ),
+        rvol=ta_snap.get("rvol"),
+        vwap_dev_pct=ta_snap.get("vwap_dev_pct"),
+        pullback_ok=bool((setup or {}).get("pullback_ok")),
+        sentiment_score=brief.sentiment_score,
         llm_degraded=degraded,
         model=model,
     )

@@ -17,7 +17,7 @@ TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_PHOTO = "https://api.telegram.org/bot{token}/sendPhoto"
 STARTUP_TEXT = (
     "Chronos-Nexus is ONLINE — glasshouse desk, SL/TP armed, hourly tape scan.\n"
-    "Commands: /positions  /close SYMBOL  /closeall  /help\n"
+    "Commands: /positions  /close SYMBOL  /closeall  /price SYMBOL  /balance SYMBOL  /help\n"
     "Spot chatbox: NVDA/USDT BUY $10  (confirm in-chat, Spot market only)"
 )
 TELEGRAM_EDIT = "https://api.telegram.org/bot{token}/editMessageText"

@@ -123,6 +123,10 @@ Rules:
   (equity / stock perps / rTokens — not a hardcoded five names).
   primary_symbol MUST be copied EXACTLY from that list, OR you MUST emit
   primary_symbol="NONE" with side="none" and conviction=0.
+- Pricing is live Bitget MAINNET BBO, not Demo/sandbox prints. Python pegs
+  BUY to the live best ask and SELL/CLOSE to the live best bid, and
+  cross-checks perps/rTokens against live markPrice. You pick the name;
+  you do not invent a last or mid.
 - NEVER default to NVDA. NEVER assume BUY. If the tape is mixed, stale, or
   names a stock that is not listed, STAND DOWN with NONE / none / 0.
 - OCCUPIED names already have a live Demo position. Never pick them for a NEW
@@ -142,8 +146,10 @@ Rules:
 - stay_away: array of short strings ("NFLX — earnings miss / guidance cut")
 - news_good / news_bad: concise market-context summaries (what is working /
   what is hurting on THIS wire)
-- Python injects a WIRE SENTIMENT SCORE (0-100) with source credibility.
+- Python injects a WIRE SENTIMENT SCORE (0-100) with source credibility,
+  recency, macro context (Fed/CPI/FOMC), and a 0-100 conviction score.
   Do not fight a clearly conflicted or weak tape. Prefer NONE over a 55/100 guess.
+  SENTINEL will still require a 90+ setup (news + 15m/1h/4h + volume + book).
 """
 
 
@@ -192,7 +198,8 @@ class AnalystAgent:
             "Live financial RSS wire (newest first). These are real headlines, not desk fiction:\n"
             f"{_wire_for_prompt(wire)}\n\n"
             "LIVE UNIVERSE from Bitget Demo load_markets() (equity / stock perps / rTokens).\n"
-            "primary_symbol MUST be one of these exact strings, or NONE:\n"
+            "Fills are simulated at live Bitget MAINNET BBO (BUY=ask, SELL=bid), "
+            "never at a sandbox mid. primary_symbol MUST be one of these exact strings, or NONE:\n"
             f"{listed}\n\n"
             "If the wire names no listed equity, or the tape is not actionable, emit "
             'primary_symbol="NONE", side="none", conviction=0. NEVER default to NVDA. NEVER assume BUY.\n'
@@ -262,11 +269,15 @@ class AnalystAgent:
             side = "none"
             conviction = 0
         focused = score_wire(triggers, ticker=picked) if picked != STAND_DOWN_SYMBOL else wire_score
+        nlp_conv = int(focused.get("conviction") or 0)
         if side in {"buy", "sell"} and focused.get("scored"):
+            conviction = min(conviction, max(nlp_conv, 1))
             if (side == "buy" and float(focused.get("sentiment") or 50) < 55) or (
                 side == "sell" and float(focused.get("sentiment") or 50) > 45
             ):
                 conviction = min(conviction, 45)
+            if focused.get("conflict"):
+                conviction = min(conviction, 20)
         return AnalystBrief(
             thesis=_safe_text(payload.get("thesis"), fallback["thesis"]),
             monday_gap_bias=_gap(payload.get("monday_gap_bias")),

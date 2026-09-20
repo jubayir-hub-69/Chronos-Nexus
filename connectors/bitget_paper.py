@@ -1,7 +1,11 @@
 """Bitget Paper Trading connector.
 
-Sandbox/Demo only. `set_sandbox_mode(True)` is the first call after construct.
-Live trading is refused at init.
+Sandbox/Demo only for private calls (orders, balances, positions).
+`set_sandbox_mode(True)` is the first call after construct on the execution
+client. Live trading is refused at init.
+
+Public market data (ticker, L2, OHLCV, markPrice) is fetched from Bitget
+MAINNET via a second CCXT client with no keys and no sandbox flag.
 """
 
 from __future__ import annotations
@@ -18,14 +22,18 @@ import ccxt
 from core.config import PROJECT_ROOT, Settings
 from core.retry import call_with_backoff
 from core.ta import (
+    BBO_MARK_DIVERGENCE_PCT,
     MTF_FRAMES,
     RSI_FALLBACK_TIMEFRAME,
     RSI_PERIOD,
     RSI_TIMEFRAME,
     analyze_candles,
+    bbo_peg_price,
+    bbo_sane_vs_mark,
     compute_atr,
     compute_rsi,
     enrich_ohlcv,
+    extract_mark_price,
     mtf_alignment,
     sl_tp_from_margin,
 )
@@ -68,6 +76,53 @@ _SYMBOL_CANDIDATES = (
 )
 
 
+def _looks_contract(symbol: str) -> bool:
+    u = (symbol or "").upper()
+    return ":USDT" in u or ":USDC" in u or ":USD" in u or u.endswith(":USDT")
+
+
+def public_symbol_candidates(symbol: str) -> list[str]:
+    """Demo/sandbox symbol → live Bitget unified-symbol tries (spot + swap)."""
+    raw = (symbol or "").strip()
+    if not raw:
+        return []
+    out: list[str] = []
+
+    def add(item: str) -> None:
+        text = (item or "").strip()
+        if text and text not in out:
+            out.append(text)
+
+    add(raw)
+    u = raw.upper().replace("SUSDT", "USDT").replace("SUSDC", "USDC")
+    add(u)
+    base_quote = u.split(":")[0]
+    add(base_quote)
+    if ":" not in u:
+        add(f"{base_quote}:USDT")
+    else:
+        add(u)
+    parts = base_quote.split("/")
+    base = parts[0] if parts else u
+    quote = parts[1] if len(parts) > 1 else "USDT"
+    if quote not in {"USDT", "USDC", "USD"}:
+        quote = "USDT"
+    if base.startswith("S") and base[1:] in _CRYPTO_DENY:
+        add(f"{base[1:]}/{quote}")
+        add(f"{base[1:]}/{quote}:USDT")
+    if base.startswith("R") and len(base) > 2 and base[1:].isalpha():
+        add(f"{base[1:]}/{quote}")
+        add(f"{base[1:]}/{quote}:USDT")
+        add(f"{base}/{quote}")
+        add(f"{base}/{quote}:USDT")
+    else:
+        add(f"{base}/{quote}")
+        add(f"{base}/{quote}:USDT")
+        add(f"r{base}/{quote}")
+        add(f"r{base}/{quote}:USDT")
+    return out
+
+
 def simulate_account_balance_change(
     *,
     side: str,
@@ -101,6 +156,19 @@ def simulate_account_balance_change(
     return 0.0
 
 
+def _coin_amt(value: Any) -> float:
+    """Wallet free/total cell → finite float ≥ 0. None-safe."""
+    if value is None or value == "":
+        return 0.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if parsed != parsed or parsed in {float("inf"), float("-inf")}:
+        return 0.0
+    return max(0.0, parsed)
+
+
 def coerce_price(*candidates: Any) -> float:
     """First positive float among scalars or ticker/order dicts. Never returns None."""
     for value in candidates:
@@ -123,6 +191,35 @@ def coerce_price(*candidates: Any) -> float:
         if parsed > 0:
             return parsed
     return 0.0
+
+
+def _stamp_bbo(
+    record: dict[str, Any],
+    quote: dict[str, Any] | None,
+    *,
+    as_entry: bool = True,
+) -> dict[str, Any]:
+    """Paper log / receipts always show the live mainnet BBO peg, not a sandbox mid.
+
+    Opens stamp entry+price. Closes stamp the exit `price` only (keep original entry).
+    """
+    payload = quote if isinstance(quote, dict) else {}
+    peg = coerce_price(payload.get("peg"))
+    if peg > 0:
+        record["price"] = peg
+        if as_entry:
+            record["entry_price"] = peg
+        record["price_source"] = payload.get("source") or "mainnet_bbo"
+    if payload.get("best_bid") is not None:
+        record["best_bid"] = payload.get("best_bid")
+    if payload.get("best_ask") is not None:
+        record["best_ask"] = payload.get("best_ask")
+    mark = payload.get("mark")
+    if mark not in (None, "", 0, 0.0):
+        record["mark_price"] = mark
+    if payload.get("public_symbol"):
+        record["public_symbol"] = payload.get("public_symbol")
+    return record
 
 
 def stamp_gitbook_log(record: dict[str, Any]) -> dict[str, Any]:
@@ -208,6 +305,10 @@ class BitgetPaperConnector:
                 "options": {
                     "defaultType": "spot",
                     "sandboxMode": True,
+                    # Bitget native-token fee: pay in BGB (20% discount) when the
+                    # account switch-deduct endpoint is armed. Unknown order-body
+                    # keys are NOT sent on create_order — Bitget rejects them.
+                    "deduct": "on",
                 },
                 "headers": {"PAPTRADING": "1"},
             }
@@ -216,9 +317,104 @@ class BitgetPaperConnector:
         exchange.set_sandbox_mode(True)
         self.exchange = exchange
         self._order_lock = threading.RLock()
+        self.bgb_fee_deduct: dict[str, Any] = {"ok": False, "deduct": "off", "via": None}
+        # Public mainnet feed — no keys, never sandbox. Spot + swap catalogs.
+        self.public = ccxt.bitget(
+            {
+                "enableRateLimit": True,
+                "timeout": 20000,
+                "options": {
+                    "defaultType": "swap",
+                    "fetchMarkets": ["spot", "swap"],
+                },
+            }
+        )
+        self._public_lock = threading.Lock()
+        self._public_ready = False
+        self.price_feed = "bitget.mainnet"
 
     def _ccxt(self, fn, *, label: str = "bitget"):
         return call_with_backoff(fn, attempts=3, label=label)
+
+    def _feed(self):
+        """Mainnet public client. Unit tests that skip __init__ fall back to sandbox."""
+        return getattr(self, "public", None) or self.exchange
+
+    def _ensure_public_markets(self) -> None:
+        client = getattr(self, "public", None)
+        if client is None or getattr(self, "_public_ready", False):
+            return
+        lock = getattr(self, "_public_lock", None)
+        if lock is None:
+            self._load_public_markets(client)
+            return
+        with lock:
+            if self._public_ready:
+                return
+            self._load_public_markets(client)
+
+    def _load_public_markets(self, client: Any) -> None:
+        prev = (client.options or {}).get("defaultType")
+        try:
+            # CCXT bitget fetchMarkets defaults to both spot and swap.
+            client.options["defaultType"] = "swap"
+            self._ccxt(lambda: client.load_markets(reload=False), label="bitget.mainnet.load_markets")
+            self._public_ready = True
+            n = len(client.markets or {})
+            print(f"[BITGET] mainnet price feed armed  markets={n}  spot+swap", flush=True)
+        except Exception as exc:
+            self._public_ready = False
+            print(f"[BITGET] mainnet price feed failed — {str(exc)[:160]}", flush=True)
+        finally:
+            client.options["defaultType"] = prev or "swap"
+
+    def _resolve_public_symbol(self, symbol: str) -> str:
+        raw = (symbol or "").strip()
+        if not raw:
+            return raw
+        client = self._feed()
+        markets = getattr(client, "markets", None) or {}
+        if not markets and client is getattr(self, "public", None):
+            try:
+                self._ensure_public_markets()
+                markets = client.markets or {}
+            except Exception:
+                markets = {}
+        for cand in public_symbol_candidates(raw):
+            if cand in markets:
+                return cand
+        root = raw.upper().split(":")[0].split("/")[0]
+        if root.startswith("R") and len(root) > 2:
+            root = root[1:]
+        hits: list[str] = []
+        for name, market in (markets or {}).items():
+            row = market if isinstance(market, dict) else {}
+            base = str(row.get("base") or str(name).split("/")[0] or "").upper()
+            base_root = base[1:] if base.startswith("R") and len(base) > 2 else base
+            if base == root or base_root == root:
+                hits.append(str(name))
+        if not hits:
+            return raw
+        hits.sort(
+            key=lambda n: (
+                0 if n.endswith(":USDT") else 1,
+                0 if n.endswith("/USDT:USDT") or n.endswith("/USDT") else 1,
+                n,
+            )
+        )
+        return hits[0]
+
+    def _feed_type(self, symbol: str) -> str:
+        if _looks_contract(symbol):
+            return "swap"
+        client = self._feed()
+        try:
+            market = client.market(symbol)
+            if market.get("swap") or market.get("future"):
+                return "swap"
+        except Exception:
+            pass
+        return "spot"
 
     def ping(self) -> dict[str, Any]:
         try:
@@ -232,6 +428,9 @@ class BitgetPaperConnector:
             self.exchange.options["defaultType"] = "swap"
         else:
             self.exchange.options["defaultType"] = "spot"
+        self.bgb_fee_deduct = self._enable_bgb_fee_deduct()
+        self._ensure_public_markets()
+        public_n = len((getattr(self, "public", None).markets or {}) if getattr(self, "public", None) else {})
         return {
             "sandbox": True,
             "paptrading": "1",
@@ -241,7 +440,43 @@ class BitgetPaperConnector:
             "symbol": self.resolved_symbol,
             "market_type": "swap" if market.get("swap") else "spot",
             "id": self.exchange.id,
+            "bgb_fee_deduct": self.bgb_fee_deduct.get("deduct") or "off",
+            "bgb_fee_deduct_via": self.bgb_fee_deduct.get("via"),
+            "price_feed": getattr(self, "price_feed", "bitget.mainnet"),
+            "public_markets": public_n,
         }
+
+    def _enable_bgb_fee_deduct(self) -> dict[str, Any]:
+        """Pay trading fees in BGB (Bitget native token) via the official switch.
+
+        Account-level, not a per-order header: POST /api/v3/account/switch-deduct
+        (UTA) and POST /api/v2/spot/account/switch-deduct (classic spot).
+        Fail-open — Demo / missing UTA must never block the rail.
+        """
+        payload = {"deduct": "on"}
+        errors: list[str] = []
+        uta = getattr(self.exchange, "private_uta_post_v3_account_switch_deduct", None)
+        if callable(uta):
+            try:
+                uta(payload)
+                print("[BITGET] fee deduct in BGB armed (uta v3 switch-deduct)", flush=True)
+                return {"ok": True, "deduct": "on", "via": "uta_v3"}
+            except Exception as exc:
+                errors.append(f"uta_v3:{str(exc)[:120]}")
+        try:
+            self.exchange.request(
+                "v2/spot/account/switch-deduct",
+                ["private", "spot"],
+                "POST",
+                payload,
+            )
+            print("[BITGET] fee deduct in BGB armed (spot v2 switch-deduct)", flush=True)
+            return {"ok": True, "deduct": "on", "via": "spot_v2"}
+        except Exception as exc:
+            errors.append(f"spot_v2:{str(exc)[:120]}")
+        note = " | ".join(errors)[:240] if errors else "unsupported"
+        print(f"[BITGET] fee deduct in BGB skipped — {note}", flush=True)
+        return {"ok": False, "deduct": "off", "via": None, "error": note}
 
     def discover_equity_universe(self, markets: dict[str, Any] | None = None) -> list[str]:
         """Live CCXT catalog of Demo equity / stock-perp / rToken listings. No hardcoded cap."""
@@ -375,23 +610,121 @@ class BitgetPaperConnector:
         except (TypeError, ValueError):
             return 0.0
 
-    def fetch_spot_quote(self, symbol: str) -> dict[str, Any]:
-        """Live spot ticker. Isolated from the swap defaultType used by the AI desk."""
+    def fetch_spot_quote(self, symbol: str, side: str = "buy") -> dict[str, Any]:
+        """Live mainnet Spot BBO. Isolated from the swap defaultType used by the AI desk."""
         resolved = self.resolve_spot_symbol(symbol) or symbol
-        prev = (self.exchange.options or {}).get("defaultType")
-        try:
-            self.exchange.options["defaultType"] = "spot"
-            ticker = self.fetch_ticker(resolved)
-        finally:
-            self.exchange.options["defaultType"] = prev
-        last = coerce_price(ticker.get("last"), ticker.get("bid"), ticker.get("ask"))
+        quote = self.fetch_bbo(resolved, side=side)
+        last = coerce_price(
+            quote.get("peg"),
+            quote.get("last"),
+            quote.get("best_ask"),
+            quote.get("best_bid"),
+        )
         return {
-            "ok": bool(ticker.get("ok")) and last > 0,
-            "symbol": resolved,
+            "ok": last > 0,
+            "symbol": str(quote.get("public_symbol") or quote.get("symbol") or resolved),
             "last": last,
-            "bid": ticker.get("bid"),
-            "ask": ticker.get("ask"),
-            "error": ticker.get("error"),
+            "bid": quote.get("best_bid"),
+            "ask": quote.get("best_ask"),
+            "mark": quote.get("mark"),
+            "peg": coerce_price(quote.get("peg"), last) if last > 0 else None,
+            "price_source": quote.get("source") or "mainnet_bbo",
+            "error": None if last > 0 else (quote.get("error") or "No live Bitget mainnet price."),
+        }
+
+    def fetch_live_price(self, symbol: str) -> dict[str, Any]:
+        """Mainnet last/bid/ask for /price. Spot first, then any public listing."""
+        resolved = self.resolve_spot_symbol(symbol) or (symbol or "").strip()
+        quote = self.fetch_bbo(resolved, side="buy")
+        last = coerce_price(
+            quote.get("last"),
+            quote.get("peg"),
+            quote.get("best_ask"),
+            quote.get("best_bid"),
+            quote.get("mark"),
+        )
+        return {
+            "ok": last > 0,
+            "symbol": str(quote.get("public_symbol") or quote.get("symbol") or resolved),
+            "last": last if last > 0 else None,
+            "bid": quote.get("best_bid"),
+            "ask": quote.get("best_ask"),
+            "mark": quote.get("mark"),
+            "source": quote.get("source") or "bitget.mainnet",
+            "error": None if last > 0 else (quote.get("error") or f"No live mainnet price for {symbol}."),
+        }
+
+    def fetch_spot_wallet(self, coins: tuple[str, ...] = ("USDT", "BGB")) -> dict[str, Any]:
+        """Spot wallet free/total for named coins. None-safe; missing coins are 0."""
+        try:
+            raw = self._ccxt(
+                lambda: self.exchange.fetch_balance({"type": "spot"}),
+                label="bitget.balance.spot.wallet",
+            )
+        except Exception as exc:
+            return {"ok": False, "assets": {}, "error": str(exc)[:240]}
+        frees = raw.get("free") if isinstance(raw.get("free"), dict) else {}
+        totals = raw.get("total") if isinstance(raw.get("total"), dict) else {}
+        assets: dict[str, dict[str, float]] = {}
+        for coin in coins:
+            key = str(coin or "").upper()
+            if not key:
+                continue
+            try:
+                free_f = float(frees.get(key) if frees.get(key) is not None else 0.0)
+            except (TypeError, ValueError):
+                free_f = 0.0
+            try:
+                total_f = float(totals.get(key) if totals.get(key) is not None else 0.0)
+            except (TypeError, ValueError):
+                total_f = 0.0
+            assets[key] = {"free": max(0.0, free_f), "total": max(0.0, total_f)}
+        return {"ok": True, "assets": assets, "error": None}
+
+    def fetch_asset_balance(self, coin: str) -> dict[str, Any]:
+        """Free/total for one asset across Spot + swap. Any CCXT coin key, case-insensitive."""
+        wanted = str(coin or "").strip()
+        if not wanted:
+            return {
+                "ok": False,
+                "coin": "",
+                "free": 0.0,
+                "total": 0.0,
+                "found": False,
+                "error": "coin required",
+            }
+        wanted_u = wanted.upper()
+        free_sum = 0.0
+        total_sum = 0.0
+        found = False
+        matched = wanted_u
+        errors: list[str] = []
+        for account_type in ("spot", "swap"):
+            try:
+                raw = self._ccxt(
+                    lambda t=account_type: self.exchange.fetch_balance({"type": t}),
+                    label=f"bitget.balance.{account_type}.asset",
+                )
+            except Exception as exc:
+                errors.append(f"{account_type}:{str(exc)[:120]}")
+                continue
+            frees = raw.get("free") if isinstance(raw.get("free"), dict) else {}
+            totals = raw.get("total") if isinstance(raw.get("total"), dict) else {}
+            keys = {str(k) for k in list(frees.keys()) + list(totals.keys())}
+            for key in keys:
+                if key.upper() != wanted_u:
+                    continue
+                found = True
+                matched = key
+                free_sum += _coin_amt(frees.get(key))
+                total_sum += _coin_amt(totals.get(key))
+        return {
+            "ok": True if found or not errors else False,
+            "coin": matched,
+            "free": max(0.0, free_sum),
+            "total": max(0.0, total_sum),
+            "found": found,
+            "error": " | ".join(errors)[:240] if errors and not found else None,
         }
 
     def execute_spot_market(
@@ -448,14 +781,14 @@ class BitgetPaperConnector:
         }
         try:
             self.exchange.options["defaultType"] = "spot"
-            quote = self.fetch_spot_quote(resolved)
-            last = coerce_price(quote.get("last"))
+            quote = self.fetch_spot_quote(resolved, side=side_n)
+            last = coerce_price(quote.get("peg"), quote.get("last"))
             if last <= 0:
                 record.update(
                     {
                         "ok": False,
                         "status": "NO_LIVE_PRICE",
-                        "error": "No live Bitget Spot price.",
+                        "error": "No live Bitget mainnet Spot BBO.",
                         "amount": 0.0,
                         "price": 0.0,
                     }
@@ -468,6 +801,7 @@ class BitgetPaperConnector:
             record["quantity"] = qty
             record["price"] = last
             record["entry_price"] = last
+            _stamp_bbo(record, quote)
             free = self.fetch_spot_usdt_free()
             if side_n == "buy" and free + 1e-9 < cost:
                 record.update(
@@ -482,7 +816,8 @@ class BitgetPaperConnector:
                 return record
             balance_before = self._snapshot_usdt()
             order = self._place_spot_market(resolved, side_n, qty, last, cost)
-            fill = coerce_price(order.get("average"), order.get("price"), last)
+            demo_fill = coerce_price(order.get("average"), order.get("price"))
+            fill = last if last > 0 else demo_fill
             filled_qty = coerce_price(order.get("filled"), order.get("amount"), qty)
             record.update(
                 {
@@ -492,11 +827,13 @@ class BitgetPaperConnector:
                     "raw_order": _slim_order(order),
                     "price": fill,
                     "entry_price": fill,
+                    "demo_fill_price": demo_fill if demo_fill > 0 else None,
                     "amount": filled_qty,
                     "quantity": filled_qty,
                     "notional_usdt": round(abs(fill * filled_qty), 6) if fill and filled_qty else round(cost, 6),
                 }
             )
+            _stamp_bbo(record, quote)
             self._apply_balance_change(record, balance_before=balance_before, filled=True)
         except Exception as exc:
             record.update(
@@ -619,50 +956,75 @@ class BitgetPaperConnector:
             record["account_balance_after"] = round(balance_before + change, 8)
 
     def fetch_ticker(self, symbol: str | None = None) -> dict[str, Any]:
+        """Live Bitget MAINNET ticker (spot or swap). Never a sandbox print."""
         target = symbol or self.resolved_symbol or self.preferred_symbol
+        client = self._feed()
+        live = self._resolve_public_symbol(target)
+        dtype = self._feed_type(live)
+        prev = (client.options or {}).get("defaultType")
         try:
-            ticker = self._ccxt(lambda: self.exchange.fetch_ticker(target), label="bitget.ticker")
+            client.options["defaultType"] = dtype
+            ticker = self._ccxt(lambda: client.fetch_ticker(live), label="bitget.mainnet.ticker")
+            mark = extract_mark_price(ticker)
             return {
                 "ok": True,
                 "mocked": False,
-                "symbol": ticker.get("symbol") or target,
+                "symbol": ticker.get("symbol") or live or target,
+                "public_symbol": live,
                 "last": ticker.get("last"),
                 "bid": ticker.get("bid"),
                 "ask": ticker.get("ask"),
+                "mark": mark,
+                "index": extract_mark_price(ticker.get("index"), ticker.get("indexPrice")) if isinstance(ticker, dict) else None,
                 "percentage": ticker.get("percentage"),
                 "quoteVolume": ticker.get("quoteVolume"),
                 "datetime": ticker.get("datetime"),
+                "source": "bitget.mainnet",
+                "market_type": dtype,
             }
         except Exception as exc:
             return {
                 "ok": False,
                 "mocked": False,
                 "symbol": target,
+                "public_symbol": live,
                 "last": None,
                 "bid": None,
                 "ask": None,
+                "mark": None,
                 "percentage": None,
                 "quoteVolume": None,
                 "datetime": datetime.now(timezone.utc).isoformat(),
+                "source": "bitget.mainnet",
                 "error": str(exc)[:240],
             }
+        finally:
+            client.options["defaultType"] = prev
 
     def fetch_order_book(self, symbol: str | None = None, limit: int = 50) -> dict[str, Any]:
-        """Live L2 book for the Demo symbol. Never invents bids/asks."""
+        """Live MAINNET L2 book. Never invents bids/asks. Never uses the sandbox book."""
         target = symbol or self.resolved_symbol or self.preferred_symbol
+        client = self._feed()
+        live = self._resolve_public_symbol(target)
+        dtype = self._feed_type(live)
+        prev = (client.options or {}).get("defaultType")
         try:
+            client.options["defaultType"] = dtype
             book = self._ccxt(
-                lambda: self.exchange.fetch_order_book(target, limit),
-                label="bitget.order_book",
+                lambda: client.fetch_order_book(live, limit),
+                label="bitget.mainnet.order_book",
             )
-            return _book_payload(
-                target,
+            payload = _book_payload(
+                live or target,
                 list(book.get("bids") or []),
                 list(book.get("asks") or []),
                 ok=True,
-                source="l2",
+                source="mainnet_l2",
                 error=None,
             )
+            payload["public_symbol"] = live
+            payload["market_type"] = dtype
+            return payload
         except Exception as exc:
             ticker = self.fetch_ticker(target)
             bid = ticker.get("bid")
@@ -677,14 +1039,64 @@ class BitgetPaperConnector:
             if bid_f > 0 and ask_f > 0:
                 bids = [[bid_f, 0.0]]
                 asks = [[ask_f, 0.0]]
-            return _book_payload(
-                target,
+            payload = _book_payload(
+                live or target,
                 bids,
                 asks,
                 ok=bool(bids and asks),
-                source="ticker",
+                source="mainnet_ticker",
                 error=str(exc)[:240],
             )
+            payload["public_symbol"] = live
+            payload["market_type"] = dtype
+            return payload
+        finally:
+            client.options["defaultType"] = prev
+
+    def fetch_bbo(self, symbol: str, side: str = "") -> dict[str, Any]:
+        """Mainnet best bid/offer peg. BUY=ask, SELL/CLOSE=bid. Contracts vs markPrice."""
+        target = symbol or self.resolved_symbol or self.preferred_symbol or ""
+        book = self.fetch_order_book(target)
+        ticker = self.fetch_ticker(target)
+        bid = coerce_price(book.get("best_bid"), ticker.get("bid"))
+        ask = coerce_price(book.get("best_ask"), ticker.get("ask"))
+        mark = coerce_price(extract_mark_price(ticker, ticker.get("mark"), book))
+        last = coerce_price(ticker.get("last"), mark, ask, bid)
+        peg = bbo_peg_price(side, bid if bid > 0 else None, ask if ask > 0 else None)
+        peg_f = coerce_price(peg)
+        if peg_f <= 0:
+            peg_f = last
+            peg = peg_f if peg_f > 0 else None
+        live = str(ticker.get("public_symbol") or book.get("public_symbol") or target)
+        is_contract = _looks_contract(live) or _looks_contract(target)
+        try:
+            is_contract = is_contract or self._is_swap(target)
+        except Exception:
+            pass
+        error = None
+        if last <= 0 and peg_f <= 0:
+            error = "NO_LIVE_BBO"
+        elif peg_f > 0 and not bbo_sane_vs_mark(peg=peg_f, mark=mark if mark > 0 else None, is_contract=is_contract):
+            error = "MARK_DIVERGENCE"
+        div = None
+        if peg_f > 0 and mark > 0:
+            div = round(abs(peg_f - mark) / mark * 100.0, 4)
+        return {
+            "ok": error is None,
+            "source": "mainnet_bbo",
+            "symbol": target,
+            "public_symbol": live,
+            "side": (side or "").lower().strip(),
+            "best_bid": bid if bid > 0 else None,
+            "best_ask": ask if ask > 0 else None,
+            "mark": mark if mark > 0 else None,
+            "last": last if last > 0 else None,
+            "peg": peg_f if peg_f > 0 else None,
+            "is_contract": is_contract,
+            "spread_pct": book.get("spread_pct"),
+            "mark_divergence_pct": div,
+            "error": error,
+        }
 
     def fetch_open_position(self, symbol: str | None = None) -> dict[str, Any]:
         """Live CCXT positions for the target. Never invents an open book."""
@@ -819,9 +1231,18 @@ class BitgetPaperConnector:
             record["log_path"] = str(log_path)
             return record
 
-        ticker = self.fetch_ticker(symbol)
-        last = coerce_price(ticker.get("last"), ticker.get("bid"), ticker.get("ask"))
-        if last <= 0:
+        quote = self.fetch_bbo(symbol, side=side_n)
+        last = coerce_price(quote.get("peg"), quote.get("mark"), quote.get("last"))
+        if last <= 0 or not quote.get("ok"):
+            status = str(quote.get("error") or "NO_LIVE_PRICE")
+            if status == "MARK_DIVERGENCE":
+                err = (
+                    f"Live BBO diverges from markPrice "
+                    f"(peg={quote.get('peg')} mark={quote.get('mark')} "
+                    f"div={quote.get('mark_divergence_pct')}% > {BBO_MARK_DIVERGENCE_PCT}%)."
+                )
+            else:
+                err = "No live mainnet BBO — refusing to size a dummy or sandbox ticket."
             record = {
                 "id": str(uuid.uuid4()),
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -834,11 +1255,14 @@ class BitgetPaperConnector:
                 "notional_usdt": 0.0,
                 "reasoning_hash": reasoning_hash,
                 "ok": False,
-                "status": "NO_LIVE_PRICE",
+                "status": status if status in {"NO_LIVE_PRICE", "NO_LIVE_BBO", "MARK_DIVERGENCE"} else "NO_LIVE_PRICE",
                 "order_id": None,
                 "raw_order": {},
-                "error": "No live last price — refusing to size a dummy ticket.",
-                "ticker": {k: ticker.get(k) for k in ("last", "percentage", "mocked", "datetime")},
+                "error": err,
+                "ticker": {
+                    k: quote.get(k)
+                    for k in ("last", "best_bid", "best_ask", "mark", "peg", "source")
+                },
                 "price": 0.0,
                 "entry_price": 0.0,
                 "account_balance_change": 0.0,
@@ -846,6 +1270,7 @@ class BitgetPaperConnector:
                 "sl_price": None,
                 "tp_price": None,
             }
+            _stamp_bbo(record, quote)
             if extra:
                 record["board"] = extra
             log_path = _append_trade(record)
@@ -865,7 +1290,10 @@ class BitgetPaperConnector:
             "amount": sized,
             "notional_usdt": notional,
             "reasoning_hash": reasoning_hash,
-            "ticker": {k: ticker.get(k) for k in ("last", "percentage", "mocked", "datetime")},
+            "ticker": {
+                k: quote.get(k)
+                for k in ("last", "best_bid", "best_ask", "mark", "peg", "source", "public_symbol")
+            },
             "price": last,
             "entry_price": last,
             "sl_price": None,
@@ -875,6 +1303,7 @@ class BitgetPaperConnector:
             "margin_usdt": margin_usdt,
             "sl_margin_frac": sl_margin_frac,
         }
+        _stamp_bbo(record, quote)
         if extra:
             record["board"] = extra
 
@@ -894,14 +1323,13 @@ class BitgetPaperConnector:
             record["status"] = str(order.get("status") or "submitted")
             record["order_id"] = order.get("id")
             record["raw_order"] = _slim_order(order)
-            entry = coerce_price(
-                order.get("average"),
-                order.get("price"),
-                last,
-            )
+            demo_fill = coerce_price(order.get("average"), order.get("price"))
+            entry = last if last > 0 else demo_fill
+            record["demo_fill_price"] = demo_fill if demo_fill > 0 else None
             record["entry_price"] = entry
             record["price"] = entry
             record["notional_usdt"] = round(sized * entry, 6) if entry > 0 else notional
+            _stamp_bbo(record, quote)
             if margin_usdt is None and record["notional_usdt"]:
                 try:
                     lev = SWAP_LEVERAGE if self._is_swap(symbol) else 1.0
@@ -1340,14 +1768,21 @@ class BitgetPaperConnector:
         timeframe: str = RSI_TIMEFRAME,
         limit: int = 64,
     ) -> list[list[Any]]:
-        """Live Demo candles. Empty list if the venue has no OHLCV for this symbol."""
+        """Live MAINNET candles. Empty list if the venue has no OHLCV for this symbol."""
+        client = self._feed()
+        live = self._resolve_public_symbol(symbol)
+        dtype = self._feed_type(live)
+        prev = (client.options or {}).get("defaultType")
         try:
+            client.options["defaultType"] = dtype
             rows = self._ccxt(
-                lambda: self.exchange.fetch_ohlcv(symbol, timeframe, limit=int(limit)),
-                label=f"bitget.ohlcv.{timeframe}",
+                lambda: client.fetch_ohlcv(live, timeframe, limit=int(limit)),
+                label=f"bitget.mainnet.ohlcv.{timeframe}",
             )
         except Exception:
             return []
+        finally:
+            client.options["defaultType"] = prev
         return list(rows) if isinstance(rows, list) else []
 
     def _ohlcv_with_fallback(
@@ -1529,6 +1964,7 @@ class BitgetPaperConnector:
             if key in seen:
                 continue
             seen.add(key)
+            self._overlay_live_mark(snap)
             book.append(snap)
         if not book:
             for symbol in list(self.universe or [])[:40]:
@@ -1538,25 +1974,26 @@ class BitgetPaperConnector:
                     continue
                 if not spot.get("open"):
                     continue
-                mark = coerce_price((self.fetch_ticker(symbol) or {}).get("last"))
+                ticker = self.fetch_ticker(symbol) or {}
+                mark = coerce_price(ticker.get("mark"), ticker.get("last"), ticker.get("bid"), ticker.get("ask"))
                 qty = float(spot.get("contracts") or 0.0)
                 entry = coerce_price(spot.get("entry_price"), mark)
                 pnl_usdt, pnl_pct = unrealized_pnl(entry, mark, qty, "buy")
-                book.append(
-                    {
-                        "open": True,
-                        "source": "spot",
-                        "symbol": symbol,
-                        "side": "buy",
-                        "contracts": qty,
-                        "entry_price": entry,
-                        "mark_price": mark,
-                        "pnl_usdt": pnl_usdt,
-                        "pnl_pct": pnl_pct,
-                        "raw": spot.get("raw") or {},
-                        "error": None,
-                    }
-                )
+                row = {
+                    "open": True,
+                    "source": "spot",
+                    "symbol": symbol,
+                    "side": "buy",
+                    "contracts": qty,
+                    "entry_price": entry,
+                    "mark_price": mark,
+                    "pnl_usdt": pnl_usdt,
+                    "pnl_pct": pnl_pct,
+                    "raw": spot.get("raw") or {},
+                    "error": None,
+                }
+                self._overlay_live_mark(row)
+                book.append(row)
         if errors and not book:
             return [{"open": False, "error": " | ".join(errors), "symbol": "", "side": "none"}]
         return book
@@ -1601,8 +2038,9 @@ class BitgetPaperConnector:
             }
         pos_side = _norm_side(str(existing.get("side") or side or "buy"))
         entry = coerce_price(existing.get("entry_price"), (existing.get("raw") or {}).get("entryPrice"))
-        ticker = self.fetch_ticker(symbol)
-        mark = coerce_price(ticker.get("last"), ticker.get("bid"), ticker.get("ask"), entry)
+        close_side_guess = "buy" if pos_side in {"sell", "short"} else "sell"
+        quote = self.fetch_bbo(symbol, side=close_side_guess)
+        mark = coerce_price(quote.get("peg"), quote.get("mark"), quote.get("last"), entry)
         qty, qty_why = self._partial_close_qty(
             symbol,
             float(existing.get("contracts") or 0.0),
@@ -1660,6 +2098,7 @@ class BitgetPaperConnector:
             "price": mark,
             "mark_price": mark,
         }
+        _stamp_bbo(record, quote, as_entry=False)
         try:
             order = None
             last_exc: Exception | None = None
@@ -1677,7 +2116,8 @@ class BitgetPaperConnector:
                     continue
             if order is None:
                 raise last_exc or RuntimeError("close_market failed")
-            fill = coerce_price(order.get("average"), order.get("price"), mark)
+            demo_fill = coerce_price(order.get("average"), order.get("price"))
+            fill = mark if mark > 0 else demo_fill
             pnl_usdt, pnl_pct = unrealized_pnl(entry, fill, qty, pos_side)
             record.update(
                 {
@@ -1686,11 +2126,13 @@ class BitgetPaperConnector:
                     "order_id": order.get("id"),
                     "raw_order": _slim_order(order),
                     "price": fill,
+                    "demo_fill_price": demo_fill if demo_fill > 0 else None,
                     "pnl_usdt": round(pnl_usdt, 6),
                     "pnl_pct": round(pnl_pct, 4),
                     "notional_usdt": round(abs(fill * qty), 6),
                 }
             )
+            _stamp_bbo(record, quote, as_entry=False)
             self._apply_balance_change(record, balance_before=balance_before, filled=True)
         except Exception as exc:
             pnl_usdt, pnl_pct = unrealized_pnl(entry, mark, qty, pos_side)
@@ -1740,12 +2182,39 @@ class BitgetPaperConnector:
                 )
         return results
 
+    def _overlay_live_mark(self, snap: dict[str, Any]) -> None:
+        """Reprice an open Demo book to live mainnet mark / BBO for realistic PnL."""
+        symbol = str(snap.get("symbol") or "")
+        if not symbol:
+            return
+        try:
+            ticker = self.fetch_ticker(symbol)
+        except Exception:
+            return
+        mark = coerce_price(
+            ticker.get("mark"),
+            ticker.get("last"),
+            ticker.get("bid"),
+            ticker.get("ask"),
+            snap.get("mark_price"),
+        )
+        if mark <= 0:
+            return
+        entry = coerce_price(snap.get("entry_price"), mark)
+        qty = float(snap.get("contracts") or 0.0)
+        side = str(snap.get("side") or "buy")
+        pnl_usdt, pnl_pct = unrealized_pnl(entry, mark, qty, side)
+        snap["mark_price"] = mark
+        snap["pnl_usdt"] = pnl_usdt
+        snap["pnl_pct"] = pnl_pct
+        snap["mark_source"] = ticker.get("source") or "bitget.mainnet"
+
     def _is_swap(self, symbol: str) -> bool:
         try:
             market = self.exchange.market(symbol)
             return bool(market.get("swap") or market.get("future"))
         except Exception:
-            return ":USDT" in symbol
+            return ":USDT" in symbol or _looks_contract(symbol)
 
     def _price(self, symbol: str, value: float) -> float:
         try:

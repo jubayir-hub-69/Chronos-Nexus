@@ -58,12 +58,12 @@ from core.positions import (
     strip_occupied_universe,
 )
 from core.schemas import AnalystBrief, BoardDecision, RiskReport
-from core.ta import RSI_PERIOD, SCALE_OUT_PCT, candle_veto, confluence_veto, rsi_zone
+from core.ta import RSI_PERIOD, SCALE_OUT_PCT, bbo_peg_price, candle_veto, confluence_veto, rsi_zone
 from utils.commands import CommandDesk, TelegramCommandLoop, TerminalCommandLoop
 from utils.notifier import TelegramNotifier, send_startup_message
 
 LIVE_TRADING_ENABLED = False
-VERSION = "0.9.1-spotchat"
+VERSION = "1.0.0-nexus"
 HACKATHON = "Bitget AI Base Camp Hackathon S2"
 CYCLE_INTERVAL_SEC = 3600
 CYCLE_ERROR_BACKOFF_SEC = 300
@@ -558,11 +558,17 @@ def _run_trading_cycle(
                 action="STAND_DOWN",
                 session=clock["line"],
             )
-        last = _safe_float(ticker.get("last"))
+        last = bbo_peg_price(
+            brief.side,
+            book.get("best_bid") if book.get("best_bid") is not None else ticker.get("bid"),
+            book.get("best_ask") if book.get("best_ask") is not None else ticker.get("ask"),
+        )
+        if last is None:
+            last = _safe_float(ticker.get("mark")) or _safe_float(ticker.get("last"))
         spread = book.get("spread_pct")
         spread_s = f"{float(spread):.4f}%" if isinstance(spread, (int, float)) else "n/a"
         try:
-            ta = bitget.fetch_ta_bundle(target) if bitget else {"ok": False, "rsi": None, "symbol": target}
+            ta = bitget.fetch_mtf_bundle(target) if bitget else {"ok": False, "rsi": None, "symbol": target}
         except Exception as exc:
             ta = {
                 "ok": False,
@@ -582,10 +588,12 @@ def _run_trading_cycle(
             [
                 ("symbol", target),
                 ("picked", "STAND_DOWN" if idle else "ORACLE · live RSS"),
-                ("last", "n/a" if last is None else str(last)),
+                ("peg", "n/a" if last is None else str(last)),
                 ("bid", str(book.get("best_bid") if book.get("best_bid") is not None else ticker.get("bid") or "n/a")),
                 ("ask", str(book.get("best_ask") if book.get("best_ask") is not None else ticker.get("ask") or "n/a")),
+                ("mark", str(ticker.get("mark") if ticker.get("mark") is not None else "n/a")),
                 ("spread", spread_s),
+                ("feed", str(ticker.get("source") or book.get("source") or "bitget.mainnet")),
                 ("l2", book.get("source") or ("LIVE" if book.get("ok") else "FAULT")),
                 ("model", brief.model or cortex.model_name),
             ],
