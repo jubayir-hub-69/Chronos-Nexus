@@ -65,6 +65,10 @@ class ParseSpotIntentTests(unittest.TestCase):
         self.assertIsNone(parse_spot_intent("hello world"))
         self.assertIsNone(parse_spot_intent("/price BGB"))
         self.assertIsNone(parse_spot_intent("/balance"))
+        self.assertIsNone(parse_spot_intent("/pnl"))
+        self.assertIsNone(parse_spot_intent("/status"))
+        self.assertIsNone(parse_spot_intent("/menu"))
+        self.assertIsNone(parse_spot_intent("/dashboard"))
 
     def test_bgb_buy_five_is_a_spot_ticket(self) -> None:
         intent = parse_spot_intent("BGB BUY 5 USDT")
@@ -197,6 +201,8 @@ class SpotMarketGuardTests(unittest.TestCase):
         self.assertEqual(parse_command("/balance USDT"), ("balance", "USDT"))
         self.assertEqual(parse_command("/balance nvda"), ("balance", "nvda"))
         self.assertEqual(parse_command("bal"), ("balance", ""))
+        self.assertEqual(parse_command("/pnl"), ("pnl", ""))
+        self.assertEqual(parse_command("/status"), ("status", ""))
 
 
 class PriceBalanceCommandTests(unittest.TestCase):

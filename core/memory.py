@@ -88,6 +88,13 @@ class BoardMemory:
                 "ta_verdict": decision.get("ta_verdict"),
                 "thesis": _clip(decision.get("thesis"), 400),
                 "model": str(decision.get("model") or ""),
+                "conviction": _opt_int(decision.get("conviction")),
+                "sentiment": _opt_float(decision.get("sentiment")),
+                "news_credibility": _opt_float(decision.get("news_credibility")),
+                "news_conflict": bool(decision.get("news_conflict")),
+                "news_impact": str(decision.get("news_impact") or ""),
+                "news_good": _clip(decision.get("news_good"), 240),
+                "news_bad": _clip(decision.get("news_bad"), 240),
             },
             "result": {
                 "ok": bool(result.get("ok")),
@@ -106,7 +113,9 @@ class BoardMemory:
             payload["trades"] = trades
             payload["updated"] = entry["ts"]
             payload["max_trades"] = self.max_trades
-            payload["daily"] = _coerce_daily(payload.get("daily"))
+            daily = _coerce_daily(payload.get("daily"))
+            payload["daily"] = daily
+            payload["snapshot"] = _snapshot_from_trade(entry, daily)
             _atomic_write(self.path, payload)
         return self.path
 
@@ -190,6 +199,11 @@ class BoardMemory:
                 }
             )
             daily["fills"] = fills[-32:]
+            try:
+                prev = float(daily.get("realized_pnl_usdt") or 0.0)
+            except (TypeError, ValueError):
+                prev = 0.0
+            daily["realized_pnl_usdt"] = round(prev + pnl, 6)
             if "PARTIAL" in kind:
                 return daily
             if kind == "SL" or kind.startswith("SL") or " SL" in f" {kind}":
@@ -220,6 +234,90 @@ class BoardMemory:
             _atomic_write(self.path, payload)
             return dict(daily)
 
+    def record_snapshot(self, snapshot: dict[str, Any] | None) -> dict[str, Any]:
+        """Persist the live ORACLE/SENTINEL/CHAIRMAN state for /status."""
+        row = snapshot if isinstance(snapshot, dict) else {}
+        with _LOCK:
+            payload = _read_payload(self.path)
+            daily = _coerce_daily(payload.get("daily"))
+            payload["daily"] = daily
+            stamped = dict(row)
+            if not stamped.get("ts"):
+                stamped["ts"] = datetime.now(timezone.utc).isoformat()
+            stamped["desk"] = live_desk_status(daily, str(stamped.get("action") or ""))
+            payload["snapshot"] = stamped
+            payload["updated"] = stamped["ts"]
+            if "trades" not in payload:
+                payload["trades"] = []
+            _atomic_write(self.path, payload)
+            return dict(stamped)
+
+    def latest_snapshot(self) -> dict[str, Any]:
+        """Exact last engine snapshot. Empty dict fields stay empty — never invented."""
+        with _LOCK:
+            payload = _read_payload(self.path)
+            snap = payload.get("snapshot")
+            trades = list(payload.get("trades") or [])
+            daily = _coerce_daily(payload.get("daily"))
+        if isinstance(snap, dict) and snap:
+            out = dict(snap)
+            out["desk"] = live_desk_status(daily, str(out.get("action") or ""))
+            return out
+        if trades:
+            return _snapshot_from_trade(trades[-1], daily)
+        return {
+            "ts": "",
+            "scored": False,
+            "desk": live_desk_status(daily, ""),
+            "action": "",
+        }
+
+    def session_pnl(self) -> dict[str, Any]:
+        """UTC-day realized PnL, win/loss, and remaining entry slots from the live ledger."""
+        daily = self.daily_state()
+        try:
+            entries = int(daily.get("entries") or 0)
+        except (TypeError, ValueError):
+            entries = 0
+        try:
+            wins = int(daily.get("wins") or 0)
+        except (TypeError, ValueError):
+            wins = 0
+        try:
+            losses = int(daily.get("losses") or 0)
+        except (TypeError, ValueError):
+            losses = 0
+        try:
+            sl_hits = int(daily.get("sl_hits") or 0)
+        except (TypeError, ValueError):
+            sl_hits = 0
+        fills = [f for f in (daily.get("fills") or []) if isinstance(f, dict)]
+        fill_pnl = _sum_fill_pnl(fills)
+        try:
+            stored = float(daily.get("realized_pnl_usdt") or 0.0)
+        except (TypeError, ValueError):
+            stored = 0.0
+        realized = stored
+        if abs(realized) < 1e-12 and abs(fill_pnl) >= 1e-12:
+            realized = fill_pnl
+        blocked = bool(daily_block_reason(daily))
+        trades_left = 0 if blocked else max(0, DAILY_MAX_ENTRIES - max(0, entries))
+        return {
+            "date": str(daily.get("date") or utc_today()),
+            "realized_pnl_usdt": round(float(realized), 6),
+            "wins": wins,
+            "losses": losses,
+            "sl_hits": sl_hits,
+            "entries": entries,
+            "entries_max": DAILY_MAX_ENTRIES,
+            "trades_left": trades_left,
+            "halt": str(daily.get("halt") or ""),
+            "halt_reason": str(daily.get("halt_reason") or ""),
+            "deployed_usdt": float(daily.get("deployed_usdt") or 0.0),
+            "fills": fills,
+            "desk": live_desk_status(daily, ""),
+        }
+
 
 def utc_today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -233,6 +331,7 @@ def empty_daily(day: str | None = None) -> dict[str, Any]:
         "losses": 0,
         "sl_hits": 0,
         "deployed_usdt": 0.0,
+        "realized_pnl_usdt": 0.0,
         "halt": "",
         "halt_reason": "",
         "fills": [],
@@ -349,6 +448,10 @@ def _coerce_daily(raw: Any) -> dict[str, Any]:
         out["deployed_usdt"] = float(out.get("deployed_usdt") or 0.0)
     except (TypeError, ValueError):
         out["deployed_usdt"] = 0.0
+    try:
+        out["realized_pnl_usdt"] = float(out.get("realized_pnl_usdt") or 0.0)
+    except (TypeError, ValueError):
+        out["realized_pnl_usdt"] = 0.0
     out["halt"] = str(out.get("halt") or "")
     out["halt_reason"] = str(out.get("halt_reason") or "")
     fills = out.get("fills")
@@ -421,6 +524,174 @@ def _hydrate_from_trade_log() -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def live_desk_status(daily: dict[str, Any] | None, action: str = "") -> str:
+    """ARMED when the desk may still take risk; STAND_DOWN on halt or last chair action."""
+    if daily_block_reason(daily):
+        return "STAND_DOWN"
+    act = str(action or "").strip().upper().replace(" ", "_")
+    if act == "STAND_DOWN":
+        return "STAND_DOWN"
+    if act == "EXECUTE":
+        return "ARMED"
+    return "ARMED"
+
+
+def sentiment_label(score: Any, *, scored: bool = True) -> str:
+    if not scored or score is None or score == "":
+        return "UNSCANNED"
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return "UNSCANNED"
+    if value >= 58:
+        return "BULL"
+    if value <= 42:
+        return "BEAR"
+    return "NEUTRAL"
+
+
+def build_engine_snapshot(
+    *,
+    news_context: list[str] | None = None,
+    brief: dict[str, Any] | None = None,
+    risk: dict[str, Any] | None = None,
+    decision: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+    daily: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Map live ORACLE/SENTINEL/CHAIRMAN objects onto the persisted snapshot."""
+    brief_d = brief if isinstance(brief, dict) else {}
+    risk_d = risk if isinstance(risk, dict) else {}
+    decision_d = decision if isinstance(decision, dict) else {}
+    result_d = result if isinstance(result, dict) else {}
+    headlines = [
+        str(h)
+        for h in (news_context or brief_d.get("wire_headlines") or [])
+        if str(h).strip()
+    ][:8]
+    action = str(decision_d.get("action") or "")
+    sentiment = _opt_float(brief_d.get("sentiment_score"), decision_d.get("sentiment"))
+    conviction = _opt_int(brief_d.get("conviction"), decision_d.get("conviction"))
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "scored": True,
+        "action": action,
+        "desk": live_desk_status(daily, action),
+        "sentiment": sentiment,
+        "conviction": conviction if conviction is not None else 0,
+        "sentiment_label": sentiment_label(sentiment, scored=sentiment is not None),
+        "oracle_side": str(brief_d.get("side") or decision_d.get("side") or "none"),
+        "oracle_symbol": str(brief_d.get("primary_symbol") or decision_d.get("symbol") or "NONE"),
+        "oracle_thesis": _clip(brief_d.get("thesis") or decision_d.get("thesis"), 400),
+        "news_good": _clip(brief_d.get("news_good"), 240),
+        "news_bad": _clip(brief_d.get("news_bad"), 240),
+        "news_conflict": bool(brief_d.get("news_conflict")),
+        "news_credibility": _opt_float(brief_d.get("news_credibility")),
+        "news_impact": str(brief_d.get("news_impact") or ""),
+        "headlines": headlines,
+        "sentinel_verdict": str(risk_d.get("verdict") or decision_d.get("verdict") or ""),
+        "sentinel_rationale": _clip(risk_d.get("rationale"), 400),
+        "rsi": _opt_float(risk_d.get("rsi"), decision_d.get("rsi")),
+        "ta_verdict": str(risk_d.get("ta_verdict") or decision_d.get("ta_verdict") or ""),
+        "setup_score": _opt_float(risk_d.get("setup_score")),
+        "setup_threshold": _opt_float(risk_d.get("setup_threshold")),
+        "mtf_align": str(risk_d.get("mtf_align") or ""),
+        "daily_halt": str(risk_d.get("daily_halt") or (daily or {}).get("halt") or ""),
+        "model": str(
+            decision_d.get("model") or brief_d.get("model") or risk_d.get("model") or ""
+        ),
+        "result_status": str(result_d.get("status") or ""),
+    }
+
+
+def _snapshot_from_trade(row: dict[str, Any], daily: dict[str, Any] | None) -> dict[str, Any]:
+    decision = row.get("decision") if isinstance(row.get("decision"), dict) else {}
+    result = row.get("result") if isinstance(row.get("result"), dict) else {}
+    news = row.get("news_context") if isinstance(row.get("news_context"), list) else []
+    headlines = [str(h) for h in news if str(h).strip()][:8]
+    sentiment = _opt_float(decision.get("sentiment"))
+    conviction = _opt_int(decision.get("conviction"))
+    scored = sentiment is not None or conviction is not None
+    if sentiment is None and headlines:
+        wire = _score_headlines(headlines)
+        if wire.get("scored"):
+            sentiment = _opt_float(wire.get("sentiment"))
+            scored = True
+            if conviction is None:
+                conviction = _opt_int(wire.get("conviction"))
+    action = str(decision.get("action") or "")
+    return {
+        "ts": str(row.get("ts") or ""),
+        "scored": scored,
+        "action": action,
+        "desk": live_desk_status(daily, action),
+        "sentiment": sentiment,
+        "conviction": conviction,
+        "sentiment_label": sentiment_label(sentiment, scored=scored and sentiment is not None),
+        "oracle_side": str(decision.get("side") or "none"),
+        "oracle_symbol": str(decision.get("symbol") or "NONE"),
+        "oracle_thesis": _clip(decision.get("thesis"), 400),
+        "news_good": _clip(decision.get("news_good"), 240),
+        "news_bad": _clip(decision.get("news_bad"), 240),
+        "news_conflict": bool(decision.get("news_conflict")),
+        "news_credibility": _opt_float(decision.get("news_credibility")),
+        "news_impact": str(decision.get("news_impact") or ""),
+        "headlines": headlines,
+        "sentinel_verdict": str(decision.get("verdict") or ""),
+        "sentinel_rationale": _clip(result.get("error"), 400),
+        "rsi": _opt_float(decision.get("rsi")),
+        "ta_verdict": str(decision.get("ta_verdict") or ""),
+        "daily_halt": str((daily or {}).get("halt") or ""),
+        "model": str(decision.get("model") or ""),
+        "result_status": str(result.get("status") or ""),
+    }
+
+
+def _score_headlines(headlines: list[str]) -> dict[str, Any]:
+    try:
+        from core.news import score_wire
+
+        return score_wire([{"headline": h} for h in headlines if h])
+    except Exception:
+        return {"scored": False}
+
+
+def _sum_fill_pnl(fills: list[dict[str, Any]]) -> float:
+    total = 0.0
+    for fill in fills:
+        if "pnl_usdt" not in fill:
+            continue
+        try:
+            total += float(fill.get("pnl_usdt") or 0.0)
+        except (TypeError, ValueError):
+            continue
+    return round(total, 6)
+
+
+def _opt_float(*values: Any) -> float | None:
+    for value in values:
+        if value is None or value == "":
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed == parsed and parsed not in {float("inf"), float("-inf")}:
+            return parsed
+    return None
+
+
+def _opt_int(*values: Any) -> int | None:
+    for value in values:
+        if value is None or value == "":
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _clip(value: Any, n: int) -> str:

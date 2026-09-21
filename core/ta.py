@@ -3,8 +3,24 @@
 Pure functions — no CCXT, no LLM. SENTINEL / CHAIRMAN / the desk apply the
 vetoes; the Bitget connector only supplies OHLCV, ticker, and fills.
 
-v0.7 RSI confluence is unchanged. This module also scores candle structure,
-volatility, fundamentals, and margin-based stop distance.
+Models
+------
+* Wilder RSI(14) on 15m (1h fallback). BUY veto ≥ 70; SELL veto ≤ 30.
+  Unmeasured RSI is fail-open (does not veto).
+* Multi-timeframe confluence: 15m entry, 1h confirmation, 4h regime.
+  Frame direction = candle structure, else pattern bias, else SMA(20) slope.
+  ALIGNED / MIXED / CONFLICT / UNMEASURED.
+* Volume: relative volume vs 20-bar mean (rvol) + 20-bin volume profile
+  (POC + 70% value area). Breaks outside VA on rvol < 1.1 are fakeouts.
+* VWAP typical-price × volume; chase veto when |close-VWAP|/VWAP > 1.2%
+  on an ALIGNED tape (wait for pullback).
+* L2 imbalance (bid_vol − ask_vol) / total. Opposing wall = size ≥ 3×
+  median within 0.8% of last.
+* Setup ensemble (only when 1h/4h are measured). TA-weighted active desk:
+    0.10·news + 0.22·HTF + 0.18·entry + 0.18·volume
+    + 0.16·book + 0.10·extension + 0.06·conviction
+  Score < 75 → VETO. Unmeasured HTF skips the 75% rail (same fail-open as RSI)
+  so daily limits, RSI, spread, Spot chatbox, and Telegram buttons stay intact.
 """
 
 from __future__ import annotations
@@ -21,9 +37,9 @@ VETO_REASON_RSI_OVERSOLD = "VETO: RSI Oversold despite bearish news"
 VETO_REASON_CANDLE = "VETO: Candle structure contradicts news thesis"
 VETO_REASON_CHOP = "VETO: Choppy/downtrending tape — daily capital halt"
 SCALE_OUT_PCT = 0.25  # first partial TP at +25% PnL (patience; 25–30% window)
-SETUP_THRESHOLD = 90.0
+SETUP_THRESHOLD = 75.0
 MTF_FRAMES = ("15m", "1h", "4h")
-VETO_REASON_SETUP = "VETO: Setup confidence below 90 — patience over activity"
+VETO_REASON_SETUP = "VETO: Setup confidence below 75 — wait for a cleaner TA tape"
 VETO_REASON_WALL = "VETO: Opposing order-book wall"
 VETO_REASON_MTF = "VETO: Higher-timeframe trend disagrees"
 VETO_REASON_EXTENSION = "VETO: Price extended — waiting for pullback"
@@ -159,6 +175,27 @@ def compute_rsi(closes: Sequence[Any], period: int = RSI_PERIOD) -> float | None
     return round(100.0 - (100.0 / (1.0 + rs)), 4)
 
 
+def compute_sma(closes: Sequence[Any], period: int = 20) -> float | None:
+    """Simple moving average. None when the window is thin."""
+    try:
+        window = int(period)
+    except (TypeError, ValueError):
+        return None
+    if window <= 0:
+        return None
+    prices: list[float] = []
+    for raw in closes or []:
+        try:
+            px = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if px > 0:
+            prices.append(px)
+    if len(prices) < window:
+        return None
+    return sum(prices[-window:]) / float(window)
+
+
 def compute_atr(rows: Sequence[Any], period: int = ATR_PERIOD) -> float | None:
     """True-range ATR from CCXT OHLCV rows [ts, o, h, l, c, v]."""
     try:
@@ -264,6 +301,12 @@ def snapshot_ta(ta: dict[str, Any] | None) -> dict[str, Any]:
         "rvol",
         "vwap",
         "vwap_dev_pct",
+        "sma20",
+        "sma_bias",
+        "high",
+        "low",
+        "high_24h",
+        "low_24h",
         "poc",
         "vah",
         "val",
@@ -648,6 +691,16 @@ def enrich_ohlcv(rows: Sequence[Any], timeframe: str) -> dict[str, Any]:
     profile = analyze_volume_profile(rows)
     candles["rsi"] = compute_rsi(closes)
     candles["timeframe"] = timeframe
+    sma20 = compute_sma(closes, 20)
+    last_close = closes[-1] if closes else None
+    sma_bias = "neutral"
+    if sma20 and last_close:
+        if last_close > sma20 * 1.001:
+            sma_bias = "bullish"
+        elif last_close < sma20 * 0.999:
+            sma_bias = "bearish"
+    candles["sma20"] = None if sma20 is None else round(float(sma20), 8)
+    candles["sma_bias"] = sma_bias
     candles["vwap"] = vwap.get("vwap")
     candles["vwap_dev_pct"] = vwap.get("vwap_dev_pct")
     candles["rvol"] = volume.get("rvol")
@@ -685,9 +738,14 @@ def mtf_alignment(frames: dict[str, Any] | None, side: str) -> str:
 def _frame_dir(frame: dict[str, Any]) -> int:
     structure = str(frame.get("structure") or "").upper()
     bias = str(frame.get("bias") or "").lower()
+    sma_bias = str(frame.get("sma_bias") or "").lower()
     if structure in {"UPTREND", "BREAK_UP"} or bias == "bullish":
         return 1
     if structure in {"DOWNTREND", "BREAK_DOWN"} or bias == "bearish":
+        return -1
+    if sma_bias == "bullish":
+        return 1
+    if sma_bias == "bearish":
         return -1
     return 0
 
@@ -748,12 +806,24 @@ def setup_veto(
     last: float | None = None,
     news: dict[str, Any] | None = None,
     conviction: int = 0,
+    high_24h: float | None = None,
+    low_24h: float | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """Hard rails + composite 0–100. Caller vetoes when reason or score < 90."""
+    """Hard rails + composite 0–100. Caller vetoes when reason or score < 75."""
     from core.news import news_veto
 
     payload = frames if isinstance(frames, dict) else {}
     entry = payload.get("15m") if isinstance(payload.get("15m"), dict) else payload
+    if not isinstance(entry, dict):
+        entry = {}
+    else:
+        entry = dict(entry)
+    if high_24h is not None:
+        entry["high_24h"] = high_24h
+    if low_24h is not None:
+        entry["low_24h"] = low_24h
+    if last is not None:
+        entry.setdefault("last_close", last)
     align = mtf_alignment(payload, side)
     fakeout = detect_fakeout(entry)
     pullback = detect_pullback(side, entry, align)
@@ -768,8 +838,6 @@ def setup_veto(
         reason = VETO_REASON_FAKEOUT
     elif book_snap.get("veto"):
         reason = str(book_snap["veto"])
-    elif align == "ALIGNED" and not pullback:
-        reason = VETO_REASON_EXTENSION
     scored = score_setup(
         side=side,
         news=news,
@@ -781,7 +849,8 @@ def setup_veto(
         fakeout=fakeout,
         entry=entry,
     )
-    if not reason and scored["score"] < SETUP_THRESHOLD:
+    measurable = align in {"ALIGNED", "MIXED", "CONFLICT"}
+    if not reason and measurable and scored["score"] < SETUP_THRESHOLD:
         reason = VETO_REASON_SETUP
     scored.update(
         {
@@ -791,6 +860,7 @@ def setup_veto(
             "book": book_snap,
             "veto": reason,
             "threshold": SETUP_THRESHOLD,
+            "measurable": measurable,
         }
     )
     return reason, scored
@@ -808,13 +878,13 @@ def score_setup(
     fakeout: bool,
     entry: dict[str, Any],
 ) -> dict[str, Any]:
-    """Weighted ensemble. Institutional desks size only when this clears 90."""
+    """Weighted ensemble. Active desk sizes when this clears 75. TA dominates news."""
     news_p = _news_part(side, news)
-    htf_p = {"ALIGNED": 100.0, "MIXED": 45.0, "UNMEASURED": 20.0, "CONFLICT": 0.0}.get(align, 20.0)
+    htf_p = {"ALIGNED": 100.0, "MIXED": 70.0, "UNMEASURED": 20.0, "CONFLICT": 0.0}.get(align, 20.0)
     entry_p = _entry_part(side, entry)
     vol_p = _volume_part(entry, fakeout)
     book_p = _book_part(side, book_snap)
-    ext_p = 92.0 if pullback else (40.0 if align == "ALIGNED" else 55.0)
+    ext_p = 92.0 if pullback else (55.0 if align == "ALIGNED" else 65.0)
     try:
         conv = max(0.0, min(100.0, float(conviction)))
     except (TypeError, ValueError):
@@ -829,13 +899,13 @@ def score_setup(
         "conviction": conv,
     }
     weights = {
-        "news": 0.22,
-        "htf": 0.18,
-        "entry": 0.12,
-        "volume": 0.15,
-        "book": 0.12,
-        "extension": 0.12,
-        "conviction": 0.09,
+        "news": 0.10,
+        "htf": 0.22,
+        "entry": 0.18,
+        "volume": 0.18,
+        "book": 0.16,
+        "extension": 0.10,
+        "conviction": 0.06,
     }
     score = sum(parts[k] * weights[k] for k in weights)
     return {"score": round(score, 2), "parts": parts}
@@ -883,7 +953,31 @@ def _entry_part(side: str, entry: dict[str, Any]) -> float:
             score = min(100.0, score + 12)
         if side_n == "sell" and 38 <= rsi_f <= 58:
             score = min(100.0, score + 12)
+    score = min(100.0, max(0.0, score + _range_adj(side_n, entry)))
     return score
+
+
+def _range_adj(side_n: str, entry: dict[str, Any]) -> float:
+    """+12 near the supportive 24h extreme, −12 chasing the far extreme."""
+    high = _pos_px(entry.get("high_24h")) or _pos_px(entry.get("high")) or _pos_px(entry.get("swing_high"))
+    low = _pos_px(entry.get("low_24h")) or _pos_px(entry.get("low")) or _pos_px(entry.get("swing_low"))
+    last = _pos_px(entry.get("last_close")) or _pos_px(entry.get("last"))
+    if high is None or low is None or last is None or high <= low:
+        return 0.0
+    loc = (last - low) / (high - low)
+    if side_n == "buy":
+        if loc <= 0.35:
+            return 12.0
+        if loc >= 0.80:
+            return -12.0
+        return 0.0
+    if side_n == "sell":
+        if loc >= 0.65:
+            return 12.0
+        if loc <= 0.20:
+            return -12.0
+        return 0.0
+    return 0.0
 
 
 def _volume_part(entry: dict[str, Any], fakeout: bool) -> float:

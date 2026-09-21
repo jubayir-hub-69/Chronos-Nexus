@@ -68,10 +68,10 @@ Evaluate:
     closes → hard stand-down; any stop-loss → hard stand-down; live OHLCV
     chop/downtrend → hard stand-down. Deployed margin across the day cannot
     exceed 6% of live fetch_balance equity (5–6% band). Do not use the whole book.
-11. SETUP SCORE (Python): News NLP + 15m/1h/4h confluence + volume + L2 walls
-    + VWAP pullback. Composite must be >= 90 or VETO
-    "VETO: Setup confidence below 90 — patience over activity".
-    Do not chase a news spike; wait for pullback. Opposing book walls veto.
+11. SETUP SCORE (Python, TA-weighted): 15m/1h/4h candles + volume + L2 walls
+    + 24h high/low + VWAP. Composite must be >= 75 or VETO
+    "VETO: Setup confidence below 75 — wait for a cleaner TA tape".
+    News is context. TA is the primary edge. Opposing book walls still veto.
 
 Verdicts:
 - CLEAR: trade may proceed at requested size
@@ -276,6 +276,8 @@ class RiskManagerAgent:
             last=last_px,
             news=news_snap,
             conviction=int(brief.conviction or 0),
+            high_24h=_px(ticker.get("high"), fund.get("high_24h")),
+            low_24h=_px(ticker.get("low"), fund.get("low_24h")),
         )
         if setup_reason:
             already = verdict == "VETO"
@@ -295,12 +297,20 @@ class RiskManagerAgent:
                 flush=True,
             )
         else:
-            print(
-                f"[SETUP] PASS  score={setup.get('score')}  "
-                f"mtf={setup.get('align')}  pullback={setup.get('pullback_ok')}  "
-                f"{tradable_symbol}",
-                flush=True,
-            )
+            if setup.get("measurable"):
+                print(
+                    f"[SETUP] PASS  score={setup.get('score')}  "
+                    f"mtf={setup.get('align')}  pullback={setup.get('pullback_ok')}  "
+                    f"{tradable_symbol}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[SETUP] SKIPPED  HTF unmeasured  "
+                    f"score={setup.get('score')}  {tradable_symbol}  "
+                    f"(75% rail waits for 1h/4h)",
+                    flush=True,
+                )
 
         chop = severe_tape_halt(ta_snap)
         if chop:

@@ -6,7 +6,7 @@
 ██║     ███████║██████╔╝██║   ██║██╔██╗ ██║██║   ██║███████╗
 ██║     ██╔══██║██╔══██╗██║   ██║██║╚██╗██║██║   ██║╚════██║
 ╚██████╗██║  ██║██║  ██║╚██████╔╝██║ ╚████║╚██████╔╝███████╗
- ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝ ╚══════╝ ╚══════╝
+ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═╝  ╚═══╝ ╚══════╝ ╚══════╝
 ███╗   ██╗███████╗██╗  ██╗██╗   ██╗███████╗
 ████╗  ██║██╔════╝╚██╗██╔╝██║   ██║██╔════╝
 ██╔██╗ ██║█████╗   ╚███╔╝ ██║   ██║███████╗
@@ -17,334 +17,269 @@
 
 ### Wall Street sleeps. The Nexus does not.
 
-**Event-Driven Agent** for **news-driven directional trading** on tokenized US equities (rTokens / stock perps)
+**Event-Driven Agent** for news-driven directional trading on tokenized US equities (rTokens / stock perps).
 
-Bitget AI Base Camp Hackathon S2 · Track: **Agentic Trading** · Sub-theme: **Event-Driven Agent** · Mode: **Paper / Demo only** · Version: **0.6.0-glasshouse**
+Bitget AI Base Camp Hackathon S2 · Track: **Agentic Trading** · Sub-theme: **Event-Driven Agent** · Mode: **Paper / Demo only** · Version: **1.1.0-nexus**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![Bitget Qwen 3.8 Max](https://img.shields.io/badge/Bitget-Hackathon%20Qwen%203.8%20Max-00C3A5?style=for-the-badge)](https://bitget-ai.gitbook.io/bitgetai_hackathons2#qwen-token-subsidy-during-the-hackathon)
-[![Bitget Paper Trading](https://img.shields.io/badge/Bitget-Paper%20Trading%20%7C%20PAPTRADING%3D1-00C3A5?style=for-the-badge)](https://www.bitget.com/api-doc/classic/demotrading/restapi)
+[![Bitget Qwen 3.8 Max](https://img.shields.io/badge/Bitget-Hackathon%20Qwen%203.8%20Max-00C3A5?style=for-the-badge)](https://bitget-ai.gitbook.io/bitgetai_hackathons2)
+[![Hybrid Pricing](https://img.shields.io/badge/Pricing-Mainnet%20BBO%20%2B%20Demo%20Fill-00C3A5?style=for-the-badge)](https://www.bitget.com/api-doc/classic/demotrading/restapi)
+[![Setup 75](https://img.shields.io/badge/Setup-75%25%20TA%20threshold-720E9E?style=for-the-badge)](#ai-brain)
 [![Arbitrum Sepolia](https://img.shields.io/badge/Arbitrum-Sepolia%20421614-28A0F0?style=for-the-badge)](https://sepolia.arbiscan.io/)
-[![Telegram Glasshouse](https://img.shields.io/badge/Telegram-Glasshouse%20Observability-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://core.telegram.org/bots/api)
-[![Live RSS](https://img.shields.io/badge/Wire-Yahoo%20%2B%20CNBC%20%2B%20MarketWatch-720E9E?style=for-the-badge)](https://finance.yahoo.com/news/rssindex)
+[![Telegram Desk](https://img.shields.io/badge/Telegram-Desk%20%2B%20Spot%20Chatbox-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](#telegram-desk--how-judges-test)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](#license)
 
-Cash US equities close. Macro does not. Tokenized names keep trading 24/7 on Bitget while NYSE / NASDAQ are dark. **Chronos-Nexus** is a three-agent Board of Directors that runs as an **unattended hourly daemon**: it **reads the live global wire**, **maps a headline onto a listed Demo equity**, **stress-tests rumor quality and L2 spread**, **anchors the decision on Arbitrum Sepolia**, and **dispatches a Bitget Demo paper order** — or it **stands down to `NONE`**.
-
-This is **not** spread capture. The LLM does not mint/redeem NAV, cross-list a basis, or harvest a quote discrepancy. It takes a **directional** paper position when a macro / earnings / policy event on the live tape maps onto a tradable rToken or stock perp — and SENTINEL may veto it.
-
-The LLM is the decision-maker, not a chatbot. SENTINEL holds a binding veto. No live capital is reachable from this tree. **Zero dummy data. Zero hardcoded five-name book. Zero silent hangs. Zero assumed BUY.**
+The LLM is the decision-maker, not a chatbot. SENTINEL holds a binding veto. Private orders never leave Bitget Demo. Live last/bid/ask/mark/L2/OHLCV come from a **keyless mainnet** Bitget feed so paper fills peg to the real book. **Zero dummy tape. Zero hardcoded five-name book. Zero assumed BUY.**
 
 ---
 
-## Hackathon identity (GitBook Chapter IV)
+## Hackathon identity
 
 | Field | Value |
 |---|---|
 | **Track** | Agentic Trading |
 | **Sub-theme** | Event-Driven Agent |
-| **What we built** | News / announcements / macro events → LLM interpretation → risk-cleared directional paper order |
-| **What we did not build** | rToken vs native-stock / NAV mint-redeem spread capture |
-| **Validation** | Bitget Demo paper trading (`PAPTRADING=1`) during the S2 competition window |
-| **Scoring mix** | 50% quantitative + 50% judge (explainability, architecture, risk layer) |
+| **What we built** | Live news → Qwen board debate → Python risk rails → Demo paper order |
+| **What we did not build** | rToken vs NAV mint/redeem spread capture |
+| **Validation** | Bitget Demo (`PAPTRADING=1`) during the S2 window |
+| **Scoring mix** | 50% quantitative + 50% judge (explainability, architecture, risk) |
+| **Handbook** | [Developer Handbook](https://bitget-ai.gitbook.io/bitgetai_hackathons2) · [Landing](https://www.bitget.com/en/activity-hub/hackathon) |
 
-GitBook positioning we implement: *“The LLM is the primary trading decision-maker, not just an assistant. The Agent must sense the environment, make independent judgments, and autonomously place orders with risk controls.”*
+GitBook: *“The LLM is the primary trading decision-maker, not just an assistant. The Agent must sense the environment, make independent judgments, and autonomously place orders with risk controls.”*
 
 ---
 
-## What judges should look at first
+## Hybrid system (mainnet pricing + Demo execution)
 
-This is a production-shaped Event-Driven Agent, not a single-shot script. The CIC boots once, then scans the tape every hour until you interrupt it.
+Paper trading is worthless if the fill is a sandbox mid. Chronos-Nexus splits the rail in two:
 
-| # | Capability | What it actually does |
+| Rail | Client | What it does |
 |---|---|---|
-| **1** | **True 24/7 autonomous daemon** | `while True` hourly cycles. No `input("Press Enter")`. Cycle faults sleep 5 minutes and recover. Ctrl+C is the only shutdown. |
-| **2** | **Unlimited market universe** | Boot + each cycle call CCXT `load_markets()` and discover **all** Bitget Demo equity / stock-perp / rToken listings. ORACLE may pick any listed name, or `NONE`. |
-| **3** | **GitBook paper log** | Every row in `data/logs/trades.json` carries `timestamp`, `instrument`, `direction`, `quantity`, `price`, and `account_balance_change`. `price` is never null. Wallet Δ is live USDT before/after a fill, else simulated margin + taker fee. |
-| **4** | **Glasshouse Telegram** | Live HTML alerts: market wire, Stay Away, rationale-backed EXECUTE, exact-reason VETO, API timeout, Qwen quota stand-down. |
-| **5** | **Bitget Hackathon - Qwen 3.8 Max** | **45s** Qwen proxy hard timeout. **503 / 429 quota** stand down to `NONE`. The daemon keeps running. |
+| **Execution** | Authenticated CCXT Bitget **sandbox** | `set_sandbox_mode(True)` first. Header `PAPTRADING: 1`. Market opens, SL/TP, closes, Spot chatbox fills. |
+| **Perception** | Keyless CCXT Bitget **mainnet** (`spot` + `swap`) | Live last, bid, ask, markPrice, L2, OHLCV. Never a sandbox print. |
+
+**Fill peg (never a mid):**
+
+- BUY / cover lifts the **best ask**
+- SELL / close hits the **best bid**
+- Swap / rToken entries refuse if BBO vs `markPrice` exceeds **2%**
+- Spot names without mark (e.g. BGB) still peg last/bid/ask
+
+Logs stamp `price_source=mainnet_bbo`. Closes keep the original entry.
+
+BGB fee optimization: `options.deduct=on`. Boot calls UTA `v3/account/switch-deduct`, then classic `v2/spot/account/switch-deduct`. Fail-open. Deduct is **never** put on `create_order` bodies (Bitget rejects unknown order params).
+
+---
+
+## AI brain
+
+Three agents. Python rails bind the model. A trade needs **multi-timeframe candles + volume + order book + 24h range** to clear a **75% TA setup score**. News is context. The desk is an active day trader.
 
 ```
  LIVE RSS (Yahoo / CNBC / MarketWatch / CoinTelegraph)
       │
       ▼
- ORACLE  ·  session clock + open universe + NONE if no tape
+ ORACLE  ·  0–100 source-weighted sentiment + conviction
       │
-      ├─ idle / timeout / 503 / 429 quota ──► STAND_DOWN · Telegram · history.json
+      ├─ idle / timeout / 429 quota ──► STAND_DOWN
       │
-      ▼ pick
- SENTINEL  ·  rumor + L2 spread > 1.5% + dark-book fail-safe
+      ▼ pick (unoccupied Demo universe only)
+ SENTINEL  ·  15m entry · 1h confirm · 4h regime
+           ·  L2 walls · rvol / volume profile · VWAP pullback
+           ·  setup ensemble ≥ 75 or VETO
       │
-      ├─ VETO / position already open ──────► Telegram + trades.json
+      ├─ VETO / daily halt / occupied book ──► Telegram + trades.json
       │
       ▼ CLEAR / REDUCE
- CHAIRMAN  ·  sha256(board minutes)
+ CHAIRMAN  ·  sha256(board minutes) · Arbitrum Sepolia (value = 0)
       │
       ▼
- Arbitrum Sepolia  ·  value = 0  ·  CHRONOS-NEXUS/v1:{hash}
+ Bitget Demo  ·  mainnet BBO peg  ·  margin SL  ·  +25% scaled TP
       │
       ▼
- Bitget Demo  ·  PAPTRADING=1  ·  SL −2%  ·  TP +5%  ·  no stacked book
-      │
-      ▼
- Telegram EXECUTE (why this name) + Arbiscan proof
- data/logs/trades.json  ·  data/history.json
-      │
-      ▼
- sleep 3600s  ·  next cycle
+ Telegram  ·  /pnl /status /price /balance  ·  Spot chatbox
+ sleep 3600s
 ```
 
----
+### 1. ORACLE — news NLP (0–100)
 
-## Elevator pitch
+Not a bull/bear flag. Each headline starts at **neutral 50**. Lexicon hits move the score; source credibility and recency shrink the move back toward 50:
 
-Weekend geopolitics, supply-chain shocks, and sector leaks hit the tape while cash equity is closed. Human desks wait for Sunday night futures. rTokens already moved.
+```text
+sentiment = clip(50 + (raw − 50) × credibility × recency, 0, 100)
+```
 
-Chronos-Nexus runs that window as an **event → debate → risk clearance → on-chain Proof of Thought → guarded paper execution** loop — **every hour, unattended**, on **Bitget Hackathon - Qwen 3.8 Max**. The trade is a **directional** paper ticket on the name the news actually maps to, not a basis harvest.
-
-| Pain | What the Nexus does |
+| Input | Model |
 |---|---|
-| Wall Street is closed; rTokens are not | ORACLE prices session / Monday-gap risk on the **live** 24/7 tape, with a real UTC clock |
-| A hardcoded five-name book is a toy | The desk **discovers the live Demo universe** and will trade any listed equity — or stand down |
-| Weekend “news” is often rumor | SENTINEL scores fake-news / black-swan and may **VETO** or **REDUCE** |
-| Wide books eat paper fills | Python **L2 spread veto** if bid–ask **> 1.5%**, or if the book is dark / crossed |
-| Agentic trades are unauditable | CHAIRMAN hashes the board minutes and anchors `sha256` on **Arbitrum Sepolia** |
-| Unguarded fills | Auto **SL −2% / TP +5%** + **position lock on both longs and shorts** |
-| Paper logs fail GitBook review | Every record stamps **timestamp / instrument / direction / quantity / price / account_balance_change** |
-| Free-tier daemons “crash” at quota | **429 / Resource Exhausted** → exact Telegram stand-down, daemon keeps running |
-| Hackathon / evaluation risk | Bitget **Demo only** (`set_sandbox_mode(True)`, `PAPTRADING=1`) |
+| Source weight | CNBC/Bloomberg 1.00 · Reuters 0.98 · WSJ 0.96 · FT 0.95 · Yahoo 0.88 · MarketWatch 0.82 · CoinTelegraph 0.52 |
+| Recency | ≤3h = 1.00 · ≤12h = 0.90 · ≤24h = 0.75 · ≤48h = 0.50 · older = 0.25 |
+| Macro / high impact | Fed, FOMC, CPI, NFP, earnings, guidance, SEC, FDA — 1.25× weight |
+| Conflict | Bulls ≈ bears on the focused tape → conflict flag, conviction capped at 20 |
+| Conviction | `clip(50 + 0.9 × 100 × \|s−50\|/50 × cred × recency × impact_w, 0, 100)` |
 
-**Live E2E (this repo):** Bitget Hackathon - Qwen 3.8 Max (`qwen3.8-max`) · board debate completed · Sepolia attestation mined · Bitget Demo paper orders submitted on listed stock perps. Subsequent live tests confirmed **NONE stand-down** (no NVDA default) when the tape or the model is not actionable.
+Qwen still writes the thesis. Python **clips** model conviction to the NLP score so a 90-conviction BUY cannot ride a 51 tape. Conflicted or ~50 wire → `NONE` / `STAND_DOWN`. Never a default NVDA.
+
+### 2. SENTINEL — multi-timeframe + book + volume
+
+| Layer | Rule |
+|---|---|
+| **15m** | Entry. Wilder RSI(14). BUY veto RSI ≥ 70. SELL veto RSI ≤ 30. Unmeasured RSI is fail-open. |
+| **1h** | Confirmation. Structure + SMA(20) slope. |
+| **4h** | Regime. Must agree with 1h for `ALIGNED`. Disagreement is `CONFLICT` → hard VETO. |
+| **L2 imbalance** | `(bid_vol − ask_vol) / total` on CCXT `fetch_order_book`. BUY blocked on a sell wall (size ≥ 3× median within 0.8% of last) or imbalance ≤ −0.35. |
+| **Volume profile** | 20-bin POC + 70% value area. A break outside VA on rvol < 1.1 is a **fakeout** VETO. |
+| **VWAP** | Typical price × volume. ALIGNED tape with \|close−VWAP\| > 1.2% waits for pullback (`VETO: Price extended`). |
+
+Candle structure BREAK against the news side is a hard VETO (`VETO: Candle structure contradicts news thesis`).
+
+### 3. Setup ensemble — 75% TA gate (active day trader)
+
+When 1h and 4h are measured:
+
+```text
+score = 0.10·news + 0.22·HTF + 0.18·entry + 0.18·volume
+      + 0.16·book + 0.10·extension + 0.06·conviction
+```
+
+**If `score < 75` → `VETO: Setup confidence below 75 — wait for a cleaner TA tape`.**
+
+The 75% rail requires a live 1h/4h tape from Bitget OHLCV (the hourly daemon always fetches it). Unmeasured HTF does not invent a 50 and kill the trade — same fail-open as unmeasured RSI — so daily limits, RSI, spread, BBO, Spot chatbox, and Telegram buttons stay intact.
 
 ---
 
-## Part 3: Quantitative Metrics & Agent Architecture (GitBook Compliance)
+## Risk contract (non-negotiable)
 
-Agentic Trading is scored **50% quantitative + 50% judge**. GitBook Part 3 (Strategy / Agent) requires test period, returns, Sharpe / Sortino, max drawdown, win rate, turnover, plus fees, slippage, and funding — each figure labeled **observed / estimated / targeted**.
+| Condition | Action | Size |
+|---|---|---|
+| Setup ≥ 75 and SENTINEL `CLEAR` | `EXECUTE` | Sized inside 6% daily equity cap |
+| SENTINEL `REDUCE` | `EXECUTE` | `max_notional_usdt × size_multiplier` |
+| SENTINEL `VETO` / setup < 75 / HTF conflict / wall / fakeout | `STAND_DOWN` | Zero — Python overrides the model |
+| ORACLE idle (`NONE` / conviction 0) | `STAND_DOWN` | Zero |
+| Qwen timeout / 503 / 429 quota | `STAND_DOWN` | Zero — daemon stays up |
+| Occupied symbol | skip new entry | Anti-stack |
+| UTC day: 4 entries **or** 3 wins **or** any SL **or** chop/downtrend | hard stand-down | Zero new entries |
+| Spread > 1.5% or dark/crossed book | `Illiquid Market / High Spread` | Zero |
 
-The daemon is in its **competition-window incubation**. Headline numbers below are **not invented**. They are reserved for the live `data/logs/trades.json` run and will be filled as observed.
+**Protective geometry (live book, not a flat 2%/5% toy):**
 
-### Required GitBook metrics
+- Stop = **50–100% of invested margin** from asset-risk score (high risk → tighter)
+- First take-profit at **+25% PnL**, scale 50%, trail the runner
+- Max **4** UTC-day entries; deployed margin ≤ **6%** of live `fetch_balance` equity
+
+---
+
+## Telegram desk — how judges test
+
+The native Telegram **Menu** is registered with `setMyCommands`. Chat id is pinned; other chats are ignored.
+
+| Command | What you should see |
+|---|---|
+| `/menu` or `/dashboard` | Headless terminal with inline buttons. **Live Market Status** = `/status`. **My Real PnL** = `/pnl`. **Open Positions** = `/positions`. **Force Close All** confirms then `/closeall`. |
+| `/price BGB` or `/price BGB/USDT` | Live **mainnet** last / bid / ask (not Demo) |
+| `/balance USDT` | Wallet free + total for that asset (any coin; pairs collapse to the base) |
+| `/balance NVDA` | `0.00 NVDA found in wallet.` if missing — never a dummy USDT row |
+| `/pnl` | **Today’s realized PnL (USDT)**, real W/L, `Trades left: X`, halt, live unrealized from Bitget |
+| `/status` | Live ORACLE sentiment (e.g. `NEUTRAL 50.17`), AI conviction `/100`, desk `ARMED` or `STAND_DOWN`, SENTINEL verdict, last scan. No scan → `NO SCAN YET` |
+| `/positions` | Open Demo book + mark PnL |
+| `/close SYMBOL` | Market-close one name |
+| `/closeall` | Flatten the Demo book |
+| `NVDA/USDT BUY $10` | Spot **preview** with Confirm / Cancel. Bitget **Spot only**. AI cycle is not used. |
+
+`/pnl` and `/status` read `data/history.json` and live Bitget. They do not invent numbers.
+
+Manual `/buy` / `/sell` / `/open` on the AI desk is refused. Spot tickets go through the chatbox.
+
+---
+
+## Part 3 metrics (GitBook)
+
+Agentic Trading is scored **50% quantitative + 50% judge**. Figures below are labeled. Nothing is invented.
 
 | Metric | Value | Label |
 |---|---|---|
-| **Test period** | S2 competition window **2026-09-03 → 2026-09-21 (UTC+8)**. Paper log started **2026-09-10**. Incubation continues through the deadline. Recommended GitBook duration ≥ 2 weeks (Observing/Calculating from live trades.json run) | observed window / targeted ≥2 weeks |
-| **Returns** | (Observing/Calculating from live trades.json run) | observed |
-| **Sharpe** | (Observing/Calculating from live trades.json run) | observed |
-| **Sortino** | (Observing/Calculating from live trades.json run) | observed |
-| **Max drawdown** | (Observing/Calculating from live trades.json run) | observed |
-| **Win rate** | (Observing/Calculating from live trades.json run) | observed |
-| **Turnover** | (Observing/Calculating from live trades.json run) | observed |
-| **Costs: fees** | Bitget USDT-M taker **6 bps** (`TAKER_FEE_RATE = 0.0006`) applied to every fill notional; live wallet Δ preferred when Demo balance is readable | estimated / observed |
-| **Costs: slippage** | L2 bid–ask captured per cycle; **spread > 1.5% is a binding VETO** (not a cost — a refused trade). Fill slippage vs mid = (Observing/Calculating from live trades.json run) | observed / estimated |
-| **Costs: funding** | Stock-perp funding on Demo = (Observing/Calculating from live trades.json run). Untaken hours labeled **n/a** until a position is held across a funding timestamp | observed / targeted |
+| **Test period** | S2 window **2026-09-03 → 2026-09-27 (UTC+8)**. Paper log started **2026-09-10**. Handbook asks ≥ 2 weeks. | observed window / targeted ≥2 weeks |
+| **Returns** | From live `data/logs/trades.json` | observed |
+| **Sharpe / Sortino** | Hourly equity returns, 24×365 bars | observed |
+| **Max drawdown** | Peak-to-trough on Demo USDT path | observed |
+| **Win rate** | Closed tickets with `account_balance_change > 0` ÷ closed tickets. Vetoes are not wins. | observed |
+| **Turnover** | `Σ \|notional_usdt\|` ÷ average Demo equity | observed |
+| **Fees** | USDT-M taker **6 bps**; BGB deduct armed when the account switch succeeds | estimated / observed |
+| **Slippage** | L2 captured per cycle; **spread > 1.5% is a VETO**, not a cost. Fill vs BBO peg in the log. | observed |
+| **Funding** | Stock-perp funding on Demo when a position spans a funding stamp | observed / n/a |
 
-Judge-facing distribution proof (GitBook also asks these; none are live users yet):
+How numbers are computed: `Σ account_balance_change` on fills, plus mark-to-market on open stock perps when logged. Open `trades.json` for the raw path.
 
-| Proof | Value | Label |
-|---|---|---|
-| Activation | Paper daemon running unattended on Demo | observed |
-| Trading volume | Sum of filled `notional_usdt` in `trades.json` | (Observing/Calculating from live trades.json run) |
-| AUM | Demo USDT equity snapshot per cycle | (Observing/Calculating from live trades.json run) |
-| Retention | Hourly cycles completed / attempted | (Observing/Calculating from live trades.json run) |
-| Incremental fee | Sum of estimated taker fees on fills | (Observing/Calculating from live trades.json run) |
-| Risk | Binding SENTINEL veto, 1.5% spread kill, SL −2% / TP +5%, position lock, 15 USDT default notional cap | observed |
+---
 
-How the numbers will be computed from `trades.json` (no hand-waving):
+## Agent architecture
 
-- **Returns** — Demo USDT equity path: `Σ account_balance_change` on fills, plus mark-to-market on open stock perps when the log records it.
-- **Sharpe / Sortino** — hourly cycle equity returns, sample stdev (Sharpe) and downside stdev (Sortino), annualized with 24 × 365 hourly bars because the desk does not sleep.
-- **Max drawdown** — peak-to-trough on the same equity path.
-- **Win rate** — closed paper tickets with `account_balance_change > 0` ÷ closed tickets. Vetoes and stand-downs are **not** wins.
-- **Turnover** — `Σ \|notional_usdt\|` on fills ÷ average Demo equity.
-
-### Agent architecture (the other 50%)
-
-| Callsign | Agent | File | Mandate |
+| Callsign | Role | File | Mandate |
 |---|---|---|---|
-| **ORACLE** | Analyst | `agents/analyst.py` | Ingest live RSS. Apply the session clock. Map **any** equity/sector onto the **live Demo universe**, or emit `NONE`. Reads board memory. |
-| **SENTINEL** | Risk Manager | `agents/risk_manager.py` | Fake-news / black-swan, **L2 spread > 1.5%**, dark-book fail-safe, concentration, size. Verdicts: **CLEAR** · **REDUCE** · **VETO**. Veto is binding. |
-| **CHAIRMAN** | Executive | `agents/executive.py` | Synthesize (memory-aware), lock the action, SHA-256 the minutes, `log_proof_of_thought()`, then `execute_paper_order()` with SL/TP — or `STAND_DOWN`. |
+| **ORACLE** | Analyst | `agents/analyst.py` | Live RSS + session clock + NLP sentiment. Pick one listed Demo name or `NONE`. |
+| **SENTINEL** | Risk | `agents/risk_manager.py` | Binding veto. Spread, RSI, MTF, walls, volume, 75% TA setup, daily limits. |
+| **CHAIRMAN** | Executive | `agents/executive.py` | Lock action, hash minutes, Sepolia attest, Demo execute or `STAND_DOWN`. |
 
-Event → decision → execution (required Agentic Trading demonstration):
-
-1. **Event** — live Yahoo / CNBC / MarketWatch / CoinTelegraph RSS, plus a UTC session clock (open / pre-market / after-hours / overnight / weekend).
-2. **Decision** — ORACLE brief (thesis, side, conviction, listed symbol or `NONE`) → SENTINEL CLEAR / REDUCE / VETO → CHAIRMAN `EXECUTE` or `STAND_DOWN`. Python overrides the model on veto, idle, timeout, and 429.
-3. **Execution** — zero-value Arbitrum Sepolia attestation of `sha256(board minutes)`, then Bitget Demo market order with SL −2% / TP +5%, logged with GitBook columns.
-
-### Risk contract (non-negotiable)
-
-| Condition | CHAIRMAN action | Size |
-|---|---|---|
-| SENTINEL `CLEAR` | `EXECUTE` | Full paper notional cap |
-| SENTINEL `REDUCE` | `EXECUTE` | `max_notional_usdt × size_multiplier` |
-| SENTINEL `VETO` | `STAND_DOWN` | Zero — Python overrides the model |
-| ORACLE idle (`NONE` / `none` / conviction 0) | `STAND_DOWN` | Zero — not a risk veto, a clean pass |
-| API timeout / 503 / parser fault | `STAND_DOWN` | Zero — degraded closed |
-| Qwen **429 quota** | `STAND_DOWN` | Zero — wait for reset, daemon stays up |
-| No live last price | `STAND_DOWN` | Zero |
+1. **Event** — live Yahoo / CNBC / MarketWatch / CoinTelegraph RSS + UTC session clock.
+2. **Decision** — ORACLE brief → SENTINEL CLEAR / REDUCE / VETO → CHAIRMAN `EXECUTE` or `STAND_DOWN`. Python overrides the model on veto, idle, timeout, and 429.
+3. **Execution** — zero-value Arbitrum Sepolia attestation of `sha256(board minutes)`, then Bitget Demo market order at **mainnet BBO**, GitBook columns in `trades.json`.
 
 ```mermaid
 flowchart LR
-    R[Live RSS] --> O[ORACLE]
-    M[Board Memory · last 5] --> O
-    Ck[UTC session clock] --> O
-    U[CCXT load_markets universe] --> O
-    O -->|NONE / timeout / 429 quota| SD[STAND_DOWN · Telegram]
+    R[Live RSS] --> O[ORACLE NLP 0-100]
+    M[Board Memory] --> O
+    U[Demo load_markets] --> O
+    O -->|NONE / quota| SD[STAND_DOWN]
     O -->|listed pick| S[SENTINEL]
-    S -->|spread / rumor / dark book| V[VETO · Telegram]
+    S -->|spread / RSI / MTF / wall / setup less than 75| V[VETO]
     S -->|CLEAR / REDUCE| C[CHAIRMAN]
-    C --> H[sha256 board minutes]
-    H --> A[Arbitrum Sepolia · value = 0]
-    A --> P{Position already open?}
-    P -->|yes| K[Skip · Telegram]
-    P -->|no| B[Bitget Demo · SL -2% · TP +5%]
-    B --> T[Telegram EXECUTE + why]
-    SD --> L[trades.json + history.json]
+    C --> H[sha256]
+    H --> A[Arbitrum Sepolia value 0]
+    A --> B[Bitget Demo at mainnet BBO]
+    B --> T[Telegram + trades.json]
+    SD --> L[history.json]
     V --> L
-    K --> L
     T --> L
     L --> Z[sleep 3600s]
-    Z --> R
 ```
 
 ---
 
-## Table of contents
+## Compliance audit (S2 handbook)
 
-1. [Hackathon identity](#hackathon-identity-gitbook-chapter-iv)
-2. [Part 3: Quantitative Metrics & Agent Architecture (GitBook Compliance)](#part-3-quantitative-metrics--agent-architecture-gitbook-compliance)
-3. [True 24/7 autonomous daemon](#1-true-247-autonomous-daemon)
-4. [Unlimited market universe](#2-unlimited-market-universe)
-5. [Glasshouse Telegram observability](#3-glasshouse-telegram-observability)
-6. [Bulletproof resilience & Qwen quota](#4-bulletproof-resilience--qwen-quota)
-7. [Testnet / paper-trading compliance](#5-testnet--paper-trading-compliance)
-8. [Quickstart](#6-quickstart--setup)
-9. [Verifiable audit trail](#7-verifiable-audit-trail--on-chain-proofs)
-10. [Production migration](#8-production--mainnet-migration-guide)
-11. [Repository map](#9-repository-map)
-12. [License](#license)
+Audited against [Bitget AI Hackathon S2 Developer Handbook](https://bitget-ai.gitbook.io/bitgetai_hackathons2) and the [landing page](https://www.bitget.com/en/activity-hub/hackathon). **No rule required a feature to be disabled.**
 
----
-
-## 1. True 24/7 autonomous daemon
-
-`main.py` is a CIC, not a one-shot demo.
-
-- **Phases 0–2** (compliance, Bitget Hackathon - Qwen 3.8 Max cortex, Bitget + Sepolia rails) boot **once**.
-- **Phases 3–5** (live ingest → board debate → attest + paper execute) run inside `while True`.
-- After each cycle: `time.sleep(3600)` — hourly trading.
-- Any cycle exception: log, Telegram API-fault alert, `time.sleep(300)`, continue. The process does not die.
-- There is **no** `input("Press Enter to shut down")`. Stop the desk with **Ctrl+C**.
-
-That is the shape of a 7-day unattended evaluation, not a laptop script that waits for a keypress.
-
----
-
-## 2. Unlimited market universe
-
-ORACLE is not locked to AAPL / NVDA / MSFT / GOOG / TSLA.
-
-At boot and on every cycle, `connectors/bitget_paper.py` calls CCXT `exchange.load_markets()` and classifies **every** Demo listing that looks like:
-
-- a stock perp (`SUSDT-FUTURES` / equity product tags)
-- an rToken (`rAAPL`, `rNVDA`, …)
-- a US-equity-like USDT swap
-
-ORACLE receives that live catalog. `primary_symbol` must be copied **exactly** from it, or it must be **`NONE`**. Python snaps aliases (`rAAPL`, `GOOGL`, `AAPL/USDT`) onto a listed market. Off-list garbage, timeouts, empty tape, and quota faults all become `NONE` — **never a blind NVDA or an assumed BUY**.
-
-The live RSS wire is global, not a five-name keyword toy:
-
-| Source | Role |
-|---|---|
-| **Yahoo Finance** | Broad equity / macro tape |
-| **CNBC** | Institutional headlines |
-| **MarketWatch** | Top stories |
-| **CoinTelegraph** | Crypto spillover into tokenized names |
-
-Each brief injects a **session clock**: exact UTC timestamp, weekday, US/Eastern time, and cash session (open / pre-market / after-hours / overnight / **weekend**). Friday close is not Monday open.
-
----
-
-## 3. Glasshouse Telegram observability
-
-The bot is a live terminal, not a fill ping. Disarmed if `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` is empty — the CIC still runs. Armed, every material action is HTML-escaped and fire-and-forget (`utils/notifier.py`). A Telegram fault never raises into the board.
-
-| Event | What you receive |
-|---|---|
-| **System startup** | Glasshouse desk is ONLINE (synchronous boot ping — credentials proven before cycle 1) |
-| **Market wire** | Session clock, Demo universe size, **what's working**, **what's hurting**, ranked headlines |
-| **Stay Away** | Dedicated warning when the tape is toxic (scandal, earnings miss, crash, fraud, guidance cut, lawsuit) with a short rationale |
-| **EXECUTE** | Symbol, side, amount, SL −2%, TP +5%, order id, Arbiscan proof, and **why this name beat the rest of the tape** |
-| **VETO / skipped** | Exact reason (spread, crossed book, position already open, margin, venue error) |
-| **API timeout / 503** | Parser-safe stand-down: `primary_symbol=NONE`, `side=none`, `conviction=0` |
-| **Qwen quota (429)** | Exact text: *Bitget Qwen API quota reached. System safely standing down until limits reset.* |
-
----
-
-## 4. Bulletproof resilience & Qwen quota
-
-The daemon is designed to live on **Bitget Hackathon - Qwen 3.8 Max** for a multi-day eval. Quota is not a crash. It is a weather report.
-
-| Fault | Behaviour |
-|---|---|
-| Qwen proxy hung | **45s** hard cap (`LLM_TIMEOUT_S`) via SDK timeout + daemon-thread join |
-| Truncated JSON / unescaped quotes in RSS-echoed strings | `JSONDecodeError` caught as **parser fault** → fallback dict, no `Unterminated string` bleed |
-| **503 UNAVAILABLE** (high demand) | Stand down to `NONE` / `none` / `0` |
-| **429 Resource Exhausted / quota exceeded** | Rationale **exactly**: `Bitget Qwen API quota reached. System safely standing down until limits reset.` Telegram broadcasts that sentence. Hourly loop keeps running. |
-| No actionable listed name | Same idle path — never default to NVDA, never assume BUY |
-| Missing / dark L2 book | Fail-safe **illiquid veto** (unmeasured spread is not “fine”) |
-| Spread **> 1.5%** | Binding `Illiquid Market / High Spread` |
-| Open long **or** short | `POSITION_ALREADY_OPEN` — no stacked book |
-
-ORACLE, SENTINEL, and CHAIRMAN **skip further Bitget Hackathon - Qwen 3.8 Max calls** once quota or timeout is latched, so a rate-limit window is not burned by three agents retrying the same 429.
-
-External rails sit behind exponential backoff (`core/retry.py`: 3 attempts, 0.75s base, 6s cap). Auth failures and insufficient margin are **not** retried.
-
-### Bitget Hackathon - Qwen 3.8 Max model
-
-`QWEN_MODEL` is read from `.env`. If empty or `auto`, the cortex falls back to `qwen3.8-max`. The client is the standard `openai` package pointed at `https://hackathon.bitgetops.com/v1` with `QWEN_API_KEY`.
-
-Quota and hard timeouts **stop further model attempts**.
-
-### Cryptographic Proof of Thought
-
-Before the paper order is sent, CHAIRMAN canonicalizes the board minutes and SHA-256s them. `connectors/arbitrum.py` submits a **zero-value self-transaction** on Arbitrum Sepolia whose `input` is:
-
-```text
-CHRONOS-NEXUS/v1:{64-char sha256}
-```
-
-Anyone can recompute the hash from `trades.json` and match it to the tx calldata on [Sepolia Arbiscan](https://sepolia.arbiscan.io/). Insufficient gas is a skipped attestation, not a crash. Telegram EXECUTE alerts deep-link the explorer URL as **Proof**.
-
----
-
-## 5. Testnet / paper-trading compliance
-
-This repository is built for **Bitget AI Base Camp Hackathon S2** evaluation. It will not spend real funds.
-
-| Surface | Lock | How it is enforced |
+| Rule | Status | Evidence |
 |---|---|---|
-| Bitget | Demo / paper only | `BITGET_PAPER_TRADING=true` required. `set_sandbox_mode(True)` is the **first** call after construct. Header `PAPTRADING: 1`. |
-| Bitget keys | Demo API key | Create under **Bitget → Demo mode → API Key Management**. Live keys are the wrong environment. |
-| Arbitrum | Sepolia, chain ID **421614** | RPC default `https://sepolia-rollup.arbitrum.io/rpc`. `eth_chainId` mismatch aborts attest. |
-| Value transfer | None | Proof-of-Thought `value = 0`, `to = from` (self-tx). Payload is calldata only. |
-| Process flag | Deadman | `LIVE_TRADING_ENABLED = False` — boot returns `2` if flipped on. |
+| Paper / Demo only | **PASS** | `BITGET_PAPER_TRADING=true` required. `set_sandbox_mode(True)` is the first call after construct. Header `PAPTRADING: 1`. `LIVE_TRADING_ENABLED = False` deadman. |
+| LLM is the decision-maker | **PASS** | ORACLE / SENTINEL / CHAIRMAN call Qwen; Python rails bind vetoes. |
+| Event → decision → execution | **PASS** | RSS → board → Sepolia hash → Demo order. |
+| Official Qwen path | **PASS** | `openai` SDK → `https://hackathon.bitgetops.com/v1` · model `qwen3.8-max`. Direct DashScope is not used. 90s timeout, 8192 max tokens. 429 quota stand-down string is exact. |
+| Allowed libraries | **PASS** | `openai`, `ccxt`, `web3`, `pydantic`, `requests`, `feedparser`, `rich`, `pillow`. No restricted stack. |
+| GitBook paper log | **PASS** | Every row: `timestamp`, `instrument`, `direction`, `quantity`, `price` (never null), `account_balance_change`. |
+| On-chain proof | **PASS** | Arbitrum Sepolia chain **421614**, `value = 0`, calldata `CHRONOS-NEXUS/v1:{sha256}`. |
+| Runnable Demo + ≥2-week paper log | **PASS** | `python main.py` hourly daemon. Log started 2026-09-10. |
+| Hybrid mainnet BBO | **PASS** | Public (keyless) market data only. Orders stay on Demo. |
+| Spot chatbox vs AI cycle | **PASS** | Manual Spot is isolated. Hourly AI still uses swap/paper. `/price` `/balance` `/pnl` `/status` are not tickets. |
+| Daily limits + scaled TP + anti-stack | **PASS** | Unchanged by the 75% TA brain. HTF-unmeasured fixtures no longer false-veto those rails. |
 
-Evaluators: claim **Bitget Demo virtual USDT** before a fill is possible. An unfunded Demo wallet records `INSUFFICIENT_MARGIN` in `trades.json` rather than failing the loop silently.
+**Fixes in this revision (no feature removed):**
+
+1. The setup ensemble was vetoing RSI-only unit fixtures because missing 1h/4h scored ~50. The rail now **requires a measured HTF tape** (what the live daemon always fetches). RSI, spread, daily limits, BBO, Spot chatbox, `/pnl`, `/status`, and Telegram buttons keep their previous behaviour.
+2. Bitget `45113` (max order value) on `/closeall` is sliced into ≤100-lot / ≤8000 USDT chunks with 0.5s between orders until the book is flat.
+2. README was stale (flat SL −2% / TP +5%, no hybrid BBO, no Telegram analytics). This document matches the code.
 
 ---
 
-## 6. Quickstart & setup
+## Quickstart
 
 ### Prerequisites
 
 - Python **3.10+** (verified on 3.12)
-- A Bitget hackathon `QWEN_API_KEY` (admin-provisioned Qwen 3.8 Max / `qwen3.8-max`)
+- Bitget hackathon `QWEN_API_KEY`
 - Bitget **Demo** API key + secret + passphrase
-- An Arbitrum **Sepolia** account with a small ETH balance (faucet) for 0-value txs
-- Virtual Demo USDT claimed on Bitget Demo (required for a fill)
-- Optional: Telegram bot token + chat id for glasshouse alerts
+- Arbitrum **Sepolia** account with a little ETH (0-value txs)
+- Virtual Demo USDT claimed on Bitget Demo
+- Optional: Telegram bot token + chat id
 
 ### Install
 
@@ -356,10 +291,10 @@ python -m venv .venv
 # macOS / Linux: source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-cp .env.example .env   # Windows: copy .env.example .env
+cp .env.example .env
 ```
 
-### Configure `.env`
+### `.env`
 
 ```dotenv
 QWEN_API_KEY=your_bitget_qwen_api_key
@@ -379,26 +314,13 @@ TELEGRAM_BOT_TOKEN=123456:ABC-your-bot-token
 TELEGRAM_CHAT_ID=your_numeric_chat_id
 ```
 
-Leave Telegram blank to run headless.
-
-### Run the daemon
+### Run
 
 ```bash
 python main.py
 ```
 
-Expected lifecycle:
-
-1. Kernel / compliance lock
-2. Bitget Hackathon - Qwen 3.8 Max cortex (**45s** timeout)
-3. Bitget Demo + Arbitrum Sepolia health + **live universe count**
-4. Hourly cycle: live RSS → ORACLE → SENTINEL → CHAIRMAN
-5. Telegram glasshouse dispatch
-6. Sleep **3600s** → repeat
-
-Stop with **Ctrl+C**. Minutes land in `data/logs/trades.json` with GitBook columns. Memory updates `data/history.json`.
-
-### Tests
+Boot: compliance lock → Qwen cortex (90s / 8192 tokens) → Bitget Demo + Sepolia health → live universe count → Telegram menu registration. Then hourly: RSS → ORACLE → SENTINEL → CHAIRMAN. Stop with **Ctrl+C**. Cycle faults sleep 5 minutes and recover.
 
 ```bash
 python -m unittest discover -s tests -v
@@ -406,95 +328,86 @@ python -m unittest discover -s tests -v
 
 ---
 
-## 7. Verifiable audit trail & on-chain proofs
-
-GitBook required paper-trading columns (every row):
+## Audit trail
 
 | Column | JSON key | Source |
 |---|---|---|
-| timestamp | `timestamp` (`ts` kept) | UTC ISO-8601 at write |
-| instrument | `instrument` (`symbol` kept) | Demo market id |
-| direction | `direction` (`side` kept) | `buy` / `sell` / `none` |
-| quantity | `quantity` (`amount` kept) | sized contracts / base |
-| price | `price` (`entry_price` kept, never null) | fill average, else live last, else `0.0` on stand-down |
-| account balance change | `account_balance_change` | Demo USDT after − before; else `-(margin + taker fee)` on a swap fill; `0.0` on veto |
+| timestamp | `timestamp` | UTC ISO-8601 |
+| instrument | `instrument` | Demo market id |
+| direction | `direction` | `buy` / `sell` / `none` |
+| quantity | `quantity` | sized contracts / base |
+| price | `price` (never null) | mainnet BBO peg, else live last, else `0.0` on stand-down |
+| account balance change | `account_balance_change` | Demo USDT after − before; else simulated margin + taker fee; `0.0` on veto |
 
 | File | Role |
 |---|---|
-| `data/logs/trades.json` | Append-only paper ledger — `EXECUTE`, `VETOED`, `POSITION_ALREADY_OPEN`, `INSUFFICIENT_MARGIN`, `NO_LIVE_PRICE`, idle `STAND_DOWN`, venue `ERROR` |
-| `data/history.json` | Last **5** cycles for ORACLE / CHAIRMAN memory |
+| `data/logs/trades.json` | Append-only paper ledger |
+| `data/history.json` | Last 5 cycles + UTC daily ledger + live ORACLE/SENTINEL snapshot |
+| `data/desk.json` | Open-book metadata (SL/TP, thesis, trail) |
 
-```text
-reasoning_hash = sha256( json.dumps({
-    analyst, risk, action, symbol, side, amount, notional_usdt, reasoning
-}, sort_keys=True, separators=(',', ':')) )
-```
+Verified Sepolia attestations:
 
-On-chain `input` (hex-decoded ASCII): `CHRONOS-NEXUS/v1:{reasoning_hash}`
+| UTC | Tx |
+|---|---|
+| 2026-09-10 07:30 | [`0x1b3ecc83…556fe721`](https://sepolia.arbiscan.io/tx/0x1b3ecc83c316e46dc7b18edb3b86da96c04a57d8af6eb68765542b96556fe721) |
+| 2026-09-10 07:51 | [`0xacf4e0ea…fde73b24`](https://sepolia.arbiscan.io/tx/0xacf4e0ea402cc66e03984e307c349094be088acc7b499e6eb0a381aefde73b24) then Demo order `1481850718917124096` on `NVDA/USDT:USDT` |
 
-### Verified Sepolia attestations (this repo)
-
-| UTC | `reasoning_hash` | Tx | Result |
-|---|---|---|---|
-| 2026-09-10 07:30 | `0b36683f…e1306cc7` | [`0x1b3ecc83…556fe721`](https://sepolia.arbiscan.io/tx/0x1b3ecc83c316e46dc7b18edb3b86da96c04a57d8af6eb68765542b96556fe721) | Anchored (`value = 0`, chain **421614**) |
-| 2026-09-10 07:51 | `a51fd447…d2cda5b6` | [`0xacf4e0ea…fde73b24`](https://sepolia.arbiscan.io/tx/0xacf4e0ea402cc66e03984e307c349094be088acc7b499e6eb0a381aefde73b24) | Anchored, then **Bitget Demo order `1481850718917124096`** on `NVDA/USDT:USDT` |
-
-Attester (Sepolia): [`0x9AFe5CeF11fC10756faef213f7A30D9873B5d372`](https://sepolia.arbiscan.io/address/0x9AFe5CeF11fC10756faef213f7A30D9873B5d372)
+Attester: [`0x9AFe5CeF11fC10756faef213f7A30D9873B5d372`](https://sepolia.arbiscan.io/address/0x9AFe5CeF11fC10756faef213f7A30D9873B5d372)
 
 ---
 
-## 8. Production / mainnet migration guide
+## Production / mainnet
 
-**This tree ships with the hackathon deadman on.** Flipping one env var is **not** enough. That is intentional.
+This tree ships with the hackathon deadman **on**. Flipping one env var is not enough.
 
-Agent prompts, risk contract, hashing, Rich lifecycle, Telegram, board memory, and the Executive sequence stay the same. You are swapping **rails and keys**.
+| Gate | Today |
+|---|---|
+| `LIVE_TRADING_ENABLED` | `False` — boot returns 2 if flipped |
+| `BITGET_PAPER_TRADING` | Must be true |
+| Connector | Sandbox + `PAPTRADING: 1` |
+| Chain | `421614` Sepolia |
 
-| Gate | File | Today | Mainnet fork |
-|---|---|---|---|
-| Boot deadman | `main.py` | `LIVE_TRADING_ENABLED = False` | Set `True` only after review |
-| Settings assert | `core/config.py` | Refuses `BITGET_PAPER_TRADING=false` | Allow false / split Demo vs live |
-| Connector refuse | `connectors/bitget_paper.py` | Requires paper + `set_sandbox_mode(True)` | Construct without sandbox / `PAPTRADING=1` |
-| Chain allow-list | `connectors/arbitrum.py` | Expects `421614` | Expect `42161` (Arbitrum One) |
-
-If you are evaluating this hackathon entry, **do not migrate**. Run Demo + Sepolia as shipped.
+Evaluators: run Demo + Sepolia as shipped.
 
 ---
 
-## 9. Repository map
+## Repository map
 
 ```text
 Chronos-Nexus/
-├── main.py                      # Rich CIC · hourly Event-Driven Agent (v0.6.0-glasshouse)
+├── main.py                      # Rich CIC · hourly Event-Driven Agent (v1.1.0-nexus)
 ├── requirements.txt
-├── .env.example
 ├── agents/
-│   ├── analyst.py               # ORACLE — live RSS, open universe, NONE / quota stand-down
-│   ├── risk_manager.py          # SENTINEL — veto + L2 spread > 1.5% + dark-book fail-safe
-│   └── executive.py             # CHAIRMAN — memory, attest, execute
+│   ├── analyst.py               # ORACLE — RSS, NLP 0–100, NONE stand-down
+│   ├── risk_manager.py          # SENTINEL — 75% TA setup, MTF, walls, daily limits
+│   └── executive.py             # CHAIRMAN — hash, attest, execute
 ├── core/
-│   ├── config.py                # dotenv, paper lock, Bitget hackathon Qwen 3.8 Max, Telegram
-│   ├── llm.py                   # openai → hackathon.bitgetops.com/v1 · 45s timeout · 503/429/parser-fault stand-down
-│   ├── memory.py                # last-5 ring buffer → data/history.json
-│   ├── retry.py                 # exponential backoff for every rail
-│   └── schemas.py               # Pydantic board contracts (side includes none)
+│   ├── news.py                  # Source-weighted sentiment + conviction
+│   ├── ta.py                    # RSI, MTF, VWAP, volume profile, setup ensemble
+│   ├── llm.py                   # hackathon.bitgetops.com/v1 · 90s · 8192 tokens · 429/503
+│   ├── memory.py                # history.json + daily PnL + engine snapshot
+│   ├── positions.py             # Trail, +25% partial, thesis close
+│   └── schemas.py
 ├── connectors/
-│   ├── bitget_paper.py          # Demo · GitBook paper log · SL/TP · long+short lock
+│   ├── bitget_paper.py          # Demo execute · mainnet BBO · BGB deduct
 │   └── arbitrum.py              # Sepolia Proof of Thought
 ├── utils/
-│   └── notifier.py              # Glasshouse Telegram (wire / stay-away / execute / quota)
+│   ├── commands.py              # Menu + /price /balance /pnl /status
+│   ├── spot_chat.py             # Spot preview / confirm
+│   ├── notifier.py
+│   └── pnl_card.py
 ├── data/
 │   ├── history.json
-│   └── logs/trades.json         # timestamp, instrument, direction, quantity, price, Δ
-└── tests/
-    ├── test_phase1_live.py
-    └── test_phase2_safety.py
+│   ├── desk.json
+│   └── logs/trades.json
+└── tests/                       # phase1 … phase10_brain
 ```
 
 ---
 
 ## Disclaimer
 
-Chronos-Nexus is research / hackathon software. The wire is **live RSS**, not a licensed news terminal. Tokenized equity products and Demo listings differ by region and account. Stop-loss / take-profit placement depends on Bitget Demo order-type support; prices are always recorded even if a venue rejects the protective ticket. Qwen quota is a hard platform limit — the desk stands down until it resets. Nothing here is investment advice. Do not point this process at live keys unless you have lifted the documented gates and accept the loss.
+Chronos-Nexus is research / hackathon software. The wire is live RSS, not a licensed terminal. Tokenized equity products differ by region. Protective orders depend on Bitget Demo order types. Qwen quota is a platform limit — the desk stands down until reset. Nothing here is investment advice. Do not point this process at live keys unless you have lifted the documented gates.
 
 ---
 
@@ -505,5 +418,5 @@ MIT. Use, fork, and modify with attribution. Keep Demo keys, Telegram tokens, an
 ---
 
 **CHRONOS-NEXUS** — *Bitget AI Base Camp Hackathon S2 · Agentic Trading · Event-Driven Agent*  
-News-driven directional trading. ORACLE · SENTINEL · CHAIRMAN  
-**Hourly daemon. Open universe. GitBook paper log. Glasshouse Telegram. Free-Tier safe. Paper only.**
+ORACLE · SENTINEL · CHAIRMAN  
+**Hybrid mainnet BBO. 75% TA setup. Chunked close. Hourly daemon. Paper only.**

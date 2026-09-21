@@ -79,7 +79,7 @@ class RiskReport(BaseModel):
     daily_deployed_usdt: float | None = None
     daily_entries: int = 0
     setup_score: float = 0.0
-    setup_threshold: float = 90.0
+    setup_threshold: float = 75.0
     mtf_align: str = ""
     book_imbalance: float | None = None
     rvol: float | None = None

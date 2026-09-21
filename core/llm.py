@@ -19,7 +19,8 @@ from core.retry import call_with_backoff
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.DOTALL)
 
 # Hard cap per HTTP round-trip. Never let chat.completions block the CIC.
-LLM_TIMEOUT_S = 45
+LLM_TIMEOUT_S = 90
+LLM_MAX_TOKENS = 8192
 API_TIMEOUT_VETO = "VETO: API Timeout"
 API_QUOTA_VETO = (
     "Bitget Qwen API quota reached. System safely standing down until limits reset."
@@ -334,7 +335,7 @@ class QwenCortex:
                 {"role": "user", "content": user},
             ],
             "temperature": temperature,
-            "max_output_tokens": 2048,
+            "max_output_tokens": LLM_MAX_TOKENS,
             "reasoning": {"effort": "none"},
             "extra_body": {"enable_thinking": False},
         }
@@ -364,7 +365,7 @@ class QwenCortex:
                 {"role": "user", "content": user},
             ],
             "temperature": temperature,
-            "max_tokens": 2048,
+            "max_tokens": LLM_MAX_TOKENS,
             "extra_body": {"enable_thinking": False},
         }
         if json_mode:

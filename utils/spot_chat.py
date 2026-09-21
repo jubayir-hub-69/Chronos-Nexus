@@ -62,6 +62,10 @@ _DESK_CMDS = {
     "balance",
     "bal",
     "balances",
+    "pnl",
+    "status",
+    "menu",
+    "dashboard",
 }
 
 

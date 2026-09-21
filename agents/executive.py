@@ -8,7 +8,7 @@ from typing import Any
 
 from agents.analyst import is_idle_brief
 from core.llm import API_QUOTA_VETO, API_TIMEOUT_VETO, QwenCortex
-from core.memory import BoardMemory, daily_block_reason
+from core.memory import BoardMemory, build_engine_snapshot, daily_block_reason
 from core.schemas import AnalystBrief, AttestationResult, BoardDecision, RiskReport
 from core.ta import candle_veto, confluence_veto
 from connectors.arbitrum import ArbitrumSepolia
@@ -266,6 +266,13 @@ class ExecutiveAgent:
                 "candle": risk.candle_structure,
                 "thesis": brief.thesis,
                 "model": decision.model,
+                "conviction": int(brief.conviction or 0),
+                "sentiment": brief.sentiment_score,
+                "news_credibility": brief.news_credibility,
+                "news_conflict": brief.news_conflict,
+                "news_impact": brief.news_impact,
+                "news_good": brief.news_good,
+                "news_bad": brief.news_bad,
             },
             result={
                 "ok": bool(ticket.get("ok")),
@@ -274,6 +281,19 @@ class ExecutiveAgent:
                 "error": ticket.get("error"),
             },
         )
+        try:
+            self.memory.record_snapshot(
+                build_engine_snapshot(
+                    news_context=list(brief.wire_headlines or []),
+                    brief=brief.model_dump(),
+                    risk=risk.model_dump(),
+                    decision=decision.model_dump(),
+                    result=ticket,
+                    daily=self.memory.daily_state(),
+                )
+            )
+        except Exception:
+            return
 
 
 def hash_decision(brief: AnalystBrief, risk: RiskReport, decision: BoardDecision) -> str:

@@ -1,4 +1,24 @@
-"""Wire NLP — source-weighted sentiment, recency, impact. No LLM required."""
+"""Wire NLP — source-weighted sentiment, recency, impact. No LLM required.
+
+Sentiment model (0–100)
+-----------------------
+Each headline starts at a neutral 50. Lexicon hits add/subtract bull/bear
+weights. The move is then shrunk toward 50 by source credibility × recency:
+
+    sentiment = clip(50 + (raw - 50) * credibility * recency, 0, 100)
+
+Wire aggregate is a credibility×recency weighted mean of focused headlines
+(ticker-matched when a symbol is known). High-impact events (earnings, Fed,
+CPI, FOMC) get a 1.25× weight. Conflicted tape (bulls ≈ bears) is flagged.
+
+Conviction (0–100)
+------------------
+    stretch = |sentiment - 50| / 50
+    raw = 100 * stretch * cred * recency * impact_w
+    score = clip(50 + raw * 0.9, 0, 100)
+
+Conflicted tape is capped at 20. Side that fights the tape is capped at 40.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +40,8 @@ SOURCE_WEIGHT: dict[str, float] = {
 _BULL: tuple[tuple[str, float], ...] = (
     ("beats estimates", 18.0),
     ("beats expectations", 18.0),
+    ("beats eps", 18.0),
+    ("tops estimates", 16.0),
     ("earnings beat", 16.0),
     ("raises guidance", 16.0),
     ("guidance raise", 14.0),
@@ -49,7 +71,9 @@ _BULL: tuple[tuple[str, float], ...] = (
 _BEAR: tuple[tuple[str, float], ...] = (
     ("earnings miss", 18.0),
     ("misses estimates", 18.0),
+    ("misses eps", 18.0),
     ("missed estimates", 16.0),
+    ("cuts forecast", 16.0),
     ("guidance cut", 16.0),
     ("profit warning", 16.0),
     ("downgrade", 12.0),
@@ -138,6 +162,7 @@ def score_headline(headline: str, source: str = "", published: str = "", detail:
     # Log-odds style: source credibility and recency shrink the move toward 50.
     sentiment = max(0.0, min(100.0, 50.0 + (raw - 50.0) * cred * recency))
     direction = "bull" if sentiment >= 58 else ("bear" if sentiment <= 42 else "neutral")
+    event_class = "macro" if macro else ("high" if impact == "high" else direction)
     return {
         "sentiment": round(sentiment, 2),
         "credibility": round(cred, 3),
@@ -145,6 +170,7 @@ def score_headline(headline: str, source: str = "", published: str = "", detail:
         "impact": impact,
         "macro": macro,
         "direction": direction,
+        "event_class": event_class,
         "source": source,
         "headline": headline,
     }
@@ -253,9 +279,10 @@ def news_veto(side: str, news: dict[str, Any] | None) -> str:
         sentiment = 50.0
     if payload.get("conflict") and float(payload.get("credibility") or 0) < 0.75:
         return VETO_REASON_NEWS
-    if side_n == "buy" and sentiment < 58:
+    # Neutral tape is SENTINEL's TA problem. Only veto a hard fight vs the wire.
+    if side_n == "buy" and sentiment <= 35:
         return VETO_REASON_NEWS
-    if side_n == "sell" and sentiment > 42:
+    if side_n == "sell" and sentiment >= 65:
         return VETO_REASON_NEWS
     return ""
 

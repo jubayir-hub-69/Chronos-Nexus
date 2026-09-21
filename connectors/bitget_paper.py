@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +49,28 @@ ATR_SL_PCT_CAP = 0.05
 ATR_TP_PCT_FLOOR = 0.03
 ATR_TP_PCT_CAP = 0.12
 POSITION_OPEN_MSG = "Position already open"
+# Bitget 45113 = max order value. Penny names (e.g. 1000 PRESPCX) must slice.
+CLOSE_CHUNK_QTY_DEFAULT = 100.0
+CLOSE_CHUNK_NOTIONAL_USDT = 8000.0
+CLOSE_CHUNK_SLEEP_S = 0.5
+CLOSE_CHUNK_MAX_LOOPS = 40
+_MAX_ORDER_CODES = ("45113", "45112", "45104", "45103", "25230", "25233", "25241")
+_MAX_ORDER_TOKS = (
+    "maximum order value",
+    "max order value",
+    "maximum order quantity",
+    "more than the maximum order",
+    "maximum amount of single flash clos",
+    "exceeds the maximum",
+    "exceeds max",
+)
+
+
+def _is_max_order_fault(exc: BaseException | str) -> bool:
+    blob = str(exc or "").lower()
+    if any(code in blob for code in _MAX_ORDER_CODES):
+        return True
+    return any(tok in blob for tok in _MAX_ORDER_TOKS)
 # Bitget USDT-M taker + crossed-margin estimate when the Demo wallet delta is unavailable.
 TAKER_FEE_RATE = 0.0006
 SWAP_LEVERAGE = 5.0
@@ -974,6 +997,8 @@ class BitgetPaperConnector:
                 "last": ticker.get("last"),
                 "bid": ticker.get("bid"),
                 "ask": ticker.get("ask"),
+                "high": ticker.get("high"),
+                "low": ticker.get("low"),
                 "mark": mark,
                 "index": extract_mark_price(ticker.get("index"), ticker.get("indexPrice")) if isinstance(ticker, dict) else None,
                 "percentage": ticker.get("percentage"),
@@ -1699,6 +1724,114 @@ class BitgetPaperConnector:
             qty = self._size_amount(symbol, total, mark or 1.0)
         return qty, "ok"
 
+    def _close_chunk_qty(self, symbol: str, remaining: float, mark: float) -> float:
+        """Single-order slice under Bitget max qty / max notional (45113)."""
+        try:
+            left = max(0.0, float(remaining or 0.0))
+        except (TypeError, ValueError):
+            left = 0.0
+        if left <= 0:
+            return 0.0
+        px = mark if mark and mark > 0 else 1.0
+        max_amt = 0.0
+        max_cost = 0.0
+        min_amt = 0.0
+        try:
+            market = self.exchange.market(symbol)
+            limits = market.get("limits") if isinstance(market.get("limits"), dict) else {}
+            max_amt = float((limits.get("amount") or {}).get("max") or 0.0)
+            max_cost = float((limits.get("cost") or {}).get("max") or 0.0)
+            min_amt = float((limits.get("amount") or {}).get("min") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            pass
+        caps = [left, CLOSE_CHUNK_QTY_DEFAULT, CLOSE_CHUNK_NOTIONAL_USDT / px]
+        if max_amt > 0:
+            caps.append(max_amt)
+        if max_cost > 0:
+            caps.append(max_cost / px)
+        chunk = min(c for c in caps if c > 0)
+        sized = self._size_amount(symbol, chunk, px)
+        if min_amt and sized < min_amt <= left:
+            sized = self._size_amount(symbol, min_amt, px)
+        if sized > left:
+            sized = self._size_amount(symbol, left, px)
+        return max(0.0, sized)
+
+    def _submit_reduce_order(
+        self,
+        symbol: str,
+        close_side: str,
+        qty: float,
+        param_sets: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        last_exc: Exception | None = None
+        for params in param_sets:
+            try:
+                return self._ccxt(
+                    lambda p=params: self.exchange.create_order(
+                        symbol, "market", close_side, qty, None, p
+                    ),
+                    label="bitget.close_market",
+                )
+            except Exception as exc:
+                last_exc = exc
+                if _is_max_order_fault(exc):
+                    raise
+                continue
+        raise last_exc or RuntimeError("close_market failed")
+
+    def _reduce_until_flat(
+        self,
+        symbol: str,
+        close_side: str,
+        target_qty: float,
+        mark: float,
+        param_sets: list[dict[str, Any]],
+        *,
+        fraction: float,
+    ) -> tuple[dict[str, Any] | None, float, int]:
+        """Slice 45113-sized books. Loop until this close's qty is filled or the book is 0."""
+        remaining = max(0.0, float(target_qty or 0.0))
+        filled = 0.0
+        last_order: dict[str, Any] | None = None
+        chunk = self._close_chunk_qty(symbol, remaining, mark)
+        loops = 0
+        while remaining > 1e-9 and loops < CLOSE_CHUNK_MAX_LOOPS:
+            loops += 1
+            this = min(remaining, chunk) if chunk > 0 else remaining
+            this = self._size_amount(symbol, this, mark or 1.0)
+            if this <= 0:
+                break
+            try:
+                order = self._submit_reduce_order(symbol, close_side, this, param_sets)
+            except Exception as exc:
+                if not _is_max_order_fault(exc):
+                    raise
+                halved = self._size_amount(symbol, this / 2.0, mark or 1.0)
+                if halved <= 0 or halved >= this - 1e-12:
+                    raise
+                chunk = halved
+                time.sleep(CLOSE_CHUNK_SLEEP_S)
+                continue
+            last_order = order if isinstance(order, dict) else {"raw": order}
+            filled += this
+            remaining = max(0.0, remaining - this)
+            if remaining <= 1e-9:
+                break
+            time.sleep(CLOSE_CHUNK_SLEEP_S)
+            if fraction >= 0.999:
+                live = self.fetch_open_position(symbol)
+                if not live.get("open"):
+                    remaining = 0.0
+                    break
+                try:
+                    live_qty = abs(float(live.get("contracts") or 0.0))
+                except (TypeError, ValueError):
+                    live_qty = remaining
+                remaining = min(remaining, live_qty)
+            chunk = self._close_chunk_qty(symbol, remaining, mark)
+        return last_order, filled, loops
+
     def _first_order(
         self,
         symbol: str,
@@ -2100,22 +2233,18 @@ class BitgetPaperConnector:
         }
         _stamp_bbo(record, quote, as_entry=False)
         try:
-            order = None
-            last_exc: Exception | None = None
-            for params in param_sets:
-                try:
-                    order = self._ccxt(
-                        lambda p=params: self.exchange.create_order(
-                            symbol, "market", close_side, qty, None, p
-                        ),
-                        label="bitget.close_market",
-                    )
-                    break
-                except Exception as exc:
-                    last_exc = exc
-                    continue
-            if order is None:
-                raise last_exc or RuntimeError("close_market failed")
+            order, filled_qty, chunks = self._reduce_until_flat(
+                symbol,
+                close_side,
+                qty,
+                mark or entry or 1.0,
+                param_sets,
+                fraction=fraction,
+            )
+            if filled_qty <= 0 or order is None:
+                raise RuntimeError("close_market failed")
+            qty = filled_qty
+            record["amount"] = qty
             demo_fill = coerce_price(order.get("average"), order.get("price"))
             fill = mark if mark > 0 else demo_fill
             pnl_usdt, pnl_pct = unrealized_pnl(entry, fill, qty, pos_side)
@@ -2130,6 +2259,7 @@ class BitgetPaperConnector:
                     "pnl_usdt": round(pnl_usdt, 6),
                     "pnl_pct": round(pnl_pct, 4),
                     "notional_usdt": round(abs(fill * qty), 6),
+                    "close_chunks": chunks,
                 }
             )
             _stamp_bbo(record, quote, as_entry=False)

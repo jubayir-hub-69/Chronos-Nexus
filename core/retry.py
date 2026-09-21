@@ -64,6 +64,12 @@ _NO_RETRY_TOKENS = (
     "already known",
     "25203",
     "25202",
+    "45113",
+    "45112",
+    "45104",
+    "45103",
+    "maximum order value",
+    "maximum order quantity",
 )
 
 

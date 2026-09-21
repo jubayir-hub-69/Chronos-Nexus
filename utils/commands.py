@@ -12,9 +12,10 @@ from typing import Any, Callable
 import requests
 
 from core.config import PROJECT_ROOT
+from core.memory import BoardMemory, sentiment_label
 from core.positions import PositionDesk, ticker_root
 from connectors.bitget_paper import BitgetPaperConnector
-from utils.notifier import TelegramNotifier
+from utils.notifier import TelegramNotifier, escape_html
 from utils.spot_chat import (
     CALLBACK_CANCEL,
     CALLBACK_CONFIRM,
@@ -32,28 +33,53 @@ from utils.spot_chat import (
 
 OFFSET_PATH = PROJECT_ROOT / "data" / "telegram_offset.json"
 TELEGRAM_UPDATES = "https://api.telegram.org/bot{token}/getUpdates"
+TELEGRAM_SET_COMMANDS = "https://api.telegram.org/bot{token}/setMyCommands"
+BOT_MENU = [
+    {"command": "menu", "description": "Headless terminal dashboard"},
+    {"command": "positions", "description": "Live book + PnL"},
+    {"command": "close", "description": "Market-close one symbol"},
+    {"command": "closeall", "description": "Flatten the whole Demo book"},
+    {"command": "price", "description": "Live mainnet last / bid / ask"},
+    {"command": "balance", "description": "Wallet free + total for one asset"},
+    {"command": "pnl", "description": "Today's realized PnL and daily limits"},
+    {"command": "status", "description": "Live ORACLE / SENTINEL desk state"},
+]
 HELP_PLAIN = (
     "CHRONOS-NEXUS COMMANDS\n"
     "AI desk opens are automated only. Manual chatbox is Bitget SPOT.\n\n"
+    "/menu               headless terminal dashboard + buttons\n"
     "/positions          live book + PnL\n"
     "/close SYMBOL       market-close one name\n"
     "/closeall           flatten the whole Demo book\n"
     "/price SYMBOL       live mainnet last / bid / ask\n"
     "/balance SYMBOL     wallet free + total for one asset\n"
+    "/pnl                today's realized PnL, W/L, trades left\n"
+    "/status             live ORACLE sentiment + SENTINEL desk\n"
     "NVDA/USDT BUY $10   Spot preview + confirm buttons\n"
     "/help               this list"
 )
 HELP_HTML = (
     "<b>CHRONOS-NEXUS COMMANDS</b>\n"
     "AI cycle is untouched. Manual chatbox is <b>Bitget Spot</b> only.\n\n"
+    "<code>/menu</code> — headless terminal dashboard + live buttons\n"
     "<code>/positions</code> — live book + PnL\n"
     "<code>/close SYMBOL</code> — market-close one name\n"
     "<code>/closeall</code> — flatten the whole Demo book\n"
     "<code>/price SYMBOL</code> — live Bitget mainnet last / bid / ask\n"
     "<code>/balance SYMBOL</code> — wallet free + total for one asset\n"
+    "<code>/pnl</code> — today's realized PnL, win/loss, trades left\n"
+    "<code>/status</code> — live ORACLE sentiment + SENTINEL desk\n"
     "<code>NVDA/USDT BUY $10</code> — Spot preview, then Confirm / Cancel\n"
     "<code>/help</code> — this list"
 )
+_DESK_CALLBACKS = {
+    "nx:status": "status",
+    "nx:pnl": "pnl",
+    "nx:positions": "positions",
+    "nx:closeall": "closeall_ask",
+    "nx:closeall_yes": "closeall_run",
+    "nx:home": "menu",
+}
 
 
 @dataclass
@@ -86,6 +112,10 @@ _DESK_COMMANDS = {
     "balance",
     "bal",
     "balances",
+    "pnl",
+    "status",
+    "menu",
+    "dashboard",
 }
 
 
@@ -119,6 +149,7 @@ def parse_command(text: str) -> tuple[str, str]:
         "px": "price",
         "bal": "balance",
         "balances": "balance",
+        "dashboard": "menu",
     }
     mapped = aliases.get(cmd, cmd)
     if mapped not in _DESK_COMMANDS and not had_slash:
@@ -135,10 +166,12 @@ class CommandDesk:
         bitget: BitgetPaperConnector | None,
         desk: PositionDesk,
         on_close: Callable[[dict[str, Any]], None] | None = None,
+        memory: BoardMemory | None = None,
     ) -> None:
         self.bitget = bitget
         self.desk = desk
         self.on_close = on_close
+        self.memory = memory
 
     def handle(self, text: str, *, source: str = "terminal") -> CommandResult:
         cmd, arg = parse_command(text)
@@ -156,6 +189,12 @@ class CommandDesk:
             return self._cmd_price(arg)
         if cmd == "balance":
             return self._cmd_balance(arg)
+        if cmd == "pnl":
+            return self._cmd_pnl()
+        if cmd == "status":
+            return self._cmd_status()
+        if cmd == "menu":
+            return self._cmd_menu()
         if cmd in {"buy", "sell", "open", "long", "short"}:
             msg = (
                 "REFUSED — manual open is disabled on the AI desk. "
@@ -300,6 +339,262 @@ class CommandDesk:
         )
         return CommandResult("balance", True, plain, html, [])
 
+    def _cmd_pnl(self) -> CommandResult:
+        mem = self.memory if self.memory is not None else BoardMemory()
+        session = mem.session_pnl()
+        realized = float(session.get("realized_pnl_usdt") or 0.0)
+        wins = int(session.get("wins") or 0)
+        losses = int(session.get("losses") or 0)
+        left = int(session.get("trades_left") or 0)
+        entries = int(session.get("entries") or 0)
+        cap = int(session.get("entries_max") or 0)
+        sl_hits = int(session.get("sl_hits") or 0)
+        day = str(session.get("date") or "")
+        halt = str(session.get("halt") or "") or "none"
+        halt_reason = str(session.get("halt_reason") or "")
+        sign = "+" if realized >= 0 else ""
+        unrealized = 0.0
+        open_n = 0
+        if self.bitget is not None:
+            try:
+                book = self.desk.snapshot(self.bitget)
+            except Exception:
+                book = []
+            for pos in book or []:
+                try:
+                    unrealized += float(pos.get("pnl_usdt") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                open_n += 1
+        u_sign = "+" if unrealized >= 0 else ""
+        plain_lines = [
+            f"SESSION PnL  UTC {day}",
+            f"Today's Realized PnL  {sign}{realized:.2f} USDT",
+            f"Win / Loss  {wins}W / {losses}L",
+            f"Trades left: {left}",
+            f"Entries  {entries}/{cap}",
+            f"SL hits  {sl_hits}",
+            f"Halt  {halt}",
+        ]
+        html_lines = [
+            "<b>CHRONOS-NEXUS</b>",
+            "📈 <b>SESSION PnL</b>",
+            f"<i>UTC {escape_html(day)} · live ledger + Bitget book</i>",
+            "",
+            f"<b>Today's Realized PnL:</b> <b>{sign}{realized:.2f} USDT</b>",
+            f"<b>Win / Loss:</b> <code>{wins}W / {losses}L</code>",
+            f"<b>Trades left:</b> <code>{left}</code>",
+            f"<b>Entries:</b> <code>{entries}/{cap}</code>",
+            f"<b>SL hits:</b> <code>{sl_hits}</code>",
+            f"<b>Halt:</b> <code>{escape_html(halt)}</code>",
+        ]
+        if halt_reason and halt != "none":
+            plain_lines.append(f"Halt reason  {halt_reason}")
+            html_lines.append(f"<b>Halt reason:</b> {escape_html(halt_reason)}")
+        if self.bitget is not None:
+            plain_lines.append(f"Open unrealized  {u_sign}{unrealized:.2f} USDT ({open_n})")
+            html_lines.append(
+                f"<b>Open unrealized:</b> <b>{u_sign}{unrealized:.2f} USDT</b>  "
+                f"({open_n} names)"
+            )
+        closes = [
+            fill
+            for fill in (session.get("fills") or [])
+            if isinstance(fill, dict) and "pnl_usdt" in fill
+        ]
+        if closes:
+            html_lines.append("")
+            html_lines.append("<b>Today's closes</b>")
+            plain_lines.append("Today's closes")
+            for fill in closes[-8:]:
+                try:
+                    pnl = float(fill.get("pnl_usdt") or 0.0)
+                except (TypeError, ValueError):
+                    pnl = 0.0
+                kind = str(fill.get("kind") or "CLOSE")
+                symbol = str(fill.get("symbol") or "")
+                bit = f"{kind} {symbol}  {pnl:+.2f} USDT"
+                plain_lines.append(f"  {bit}")
+                html_lines.append(f"• <code>{escape_html(bit)}</code>")
+        return CommandResult("pnl", True, "\n".join(plain_lines), "\n".join(html_lines), [])
+
+    def _cmd_status(self) -> CommandResult:
+        mem = self.memory if self.memory is not None else BoardMemory()
+        snap = mem.latest_snapshot()
+        daily = mem.daily_state()
+        scored = bool(snap.get("scored"))
+        sentiment = snap.get("sentiment")
+        conviction = snap.get("conviction")
+        label = str(snap.get("sentiment_label") or "") or sentiment_label(
+            sentiment, scored=scored and sentiment is not None
+        )
+        desk = str(snap.get("desk") or "") or "STAND_DOWN"
+        halt = str(daily.get("halt") or snap.get("daily_halt") or "") or "none"
+        action = str(snap.get("action") or "") or "—"
+        symbol = str(snap.get("oracle_symbol") or "NONE")
+        side = str(snap.get("oracle_side") or "none")
+        verdict = str(snap.get("sentinel_verdict") or "—")
+        ts = str(snap.get("ts") or "")
+        thesis = str(snap.get("oracle_thesis") or "")
+        if scored and sentiment is not None:
+            try:
+                sent_plain = f"{label} {float(sentiment):.2f}"
+            except (TypeError, ValueError):
+                sent_plain = label
+        else:
+            sent_plain = "NO SCAN YET"
+        if scored and conviction is not None:
+            conv_plain = f"{int(conviction)}/100"
+        elif scored:
+            conv_plain = "0/100"
+        else:
+            conv_plain = "NO SCAN YET"
+        plain_lines = [
+            "AI DESK STATUS",
+            f"Market Sentiment  {sent_plain}",
+            f"AI Conviction  {conv_plain}",
+            f"Desk  {desk}",
+            f"Last action  {action}",
+            f"ORACLE  {symbol} / {side}",
+            f"SENTINEL  {verdict}",
+            f"Halt  {halt}",
+        ]
+        if ts:
+            plain_lines.append(f"Last scan  {ts}")
+        html_lines = [
+            "<b>CHRONOS-NEXUS</b>",
+            "🧠 <b>AI DESK STATUS</b>",
+            "<i>Live ORACLE + SENTINEL snapshot from board memory</i>",
+            "",
+            f"<b>Market Sentiment:</b> <code>{escape_html(sent_plain)}</code>",
+            f"<b>AI Conviction:</b> <code>{escape_html(conv_plain)}</code>",
+            f"<b>Desk:</b> <code>{escape_html(desk)}</code>",
+            f"<b>Last action:</b> <code>{escape_html(action)}</code>",
+            f"<b>ORACLE:</b> <code>{escape_html(symbol)} / {escape_html(side)}</code>",
+            f"<b>SENTINEL:</b> <code>{escape_html(verdict)}</code>",
+            f"<b>Halt:</b> <code>{escape_html(halt)}</code>",
+        ]
+        if ts:
+            html_lines.append(f"<b>Last scan:</b> <code>{escape_html(ts)}</code>")
+        rsi = snap.get("rsi")
+        if rsi is not None and rsi != "":
+            try:
+                rsi_s = f"{float(rsi):.2f}"
+            except (TypeError, ValueError):
+                rsi_s = str(rsi)
+            ta = str(snap.get("ta_verdict") or "")
+            plain_lines.append(f"RSI  {rsi_s}  TA  {ta or '—'}")
+            html_lines.append(
+                f"<b>RSI:</b> <code>{escape_html(rsi_s)}</code>  "
+                f"<b>TA:</b> <code>{escape_html(ta or '—')}</code>"
+            )
+        setup_score = snap.get("setup_score")
+        if setup_score is not None and setup_score != "":
+            try:
+                setup_s = f"{float(setup_score):.1f}"
+            except (TypeError, ValueError):
+                setup_s = str(setup_score)
+            thresh = snap.get("setup_threshold")
+            thresh_s = ""
+            try:
+                if thresh is not None and thresh != "":
+                    thresh_s = f"/{float(thresh):.0f}"
+            except (TypeError, ValueError):
+                thresh_s = ""
+            mtf = str(snap.get("mtf_align") or "")
+            plain_lines.append(f"Setup  {setup_s}{thresh_s}  MTF  {mtf or '—'}")
+            html_lines.append(
+                f"<b>Setup:</b> <code>{escape_html(setup_s)}{escape_html(thresh_s)}</code>  "
+                f"<b>MTF:</b> <code>{escape_html(mtf or '—')}</code>"
+            )
+        headlines = [str(h) for h in (snap.get("headlines") or []) if str(h).strip()]
+        if headlines:
+            html_lines.append("")
+            html_lines.append("<b>Latest news scan</b>")
+            for idx, headline in enumerate(headlines[:6], start=1):
+                html_lines.append(f"{idx}. {escape_html(headline)}")
+        if thesis:
+            html_lines.append("")
+            html_lines.append(f"<b>Thesis:</b> {escape_html(thesis)}")
+        return CommandResult(
+            "status",
+            True,
+            "\n".join(plain_lines),
+            "\n".join(html_lines),
+            [],
+        )
+
+    def _cmd_menu(self) -> CommandResult:
+        """Headless terminal home. Same backends as /pnl and /status — never dummy tape."""
+        mem = self.memory if self.memory is not None else BoardMemory()
+        session = mem.session_pnl()
+        snap = mem.latest_snapshot()
+        daily = mem.daily_state()
+        scored = bool(snap.get("scored"))
+        sentiment = snap.get("sentiment")
+        conviction = snap.get("conviction")
+        label = str(snap.get("sentiment_label") or "") or sentiment_label(
+            sentiment, scored=scored and sentiment is not None
+        )
+        if scored and sentiment is not None:
+            try:
+                sent_plain = f"{label} {float(sentiment):.2f}"
+            except (TypeError, ValueError):
+                sent_plain = label
+        else:
+            sent_plain = "NO SCAN YET"
+        if scored and conviction is not None:
+            conv_plain = f"{int(conviction)}/100"
+        elif scored:
+            conv_plain = "0/100"
+        else:
+            conv_plain = "NO SCAN YET"
+        desk = str(snap.get("desk") or "") or "STAND_DOWN"
+        halt = str(daily.get("halt") or snap.get("daily_halt") or "") or "none"
+        realized = float(session.get("realized_pnl_usdt") or 0.0)
+        wins = int(session.get("wins") or 0)
+        losses = int(session.get("losses") or 0)
+        left = int(session.get("trades_left") or 0)
+        day = str(session.get("date") or "")
+        sign = "+" if realized >= 0 else ""
+        open_n = 0
+        if self.bitget is not None:
+            try:
+                book = self.desk.snapshot(self.bitget)
+            except Exception:
+                book = []
+            open_n = len(book or [])
+        plain = (
+            f"HEADLESS TERMINAL  UTC {day}\n"
+            f"Desk  {desk}\n"
+            f"Market Sentiment  {sent_plain}\n"
+            f"AI Conviction  {conv_plain}\n"
+            f"Today's Realized PnL  {sign}{realized:.2f} USDT\n"
+            f"Win / Loss  {wins}W / {losses}L\n"
+            f"Trades left: {left}\n"
+            f"Open book  {open_n}\n"
+            f"Halt  {halt}"
+        )
+        html = "\n".join(
+            [
+                "<b>CHRONOS-NEXUS</b>",
+                "🖥 <b>HEADLESS TERMINAL</b>",
+                f"<i>UTC {escape_html(day)} · live ledger + ORACLE snapshot</i>",
+                "",
+                f"<b>Desk:</b> <code>{escape_html(desk)}</code>",
+                f"<b>Market Sentiment:</b> <code>{escape_html(sent_plain)}</code>",
+                f"<b>AI Conviction:</b> <code>{escape_html(conv_plain)}</code>",
+                f"<b>Today's Realized PnL:</b> <b>{sign}{realized:.2f} USDT</b>",
+                f"<b>Win / Loss:</b> <code>{wins}W / {losses}L</code>",
+                f"<b>Trades left:</b> <code>{left}</code>",
+                f"<b>Open book:</b> <code>{open_n}</code> names",
+                f"<b>Halt:</b> <code>{escape_html(halt)}</code>",
+                "",
+                "<i>Buttons call the same live functions as /status · /pnl · /positions · /closeall.</i>",
+            ]
+        )
+        return CommandResult("menu", True, plain, html, [])
+
     def _cmd_close(self, arg: str, *, source: str) -> CommandResult:
         if self.bitget is None:
             msg = "Bitget Demo rail unbound — cannot close."
@@ -403,8 +698,12 @@ class TelegramCommandLoop:
             target=self._run, daemon=True, name="chronos-telegram-commands"
         )
         self._thread.start()
+        menu = register_bot_menu(self.notifier.token)
+        menu_bit = "menu registered" if menu.get("ok") else "menu skipped"
         print(
-            "[TELEGRAM] command loop armed  /positions /close /closeall  + Spot chatbox",
+            "[TELEGRAM] command loop armed  "
+            "/menu /positions /close /closeall /price /balance /pnl /status  "
+            f"+ Spot chatbox  ({menu_bit})",
             flush=True,
         )
 
@@ -468,6 +767,13 @@ class TelegramCommandLoop:
         result = self.commands.handle(text, source="telegram")
         if not result.cmd:
             return
+        if result.cmd == "menu":
+            self.notifier.send_html_sync(
+                result.html,
+                reply_markup=desk_keyboard(),
+                chat_id=chat_id,
+            )
+            return
         if result.html:
             self.notifier.reply(result.html)
 
@@ -524,6 +830,15 @@ class TelegramCommandLoop:
         if chat_id != str(self.notifier.chat_id):
             self.notifier.answer_callback(cq_id, "Ignored.")
             return
+        desk_action = parse_desk_callback(data)
+        if desk_action:
+            self._handle_desk_callback(
+                cq_id,
+                desk_action,
+                chat_id,
+                int(message_id or 0),
+            )
+            return
         parsed = parse_callback(data)
         if parsed is None:
             self.notifier.answer_callback(cq_id, "Unknown button.")
@@ -549,6 +864,83 @@ class TelegramCommandLoop:
             return
         self.notifier.answer_callback(cq_id, "Submitting Spot order…")
         self._execute_spot(ticket, int(message_id or ticket.message_id or 0), chat_id)
+
+    def _handle_desk_callback(
+        self,
+        cq_id: str,
+        action: str,
+        chat_id: str,
+        message_id: int,
+    ) -> None:
+        """Edit-in-place. Every view is CommandDesk.handle of the live slash command."""
+        labels = {
+            "status": "Live market status",
+            "pnl": "My real PnL",
+            "positions": "Open positions",
+            "closeall_ask": "Force close all",
+            "closeall_run": "Flattening Demo book",
+            "menu": "Dashboard",
+        }
+        self.notifier.answer_callback(cq_id, labels.get(action, "Loading live desk…"))
+        html, markup = self._desk_view(action)
+        if not message_id:
+            self.notifier.send_html_sync(html, reply_markup=markup, chat_id=chat_id)
+            return
+        self.notifier.edit_html(message_id, html, reply_markup=markup, chat_id=chat_id)
+
+    def _desk_view(self, action: str) -> tuple[str, dict[str, Any]]:
+        if action == "closeall_ask":
+            return self._closeall_prompt()
+        if action == "closeall_run":
+            result = self.commands.handle("/closeall", source="telegram")
+            body = result.html or result.plain or "FLAT — nothing to close."
+            return body, desk_keyboard()
+        cmd = {"status": "/status", "pnl": "/pnl", "positions": "/positions", "menu": "/menu"}.get(
+            action, "/menu"
+        )
+        result = self.commands.handle(cmd, source="telegram")
+        return result.html or result.plain or "No live data.", desk_keyboard()
+
+    def _closeall_prompt(self) -> tuple[str, dict[str, Any]]:
+        bitget = self.commands.bitget
+        if bitget is None:
+            return (
+                "<b>CHRONOS-NEXUS</b>\n🛑 <b>FORCE CLOSE ALL</b>\n\n"
+                "Bitget Demo rail unbound — cannot close.",
+                desk_keyboard(),
+            )
+        try:
+            book = self.commands.desk.snapshot(bitget)
+        except Exception as exc:
+            return (
+                f"<b>CHRONOS-NEXUS</b>\n🛑 <b>FORCE CLOSE ALL</b>\n\n"
+                f"Live book unavailable: {escape_html(str(exc))}",
+                desk_keyboard(),
+            )
+        if not book:
+            return (
+                "<b>CHRONOS-NEXUS</b>\n🛑 <b>FORCE CLOSE ALL</b>\n\n"
+                "FLAT — nothing to close.",
+                desk_keyboard(),
+            )
+        lines = [
+            "<b>CHRONOS-NEXUS</b>",
+            "🛑 <b>FORCE CLOSE ALL</b>",
+            "<i>Live Demo book — same path as /closeall. Confirm to flatten.</i>",
+            "",
+            f"<b>Open names:</b> <code>{len(book)}</code>",
+            "",
+        ]
+        for pos in book:
+            pnl_usdt = float(pos.get("pnl_usdt") or 0.0)
+            usd = "+" if pnl_usdt >= 0 else ""
+            symbol = str(pos.get("symbol") or "")
+            side = str(pos.get("side") or "").upper()
+            lines.append(
+                f"• <code>{escape_html(symbol)}</code> {escape_html(side)}  "
+                f"{usd}{pnl_usdt:.2f} USDT"
+            )
+        return "\n".join(lines), flatten_keyboard()
 
     def _execute_spot(self, ticket: Any, message_id: int, chat_id: str) -> None:
         bitget = self.commands.bitget
@@ -609,7 +1001,8 @@ class TerminalCommandLoop:
         )
         self._thread.start()
         print(
-            "[TERMINAL] command loop armed  /positions /close SYMBOL /closeall /help",
+            "[TERMINAL] command loop armed  "
+            "/positions /close /closeall /price /balance /pnl /status /help",
             flush=True,
         )
 
@@ -646,6 +1039,65 @@ class TerminalCommandLoop:
                 continue
             if result.plain:
                 self.printer(result.plain)
+
+
+def desk_keyboard() -> dict[str, Any]:
+    """Inline ChatOps pad. Callbacks map 1:1 onto /status /pnl /positions /closeall."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📡 Live Market Status", "callback_data": "nx:status"},
+                {"text": "📈 My Real PnL", "callback_data": "nx:pnl"},
+            ],
+            [
+                {"text": "📊 Open Positions", "callback_data": "nx:positions"},
+                {"text": "🛑 Force Close All", "callback_data": "nx:closeall"},
+            ],
+            [{"text": "🖥 Dashboard", "callback_data": "nx:home"}],
+        ]
+    }
+
+
+def flatten_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✅ CONFIRM FLATTEN", "callback_data": "nx:closeall_yes"},
+                {"text": "❌ BACK", "callback_data": "nx:home"},
+            ]
+        ]
+    }
+
+
+def parse_desk_callback(data: str) -> str | None:
+    """Return the desk action for nx:* buttons. None for Spot s1:/s0: tickets."""
+    return _DESK_CALLBACKS.get((data or "").strip())
+
+
+def register_bot_menu(token: str) -> dict[str, Any]:
+    """Register the native Telegram Menu button command list. Fail-open."""
+    raw = (token or "").strip()
+    if not raw:
+        return {"ok": False, "skipped": True}
+    try:
+        resp = requests.post(
+            TELEGRAM_SET_COMMANDS.format(token=raw),
+            json={"commands": BOT_MENU},
+            timeout=12,
+        )
+        data = resp.json() if resp.content else {}
+        if not isinstance(data, dict):
+            return {"ok": False, "error": "setMyCommands returned a non-object"}
+        if not data.get("ok"):
+            print(
+                f"[TELEGRAM ERROR] setMyCommands: {data.get('description') or data}",
+                flush=True,
+            )
+            return {"ok": False, "error": str(data.get("description") or "setMyCommands failed")}
+        return {"ok": True, "commands": [row["command"] for row in BOT_MENU]}
+    except Exception as exc:
+        print(f"[TELEGRAM ERROR] setMyCommands: {exc}", flush=True)
+        return {"ok": False, "error": str(exc)}
 
 
 def _safe_px(*values: Any) -> float:

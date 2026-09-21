@@ -21,6 +21,7 @@ from connectors.bitget_paper import (
 from core.llm import (
     API_QUOTA_VETO,
     API_TIMEOUT_VETO,
+    LLM_MAX_TOKENS,
     LLM_TIMEOUT_S,
     QwenCortex,
     _parse_json,
@@ -171,8 +172,9 @@ class QwenTimeoutTests(unittest.TestCase):
             _run_with_timeout(hang, timeout=0.25, label="qwen:test")
         self.assertLess(time.perf_counter() - t0, 2.0)
 
-    def test_timeout_is_forty_five_seconds(self) -> None:
-        self.assertEqual(LLM_TIMEOUT_S, 45)
+    def test_timeout_is_ninety_seconds(self) -> None:
+        self.assertEqual(LLM_TIMEOUT_S, 90)
+        self.assertEqual(LLM_MAX_TOKENS, 8192)
 
     def test_timeout_fallback_is_veto(self) -> None:
         out = _timeout_fallback(

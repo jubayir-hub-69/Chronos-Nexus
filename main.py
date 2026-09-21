@@ -50,6 +50,7 @@ from core.memory import (
     DAILY_RISK_PCT,
     DAILY_WIN_STREAK,
     BoardMemory,
+    build_engine_snapshot,
 )
 from core.positions import (
     PositionDesk,
@@ -63,7 +64,7 @@ from utils.commands import CommandDesk, TelegramCommandLoop, TerminalCommandLoop
 from utils.notifier import TelegramNotifier, send_startup_message
 
 LIVE_TRADING_ENABLED = False
-VERSION = "1.0.0-nexus"
+VERSION = "1.2.0-pro"
 HACKATHON = "Bitget AI Base Camp Hackathon S2"
 CYCLE_INTERVAL_SEC = 3600
 CYCLE_ERROR_BACKOFF_SEC = 300
@@ -263,6 +264,29 @@ def _dispatch_alerts(
                 spread=spread,
                 rsi=rsi_s,
             )
+    except Exception:
+        return
+
+
+def _persist_engine_snapshot(
+    memory: BoardMemory,
+    brief: AnalystBrief,
+    risk: RiskReport,
+    decision: BoardDecision,
+    order: dict[str, Any] | None = None,
+) -> None:
+    """Write the live ORACLE/SENTINEL/CHAIRMAN state so /status is never a dummy."""
+    try:
+        memory.record_snapshot(
+            build_engine_snapshot(
+                news_context=list(brief.wire_headlines or []),
+                brief=brief.model_dump(),
+                risk=risk.model_dump(),
+                decision=decision.model_dump(),
+                result=order or {},
+                daily=memory.daily_state(),
+            )
+        )
     except Exception:
         return
 
@@ -757,12 +781,14 @@ def _run_trading_cycle(
             ),
             model=risk.model or brief.model,
         )
+        stub_order = {"ok": False, "status": "VETOED" if stub.consensus == "VETOED" else "STAND_DOWN"}
+        _persist_engine_snapshot(memory, brief, risk, stub, stub_order)
         _dispatch_alerts(
             notifier,
             brief,
             risk,
             stub,
-            {"ok": False, "status": "VETOED" if stub.consensus == "VETOED" else "STAND_DOWN"},
+            stub_order,
             None,
             session=clock["line"],
         )
@@ -877,6 +903,8 @@ def _run_trading_cycle(
             desk.record_open(order, brief)
         except Exception:
             pass
+
+    _persist_engine_snapshot(memory, brief, risk, decision, order)
 
     _dispatch_alerts(
         notifier, brief, risk, decision, order, attestation, session=clock["line"]
@@ -1079,12 +1107,14 @@ def _main() -> int:
     )
     table.add_row(
         "Telegram Commands",
-        "/positions /close /closeall + Spot chatbox" if notifier.enabled and bitget is not None else "disarmed",
+        "/positions /close /closeall /price /balance /pnl /status + Spot chatbox"
+        if notifier.enabled and bitget is not None
+        else "disarmed",
         status_dot(notifier.enabled and bitget is not None, label_ok="ARMED", label_bad="OFF"),
     )
     table.add_row(
         "Terminal Commands",
-        "nexus> /positions /close /closeall /help",
+        "nexus> /positions /close /closeall /pnl /status /help",
         status_dot(True, label_ok="ARMED", label_bad="OFF"),
     )
     table.add_row("Position Desk", "SL/TP · trail · thesis close", status_dot(True))
@@ -1099,6 +1129,7 @@ def _main() -> int:
         bitget,
         desk,
         on_close=lambda result: _emit_desk_actions(notifier, [result]),
+        memory=memory,
     )
     TelegramCommandLoop(notifier, command_desk).start()
     TerminalCommandLoop(command_desk, printer=lambda msg: console.print(msg)).start()
@@ -1116,7 +1147,7 @@ def _main() -> int:
             )
             console.print(
                 f"  [dim]Hourly daemon — next cycle in {CYCLE_INTERVAL_SEC}s. "
-                "Type /positions /close /closeall at nexus>.[/]"
+                "Type /positions /close /pnl /status at nexus>.[/]"
             )
             time.sleep(CYCLE_INTERVAL_SEC)
         except KeyboardInterrupt:
