@@ -21,6 +21,8 @@ Models
     + 0.16·book + 0.10·extension + 0.06·conviction
   Score < 75 → VETO. Unmeasured HTF skips the 75% rail (same fail-open as RSI)
   so daily limits, RSI, spread, Spot chatbox, and Telegram buttons stay intact.
+  Neutral wire or a quiet US cash session (pre-market, overnight, weekend,
+  after-hours) with 24h quote volume ≥ 250k USDT may clear at 70 instead.
 """
 
 from __future__ import annotations
@@ -38,6 +40,9 @@ VETO_REASON_CANDLE = "VETO: Candle structure contradicts news thesis"
 VETO_REASON_CHOP = "VETO: Choppy/downtrending tape — daily capital halt"
 SCALE_OUT_PCT = 0.25  # first partial TP at +25% PnL (patience; 25–30% window)
 SETUP_THRESHOLD = 75.0
+# Neutral wire / pre-market: strong 24h volume + clean TA may trade at 70.
+NEUTRAL_SETUP_THRESHOLD = 70.0
+STRONG_24H_VOLUME_USDT = 250_000.0
 MTF_FRAMES = ("15m", "1h", "4h")
 VETO_REASON_SETUP = "VETO: Setup confidence below 75 — wait for a cleaner TA tape"
 VETO_REASON_WALL = "VETO: Opposing order-book wall"
@@ -798,6 +803,63 @@ def detect_pullback(side: str, entry: dict[str, Any] | None, align: str) -> bool
     return False
 
 
+def cash_session_is_quiet(session: str | None) -> bool:
+    """US cash is not in the regular 09:30–16:00 ET session."""
+    blob = (session or "").upper()
+    return any(
+        token in blob
+        for token in ("PRE-MARKET", "OVERNIGHT", "WEEKEND", "AFTER-HOURS")
+    )
+
+
+def news_is_neutral(news: dict[str, Any] | None) -> bool:
+    """Unscored or mid-band wire. A conflicted tape is not neutral."""
+    payload = news if isinstance(news, dict) else {}
+    if payload.get("conflict"):
+        return False
+    if not payload.get("scored"):
+        return True
+    try:
+        sentiment = float(payload.get("sentiment") or 50.0)
+    except (TypeError, ValueError):
+        sentiment = 50.0
+    return 42.0 < sentiment < 58.0
+
+
+def strong_session_volume(volume_24h: Any) -> bool:
+    """True when the live ticker printed a real 24h quote volume above the floor."""
+    if volume_24h is None or volume_24h == "":
+        return False
+    try:
+        vol = float(volume_24h)
+    except (TypeError, ValueError):
+        return False
+    return vol >= STRONG_24H_VOLUME_USDT
+
+
+def neutral_lane_allows(
+    *,
+    score: Any,
+    volume_24h: Any,
+    news: dict[str, Any] | None,
+    session: str | None,
+) -> bool:
+    """70% TA is enough when 24h volume is strong and the session or wire is quiet.
+
+    Hard vetoes (MTF conflict, wall, fakeout, news fight) are decided before this
+    lane. Cash-session directional tapes keep the 75 rail.
+    """
+    try:
+        scored = float(score)
+    except (TypeError, ValueError):
+        return False
+    if scored < NEUTRAL_SETUP_THRESHOLD:
+        return False
+    if not strong_session_volume(volume_24h):
+        return False
+    return news_is_neutral(news) or cash_session_is_quiet(session)
+
+
 def setup_veto(
     *,
     side: str,
@@ -808,8 +870,10 @@ def setup_veto(
     conviction: int = 0,
     high_24h: float | None = None,
     low_24h: float | None = None,
+    volume_24h: float | None = None,
+    session: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """Hard rails + composite 0–100. Caller vetoes when reason or score < 75."""
+    """Hard rails + composite 0–100. Caller vetoes when reason is set."""
     from core.news import news_veto
 
     payload = frames if isinstance(frames, dict) else {}
@@ -850,8 +914,16 @@ def setup_veto(
         entry=entry,
     )
     measurable = align in {"ALIGNED", "MIXED", "CONFLICT"}
+    lane = False
     if not reason and measurable and scored["score"] < SETUP_THRESHOLD:
-        reason = VETO_REASON_SETUP
+        lane = neutral_lane_allows(
+            score=scored["score"],
+            volume_24h=volume_24h,
+            news=news,
+            session=session,
+        )
+        if not lane:
+            reason = VETO_REASON_SETUP
     scored.update(
         {
             "align": align,
@@ -859,8 +931,10 @@ def setup_veto(
             "fakeout": fakeout,
             "book": book_snap,
             "veto": reason,
-            "threshold": SETUP_THRESHOLD,
+            "threshold": NEUTRAL_SETUP_THRESHOLD if lane else SETUP_THRESHOLD,
             "measurable": measurable,
+            "neutral_lane": lane,
+            "volume_24h": volume_24h,
         }
     )
     return reason, scored

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import threading
 import time
@@ -10,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from core.config import PROJECT_ROOT
 from core.memory import BoardMemory, sentiment_label
@@ -39,8 +41,8 @@ BOT_MENU = [
     {"command": "positions", "description": "Live book + PnL"},
     {"command": "close", "description": "Market-close one symbol"},
     {"command": "closeall", "description": "Flatten the whole Demo book"},
-    {"command": "price", "description": "Live mainnet last / bid / ask"},
-    {"command": "balance", "description": "Wallet free + total for one asset"},
+    {"command": "price", "description": "Last, 24h high/low, volume, cap"},
+    {"command": "balance", "description": "Live ledger free / used / total"},
     {"command": "pnl", "description": "Today's realized PnL and daily limits"},
     {"command": "status", "description": "Live ORACLE / SENTINEL desk state"},
 ]
@@ -51,8 +53,8 @@ HELP_PLAIN = (
     "/positions          live book + PnL\n"
     "/close SYMBOL       market-close one name\n"
     "/closeall           flatten the whole Demo book\n"
-    "/price SYMBOL       live mainnet last / bid / ask\n"
-    "/balance SYMBOL     wallet free + total for one asset\n"
+    "/price SYMBOL       last, 24h high/low, volume, market cap\n"
+    "/balance SYMBOL     live ledger free / used / total\n"
     "/pnl                today's realized PnL, W/L, trades left\n"
     "/status             live ORACLE sentiment + SENTINEL desk\n"
     "NVDA/USDT BUY $10   Spot preview + confirm buttons\n"
@@ -65,8 +67,8 @@ HELP_HTML = (
     "<code>/positions</code> — live book + PnL\n"
     "<code>/close SYMBOL</code> — market-close one name\n"
     "<code>/closeall</code> — flatten the whole Demo book\n"
-    "<code>/price SYMBOL</code> — live Bitget mainnet last / bid / ask\n"
-    "<code>/balance SYMBOL</code> — wallet free + total for one asset\n"
+    "<code>/price SYMBOL</code> — last, 24h high/low, volume, market cap\n"
+    "<code>/balance SYMBOL</code> — live ledger free / used / total\n"
     "<code>/pnl</code> — today's realized PnL, win/loss, trades left\n"
     "<code>/status</code> — live ORACLE sentiment + SENTINEL desk\n"
     "<code>NVDA/USDT BUY $10</code> — Spot preview, then Confirm / Cancel\n"
@@ -216,26 +218,34 @@ class CommandDesk:
         plain_lines = ["OPEN POSITIONS"]
         html_lines = ["<b>CHRONOS-NEXUS</b>", "📊 <b>OPEN POSITIONS</b>", ""]
         for pos in book:
-            pnl_pct = float(pos.get("pnl_pct") or 0.0)
-            pnl_usdt = float(pos.get("pnl_usdt") or 0.0)
-            emoji = "GREEN" if pnl_pct >= 0 else "RED"
-            sign = "+" if pnl_pct >= 0 else ""
-            usd = "+" if pnl_usdt >= 0 else ""
+            pnl_pct = _opt_float(pos.get("pnl_pct"))
+            pnl_usdt = _opt_float(pos.get("pnl_usdt"))
             symbol = pos.get("symbol")
             side = str(pos.get("side") or "").upper()
+            entry_s = _fmt_px(pos.get("entry_price"))
+            mark_s = _fmt_px(pos.get("mark_price"))
+            if pnl_pct is None:
+                pnl_pct_s = "n/a"
+                pnl_usdt_s = "n/a" if pnl_usdt is None else _fmt_signed(pnl_usdt)
+                emoji = "MARK"
+                html_emoji = "⚪"
+            else:
+                emoji = "GREEN" if pnl_pct >= 0 else "RED"
+                html_emoji = "🟢" if pnl_pct >= 0 else "🔴"
+                pnl_pct_s = f"{_fmt_signed(pnl_pct)}%"
+                pnl_usdt_s = "n/a" if pnl_usdt is None else _fmt_signed(pnl_usdt)
             plain_lines.append(
                 f"{emoji} {symbol}  {side}  qty={pos.get('contracts')}  "
-                f"entry={pos.get('entry_price')}  mark={pos.get('mark_price')}  "
-                f"PnL {sign}{pnl_pct:.2f}%  {usd}{pnl_usdt:.2f} USDT"
+                f"entry={entry_s}  mark={mark_s}  "
+                f"PnL {pnl_pct_s}  {pnl_usdt_s} USDT"
             )
-            html_emoji = "🟢" if pnl_pct >= 0 else "🔴"
             html_lines.append(
                 f"{html_emoji} <code>{symbol}</code>  {side}\n"
                 f"qty <code>{pos.get('contracts')}</code>  "
-                f"entry <code>{pos.get('entry_price')}</code>  "
-                f"mark <code>{pos.get('mark_price')}</code>\n"
-                f"PnL <b>{sign}{pnl_pct:.2f}%</b>  "
-                f"<b>{usd}{pnl_usdt:.2f} USDT</b>"
+                f"entry <code>{entry_s}</code>  "
+                f"mark <code>{mark_s}</code>\n"
+                f"PnL <b>{pnl_pct_s}</b>  "
+                f"<b>{pnl_usdt_s} USDT</b>"
             )
             html_lines.append("")
         return CommandResult(
@@ -279,10 +289,24 @@ class CommandDesk:
         bid = _safe_px(quote.get("bid"))
         ask = _safe_px(quote.get("ask"))
         mark = _safe_px(quote.get("mark"))
+        high = _metric(quote.get("high"))
+        low = _metric(quote.get("low"))
+        volume = _metric(quote.get("volume_24h"))
         source = str(quote.get("source") or "bitget.mainnet")
+        cap_px = _safe_px(quote.get("market_cap"))
+        if cap_px > 0:
+            cap_label = "market cap"
+            cap_value = _metric(quote.get("market_cap"))
+        else:
+            cap_label = "notional liquidity"
+            cap_value = _metric(quote.get("notional_liquidity"))
         plain = (
             f"LIVE PRICE  {symbol}\n"
             f"last {last}\n"
+            f"24h high {high}\n"
+            f"24h low {low}\n"
+            f"24h volume {volume}\n"
+            f"{cap_label} {cap_value}\n"
             f"bid  {bid if bid > 0 else 'n/a'}\n"
             f"ask  {ask if ask > 0 else 'n/a'}\n"
             f"feed {source}"
@@ -293,6 +317,10 @@ class CommandDesk:
             "",
             f"<b>Symbol:</b> <code>{symbol}</code>",
             f"<b>Last:</b> <code>{last}</code>",
+            f"<b>24h High:</b> <code>{high}</code>",
+            f"<b>24h Low:</b> <code>{low}</code>",
+            f"<b>24h Volume:</b> <code>{volume}</code>",
+            f"<b>{cap_label.title()}:</b> <code>{cap_value}</code>",
             f"<b>Bid:</b> <code>{bid if bid > 0 else 'n/a'}</code>",
             f"<b>Ask:</b> <code>{ask if ask > 0 else 'n/a'}</code>",
         ]
@@ -315,7 +343,12 @@ class CommandDesk:
         except Exception as exc:
             msg = f"Wallet lookup failed: {exc}"
             return CommandResult("balance", False, msg, f"<b>Wallet lookup failed</b>\n{exc}", [])
+        if payload.get("ok") is False:
+            err = str(payload.get("error") or "Bitget ledger unavailable")
+            msg = f"Wallet lookup failed: {err}"
+            return CommandResult("balance", False, msg, f"<b>Wallet lookup failed</b>\n{escape_html(err)}", [])
         free = _amt0(payload.get("free"))
+        used = _amt0(payload.get("used"))
         total = _amt0(payload.get("total"))
         found = bool(payload.get("found"))
         if not found or (free <= 0 and total <= 0):
@@ -328,13 +361,22 @@ class CommandDesk:
                 [],
             )
         label = str(payload.get("coin") or coin).upper()
-        plain = f"{label}\nfree  {free:.8f}\ntotal {total:.8f}"
+        source = str(payload.get("source") or "bitget.fetch_balance")
+        plain = (
+            f"{label}\n"
+            f"free  {free:.8f}\n"
+            f"used  {used:.8f}\n"
+            f"total {total:.8f}\n"
+            f"ledger {source}"
+        )
         html = "\n".join(
             [
                 "<b>CHRONOS-NEXUS</b>",
                 f"<code>{label}</code>",
                 f"free <code>{free:.8f}</code>",
+                f"used <code>{used:.8f}</code>",
                 f"total <code>{total:.8f}</code>",
+                f"ledger <code>{escape_html(source)}</code>",
             ]
         )
         return CommandResult("balance", True, plain, html, [])
@@ -622,6 +664,9 @@ class CommandDesk:
         )
         result["kind"] = "MANUAL"
         result["reason"] = tag
+        if result.get("ok") and str(result.get("status") or "") == "DUST":
+            msg = f"DUST {match.get('symbol')} — below 1 USDT minimum, not sent"
+            return CommandResult("close", True, msg, f"<b>{msg}</b>", [result])
         if result.get("ok"):
             self.desk.drop(str(match.get("symbol")), str(match.get("side") or ""))
             if self.on_close:
@@ -657,14 +702,30 @@ class CommandDesk:
         for result in results:
             result["kind"] = "MANUAL"
             result["reason"] = result.get("reason") or tag
-            if result.get("ok"):
+            if result.get("ok") and str(result.get("status") or "") == "DUST":
+                line = (
+                    f"DUST {result.get('symbol')} — below 1 USDT minimum, not sent"
+                )
+                lines.append(line)
+                html_lines.append(f"<b>{line}</b>")
+                closes.append(result)
+                continue
+            status = str(result.get("status") or "")
+            if result.get("ok") and status == "CLOSED":
                 self.desk.drop(str(result.get("symbol") or ""), str(result.get("side") or ""))
                 if self.on_close:
                     self.on_close(result)
                 line = (
                     f"CLOSED {result.get('symbol')}  "
-                    f"{float(result.get('pnl_pct') or 0.0):+.2f}%  "
-                    f"{float(result.get('pnl_usdt') or 0.0):+.2f} USDT"
+                    f"{_fmt_signed(float(result.get('pnl_pct') or 0.0))}%  "
+                    f"{_fmt_signed(float(result.get('pnl_usdt') or 0.0))} USDT"
+                )
+                lines.append(line)
+                html_lines.append(f"<b>{line}</b>")
+            elif result.get("ok") and status == "PARTIAL":
+                line = (
+                    f"PARTIAL {result.get('symbol')} — still open "
+                    f"qty={result.get('remaining')}"
                 )
                 lines.append(line)
                 html_lines.append(f"<b>{line}</b>")
@@ -689,6 +750,10 @@ class TelegramCommandLoop:
         self.commands = commands
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._http = requests.Session()
+        adapter = HTTPAdapter(max_retries=0)
+        self._http.mount("https://", adapter)
+        self._http.mount("http://", adapter)
 
     def start(self) -> None:
         if not self.notifier.enabled:
@@ -718,10 +783,16 @@ class TelegramCommandLoop:
                 if offset:
                     _save_offset(offset)
                 for update in updates:
-                    self._handle(update)
+                    try:
+                        self._handle(update)
+                    except Exception as exc:
+                        print(
+                            f"[TELEGRAM] update skipped — {_telegram_fault(exc)}",
+                            flush=True,
+                        )
             except Exception as exc:
-                print(f"[TELEGRAM ERROR] command loop: {exc}", flush=True)
-                time.sleep(3.0)
+                print(f"[TELEGRAM] command loop retry — {_telegram_fault(exc)}", flush=True)
+                time.sleep(2.0)
 
     def _poll(self, offset: int) -> tuple[list[dict[str, Any]], int]:
         params: dict[str, Any] = {
@@ -730,11 +801,15 @@ class TelegramCommandLoop:
         }
         if offset:
             params["offset"] = offset
-        resp = requests.get(
-            TELEGRAM_UPDATES.format(token=self.notifier.token),
-            params=params,
-            timeout=30,
-        )
+        # Connect fails fast. Read stays above the 20s long-poll.
+        try:
+            resp = self._http.get(
+                TELEGRAM_UPDATES.format(token=self.notifier.token),
+                params=params,
+                timeout=(5, 25),
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(_telegram_fault(exc)) from exc
         data = resp.json() if resp.content else {}
         if not data.get("ok"):
             raise RuntimeError(str(data.get("description") or "getUpdates failed"))
@@ -1098,6 +1173,55 @@ def register_bot_menu(token: str) -> dict[str, Any]:
     except Exception as exc:
         print(f"[TELEGRAM ERROR] setMyCommands: {exc}", flush=True)
         return {"ok": False, "error": str(exc)}
+
+
+def _telegram_fault(exc: BaseException) -> str:
+    """Short fault line. Never includes the bot token or the request URL."""
+    text = str(exc or "")
+    lowered = text.lower()
+    if "timed out" in lowered or "timeout" in lowered or "connecttimeout" in lowered:
+        return "connection to api.telegram.org timed out"
+    if "max retries" in lowered or "failed to establish" in lowered:
+        return "connection to api.telegram.org failed"
+    text = re.sub(r"/bot\d+:[A-Za-z0-9_-]+", "/bot…", text)
+    return text[:180]
+
+
+def _opt_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed or parsed in {float("inf"), float("-inf")}:
+        return None
+    return parsed
+
+
+def _fmt_signed(value: float) -> str:
+    """Two decimals for a normal print. Four when a tick would otherwise show as 0.00."""
+    if abs(value) >= 0.01:
+        return f"{value:+.2f}"
+    return f"{value:+.4f}"
+
+
+def _fmt_px(value: Any) -> str:
+    parsed = _opt_float(value)
+    if parsed is None or parsed <= 0:
+        return "n/a"
+    return f"{parsed:.8f}".rstrip("0").rstrip(".")
+
+
+def _metric(value: Any) -> str:
+    """Live ticker figure, or n/a when the venue did not send one."""
+    px = _safe_px(value)
+    if px <= 0:
+        return "n/a"
+    if px >= 100:
+        return f"{px:,.2f}"
+    text = f"{px:.8f}".rstrip("0").rstrip(".")
+    return text or "n/a"
 
 
 def _safe_px(*values: Any) -> float:

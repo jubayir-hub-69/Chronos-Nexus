@@ -66,8 +66,12 @@ _NO_RETRY_TOKENS = (
     "25202",
     "45113",
     "45112",
+    "45110",
     "45104",
     "45103",
+    "40404",
+    "request url not found",
+    "less than the minimum amount",
     "maximum order value",
     "maximum order quantity",
 )

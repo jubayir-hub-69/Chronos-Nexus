@@ -60,6 +60,25 @@ class PositionDesk:
                 row["margin_usdt"] = meta["margin_usdt"]
             if meta.get("sl_margin_frac") is not None:
                 row["sl_margin_frac"] = meta["sl_margin_frac"]
+            restored_entry = False
+            if row.get("entry_price") in (None, "", 0, 0.0) and meta.get("entry_price"):
+                row["entry_price"] = meta["entry_price"]
+                restored_entry = True
+            if restored_entry:
+                entry = row.get("entry_price")
+                mark = row.get("mark_price")
+                try:
+                    entry_f = float(entry) if entry not in (None, "") else 0.0
+                    mark_f = float(mark) if mark not in (None, "") else 0.0
+                    qty_f = abs(float(row.get("contracts") or 0.0))
+                except (TypeError, ValueError):
+                    entry_f = mark_f = qty_f = 0.0
+                if entry_f > 0 and mark_f > 0 and qty_f > 0:
+                    pnl_usdt, pnl_pct = unrealized_pnl(
+                        entry_f, mark_f, qty_f, str(row.get("side") or "buy")
+                    )
+                    row["pnl_usdt"] = pnl_usdt
+                    row["pnl_pct"] = pnl_pct
         return live
 
     def record_open(self, order: dict[str, Any], brief: AnalystBrief | None = None) -> None:

@@ -59,12 +59,13 @@ from core.positions import (
     strip_occupied_universe,
 )
 from core.schemas import AnalystBrief, BoardDecision, RiskReport
+from core.neutral_lane import seek_neutral_candidate
 from core.ta import RSI_PERIOD, SCALE_OUT_PCT, bbo_peg_price, candle_veto, confluence_veto, rsi_zone
 from utils.commands import CommandDesk, TelegramCommandLoop, TerminalCommandLoop
 from utils.notifier import TelegramNotifier, send_startup_message
 
 LIVE_TRADING_ENABLED = False
-VERSION = "1.2.0-pro"
+VERSION = "1.3.0-desk"
 HACKATHON = "Bitget AI Base Camp Hackathon S2"
 CYCLE_INTERVAL_SEC = 3600
 CYCLE_ERROR_BACKOFF_SEC = 300
@@ -478,6 +479,39 @@ def _run_trading_cycle(
     for flag in detect_stay_away(triggers, universe):
         if flag not in brief.stay_away:
             brief.stay_away.append(flag)
+    if idle and bitget is not None and not brief.llm_degraded:
+        try:
+            pick = seek_neutral_candidate(
+                bitget,
+                entry_universe,
+                news={
+                    "scored": bool(brief.wire_headlines)
+                    or bool(brief.news_conflict)
+                    or abs(float(brief.sentiment_score or 50.0) - 50.0) > 0.5,
+                    "sentiment": brief.sentiment_score,
+                    "credibility": brief.news_credibility,
+                    "conflict": brief.news_conflict,
+                    "impact": brief.news_impact,
+                },
+                session=clock["session"],
+                stay_away=list(brief.stay_away),
+            )
+        except Exception as exc:
+            pick = None
+            console.print(f"[bold yellow]NEUTRAL LANE skipped:[/] {exc}")
+        if pick and str(pick.get("side") or "") in {"buy", "sell"}:
+            idle = False
+            target = str(pick["symbol"])
+            brief.primary_symbol = target
+            brief.side = pick["side"]  # type: ignore[assignment]
+            brief.conviction = int(pick["conviction"])
+            brief.thesis = str(pick["thesis"])
+            brief.selection_reason = str(pick["reason"])
+            brief.rationale = str(pick["reason"])
+            console.print(
+                f"[bold green]NEUTRAL LANE[/]  {target}  {pick['side']}  "
+                f"setup={pick['score']}  vol24h={pick['volume_24h']}"
+            )
 
     notifier.alert_news_analysis(
         headlines=list(brief.wire_headlines or [t.headline for t in triggers]),

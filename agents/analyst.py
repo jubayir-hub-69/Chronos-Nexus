@@ -117,7 +117,11 @@ Primary edge is TECHNICAL, not a news essay:
 - News is CONTEXT. A slightly mixed wire is not a reason to sit out if a
   listed name maps cleanly. Toxic tape (fraud, crash, lawsuit) is stay_away.
 - SENTINEL's Python rail requires a 75+ TA setup (volume + candles + book +
-  MTF). You pick the name; SENTINEL confirms the tape.
+  MTF) during the regular US cash session. On a NEUTRAL wire, or when the
+  session clock says PRE-MARKET, OVERNIGHT, WEEKEND, or AFTER-HOURS, a listed
+  name with strong 24h volume and a clean TA score of 70+ is a valid paper
+  trade. Do not emit NONE for the whole quiet session when that tape exists.
+  You pick the name; SENTINEL confirms the tape.
 
 Rules:
 - Headlines are LIVE RSS. Never invent facts that are not in the wire.

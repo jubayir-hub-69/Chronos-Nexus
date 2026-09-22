@@ -6,7 +6,9 @@ import unittest
 
 from connectors.bitget_paper import _book_payload
 from core.news import conviction_score, score_headline, score_wire
+from core.neutral_lane import seek_neutral_candidate
 from core.ta import (
+    NEUTRAL_SETUP_THRESHOLD,
     SETUP_THRESHOLD,
     VETO_REASON_MTF,
     VETO_REASON_SETUP,
@@ -218,6 +220,133 @@ class SetupThresholdTests(unittest.TestCase):
             conviction=88,
         )
         self.assertEqual(reason, VETO_REASON_WALL)
+
+    def _mixed_quiet_frames(self) -> dict:
+        return {
+            "15m": _frame(structure="RANGE", bias="bullish", rsi=52.0, rvol=1.6),
+            "1h": _frame(structure="UPTREND", bias="bullish", rsi=55.0, rvol=1.6),
+            "4h": _frame(structure="RANGE", bias="neutral", rsi=50.0, rvol=1.0),
+        }
+
+    def _flat_book(self) -> dict:
+        return _book_payload(
+            "AAPL/USDT:USDT",
+            [[99.9, 2.0]],
+            [[100.1, 2.0]],
+            ok=True,
+            source="l2",
+            error=None,
+        )
+
+    def test_neutral_premarket_strong_volume_clears_at_70(self) -> None:
+        frames = self._mixed_quiet_frames()
+        book = self._flat_book()
+        blocked, blocked_score = setup_veto(
+            side="buy",
+            frames=frames,
+            book=book,
+            last=100.0,
+            news={"scored": False, "sentiment": 50.0},
+            conviction=0,
+        )
+        self.assertEqual(blocked, VETO_REASON_SETUP)
+        self.assertGreaterEqual(blocked_score["score"], NEUTRAL_SETUP_THRESHOLD)
+        self.assertLess(blocked_score["score"], SETUP_THRESHOLD)
+        reason, scored = setup_veto(
+            side="buy",
+            frames=frames,
+            book=book,
+            last=100.0,
+            news={"scored": False, "sentiment": 50.0},
+            conviction=0,
+            volume_24h=1_500_000.0,
+            session="PRE-MARKET — US cash not yet open",
+        )
+        self.assertEqual(reason, "")
+        self.assertTrue(scored["neutral_lane"])
+        self.assertGreaterEqual(scored["score"], NEUTRAL_SETUP_THRESHOLD)
+        self.assertLess(scored["score"], SETUP_THRESHOLD)
+
+    def test_thin_volume_keeps_75_rail(self) -> None:
+        reason, scored = setup_veto(
+            side="buy",
+            frames=self._mixed_quiet_frames(),
+            book=self._flat_book(),
+            last=100.0,
+            news={"scored": False, "sentiment": 50.0},
+            conviction=0,
+            volume_24h=50_000.0,
+            session="PRE-MARKET — US cash not yet open",
+        )
+        self.assertGreaterEqual(scored["score"], NEUTRAL_SETUP_THRESHOLD)
+        self.assertLess(scored["score"], SETUP_THRESHOLD)
+        self.assertEqual(reason, VETO_REASON_SETUP)
+        self.assertFalse(scored["neutral_lane"])
+
+    def test_premarket_conflict_still_vetoes(self) -> None:
+        frames = _aligned_frames()
+        frames["4h"] = _frame(structure="DOWNTREND", bias="bearish")
+        reason, scored = setup_veto(
+            side="buy",
+            frames=frames,
+            book=_bid_heavy_book(),
+            last=100.0,
+            news={"scored": False, "sentiment": 50.0},
+            conviction=0,
+            volume_24h=5_000_000.0,
+            session="PRE-MARKET — US cash not yet open",
+        )
+        self.assertEqual(reason, VETO_REASON_MTF)
+        self.assertEqual(scored["align"], "CONFLICT")
+
+
+class NeutralScanTests(unittest.TestCase):
+    def test_seek_promotes_liquid_tape_and_skips_stay_away(self) -> None:
+        class _Bitget:
+            def fetch_fundamentals(self, symbol: str) -> dict:
+                vol = 80_000.0 if "NVDA" in symbol else 2_000_000.0
+                return {"ok": True, "volume_24h_usdt": vol, "price": 100.0}
+
+            def fetch_mtf_bundle(self, symbol: str) -> dict:
+                del symbol
+                up = _frame(structure="UPTREND", bias="bullish", rsi=52.0, rvol=1.7)
+                return {"ok": True, "frames": {"15m": up, "1h": up, "4h": up}, **up}
+
+            def fetch_order_book(self, symbol: str) -> dict:
+                return _bid_heavy_book()
+
+            def fetch_ticker(self, symbol: str) -> dict:
+                del symbol
+                return {"last": 100.0, "high": 104.0, "low": 96.0, "quoteVolume": 2_000_000.0}
+
+        pick = seek_neutral_candidate(
+            _Bitget(),
+            ["rNVDA/USDT:USDT", "rAAPL/USDT:USDT"],
+            news={"scored": False, "sentiment": 50.0},
+            session="PRE-MARKET — US cash not yet open",
+            stay_away=["NVDA — headline risk"],
+        )
+        self.assertIsNotNone(pick)
+        assert pick is not None
+        self.assertEqual(pick["symbol"], "rAAPL/USDT:USDT")
+        self.assertEqual(pick["side"], "buy")
+        self.assertGreaterEqual(pick["score"], NEUTRAL_SETUP_THRESHOLD)
+        self.assertGreaterEqual(pick["conviction"], 55)
+
+    def test_seek_stands_down_on_a_directional_cash_session(self) -> None:
+        class _Bitget:
+            def fetch_fundamentals(self, symbol: str) -> dict:
+                del symbol
+                raise AssertionError("cash-session scan must not hit the book")
+
+        pick = seek_neutral_candidate(
+            _Bitget(),
+            ["rAAPL/USDT:USDT"],
+            news={"scored": True, "sentiment": 74.0, "conflict": False},
+            session="US CASH OPEN (regular session 09:30–16:00 ET)",
+            stay_away=[],
+        )
+        self.assertIsNone(pick)
 
 
 if __name__ == "__main__":

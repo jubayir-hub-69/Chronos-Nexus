@@ -225,6 +225,71 @@ class PriceBalanceCommandTests(unittest.TestCase):
         self.assertIn("BGB/USDT", result.html)
         bitget.fetch_live_price.assert_called_once_with("BGB")
 
+    def test_price_prints_live_24h_metrics(self) -> None:
+        bitget = MagicMock()
+        bitget.fetch_live_price.return_value = {
+            "ok": True,
+            "symbol": "BGB/USDT",
+            "last": 4.21,
+            "bid": 4.20,
+            "ask": 4.22,
+            "mark": None,
+            "high": 4.55,
+            "low": 4.01,
+            "volume_24h": 1_250_000.0,
+            "market_cap": 890_000_000.0,
+            "notional_liquidity": None,
+            "source": "bitget.mainnet",
+        }
+        desk = CommandDesk(bitget, PositionDesk())
+        result = desk.handle("/price BGB", source="telegram")
+        self.assertTrue(result.ok)
+        self.assertIn("4.21", result.plain)
+        self.assertIn("4.55", result.plain)
+        self.assertIn("4.01", result.plain)
+        self.assertIn("1,250,000.00", result.plain)
+        self.assertIn("market cap", result.plain)
+        self.assertIn("890,000,000.00", result.html)
+
+    def test_price_uses_notional_liquidity_when_cap_is_absent(self) -> None:
+        bitget = MagicMock()
+        bitget.fetch_live_price.return_value = {
+            "ok": True,
+            "symbol": "rNVDA/USDT:USDT",
+            "last": 180.5,
+            "bid": 180.4,
+            "ask": 180.6,
+            "high": 182.0,
+            "low": 176.2,
+            "volume_24h": 4_200_000.0,
+            "market_cap": None,
+            "notional_liquidity": 250_000.0,
+            "source": "bitget.mainnet",
+        }
+        desk = CommandDesk(bitget, PositionDesk())
+        result = desk.handle("/price NVDA", source="telegram")
+        self.assertTrue(result.ok)
+        self.assertIn("notional liquidity", result.plain)
+        self.assertIn("250,000.00", result.plain)
+        self.assertNotIn("market cap", result.plain)
+
+    def test_balance_ledger_error_is_not_a_fake_zero(self) -> None:
+        bitget = MagicMock()
+        bitget.fetch_asset_balance.return_value = {
+            "ok": False,
+            "coin": "USDT",
+            "free": 0.0,
+            "used": 0.0,
+            "total": 0.0,
+            "found": False,
+            "error": "spot:timeout | swap:timeout",
+        }
+        desk = CommandDesk(bitget, PositionDesk())
+        result = desk.handle("/balance USDT", source="telegram")
+        self.assertFalse(result.ok)
+        self.assertIn("timeout", result.plain)
+        self.assertNotIn("0.00 USDT found", result.plain)
+
     def test_price_requires_symbol(self) -> None:
         desk = CommandDesk(MagicMock(), PositionDesk())
         result = desk.handle("/price", source="telegram")
@@ -293,12 +358,42 @@ class PriceBalanceCommandTests(unittest.TestCase):
         }
         bgb = conn.fetch_asset_balance("bgb")
         self.assertTrue(bgb["found"])
-        self.assertEqual(bgb["free"], 6.0)  # spot+swap mocked same payload twice
+        self.assertEqual(bgb["free"], 3.0)  # identical spot+swap snapshot is one wallet
         nvda = conn.fetch_asset_balance("rnvda")
         self.assertTrue(nvda["found"])
         missing = conn.fetch_asset_balance("DOGE")
         self.assertFalse(missing["found"])
         self.assertEqual(missing["free"], 0.0)
+
+    def test_fetch_asset_balance_sums_distinct_wallets(self) -> None:
+        conn = BitgetPaperConnector.__new__(BitgetPaperConnector)
+        books = {
+            "spot": {
+                "free": {"BGB": 1.0},
+                "used": {"BGB": 0.25},
+                "total": {"BGB": 1.25},
+            },
+            "swap": {
+                "free": {"BGB": 2.0},
+                "used": {"BGB": 0.0},
+                "total": {"BGB": 2.0},
+            },
+        }
+
+        def _ccxt(fn, label=""):
+            del label
+            return fn()
+
+        conn._ccxt = _ccxt  # type: ignore[method-assign]
+        conn.exchange = MagicMock()
+        conn.exchange.fetch_balance.side_effect = lambda params: books[params["type"]]
+        bgb = conn.fetch_asset_balance("BGB")
+        self.assertTrue(bgb["ok"])
+        self.assertEqual(bgb["free"], 3.0)
+        self.assertEqual(bgb["used"], 0.25)
+        self.assertEqual(bgb["total"], 3.25)
+        self.assertIn("spot", bgb["source"])
+        self.assertIn("swap", bgb["source"])
 
 
 class BgbFeeDeductTests(unittest.TestCase):
@@ -331,6 +426,34 @@ class BgbFeeDeductTests(unittest.TestCase):
             "POST",
             {"deduct": "on"},
         )
+
+    def test_demo_skips_uta_v3_that_404s(self) -> None:
+        conn = BitgetPaperConnector.__new__(BitgetPaperConnector)
+        conn.sandbox = True
+        conn.exchange = MagicMock()
+        conn.exchange.private_uta_post_v3_account_switch_deduct = MagicMock(
+            side_effect=RuntimeError('{"code":"40404","msg":"Request URL NOT FOUND"}')
+        )
+        conn.exchange.request = MagicMock(return_value={"code": "00000", "data": True})
+        out = conn._enable_bgb_fee_deduct()
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["deduct"], "on")
+        self.assertEqual(out["via"], "spot_v2")
+        conn.exchange.private_uta_post_v3_account_switch_deduct.assert_not_called()
+        self.assertNotIn("40404", str(out.get("error") or ""))
+
+    def test_uta_40404_falls_through_without_raw_body(self) -> None:
+        conn = BitgetPaperConnector.__new__(BitgetPaperConnector)
+        conn.sandbox = False
+        conn.exchange = MagicMock()
+        conn.exchange.private_uta_post_v3_account_switch_deduct = MagicMock(
+            side_effect=RuntimeError('bitget {"code":"40404","msg":"Request URL NOT FOUND"}')
+        )
+        conn.exchange.request = MagicMock(return_value={"code": "00000", "data": True})
+        out = conn._enable_bgb_fee_deduct()
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["via"], "spot_v2")
+        self.assertNotIn("40404", str(out.get("error") or ""))
 
     def test_fail_open_when_both_endpoints_reject(self) -> None:
         conn = BitgetPaperConnector.__new__(BitgetPaperConnector)

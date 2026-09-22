@@ -54,6 +54,9 @@ CLOSE_CHUNK_QTY_DEFAULT = 100.0
 CLOSE_CHUNK_NOTIONAL_USDT = 8000.0
 CLOSE_CHUNK_SLEEP_S = 0.5
 CLOSE_CHUNK_MAX_LOOPS = 40
+# Bitget 45110 = order notional under the 1 USDT minimum. A close chunk must
+# not leave a crumb below this, and a crumb that cannot be absorbed is dropped.
+MIN_CLOSE_NOTIONAL_USDT = 1.0
 _MAX_ORDER_CODES = ("45113", "45112", "45104", "45103", "25230", "25233", "25241")
 _MAX_ORDER_TOKS = (
     "maximum order value",
@@ -71,6 +74,38 @@ def _is_max_order_fault(exc: BaseException | str) -> bool:
     if any(code in blob for code in _MAX_ORDER_CODES):
         return True
     return any(tok in blob for tok in _MAX_ORDER_TOKS)
+
+
+def _is_min_notional_fault(exc: BaseException | str) -> bool:
+    """Bitget 45110 — order value is under the 1 USDT minimum."""
+    blob = str(exc or "").lower()
+    return "45110" in blob or "less than the minimum amount" in blob
+
+
+def _is_missing_route(exc: BaseException | str) -> bool:
+    """Bitget 40404 on a path this account (often Demo) does not serve."""
+    blob = str(exc or "").lower()
+    return "40404" in blob or "request url not found" in blob
+
+
+def _depth_notional(book: dict[str, Any] | None) -> float | None:
+    """Sum of visible bid and ask notionals. None when the book has no size."""
+    payload = book if isinstance(book, dict) else {}
+    total = 0.0
+    count = 0
+    for key in ("bids", "asks"):
+        for row in payload.get(key) or []:
+            try:
+                px = float(row[0])
+                sz = float(row[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if px > 0 and sz > 0:
+                total += px * sz
+                count += 1
+    if count <= 0 or total <= 0:
+        return None
+    return round(total, 4)
 # Bitget USDT-M taker + crossed-margin estimate when the Demo wallet delta is unavailable.
 TAKER_FEE_RATE = 0.0006
 SWAP_LEVERAGE = 5.0
@@ -470,22 +505,28 @@ class BitgetPaperConnector:
         }
 
     def _enable_bgb_fee_deduct(self) -> dict[str, Any]:
-        """Pay trading fees in BGB (Bitget native token) via the official switch.
+        """Pay trading fees in BGB via the account switch. Fail-open.
 
-        Account-level, not a per-order header: POST /api/v3/account/switch-deduct
-        (UTA) and POST /api/v2/spot/account/switch-deduct (classic spot).
-        Fail-open — Demo / missing UTA must never block the rail.
+        Live UTA: POST /api/v3/account/switch-deduct.
+        Classic / Demo: POST /api/v2/spot/account/switch-deduct.
+
+        Bitget Demo (PAPTRADING) answers the UTA v3 path with
+        {"code":"40404","msg":"Request URL NOT FOUND"}. That route is skipped
+        on the sandbox client so startup does not surface a dead URL. A 40404
+        from either path is a missing route, not a rail fault.
         """
         payload = {"deduct": "on"}
-        errors: list[str] = []
-        uta = getattr(self.exchange, "private_uta_post_v3_account_switch_deduct", None)
-        if callable(uta):
-            try:
-                uta(payload)
-                print("[BITGET] fee deduct in BGB armed (uta v3 switch-deduct)", flush=True)
-                return {"ok": True, "deduct": "on", "via": "uta_v3"}
-            except Exception as exc:
-                errors.append(f"uta_v3:{str(exc)[:120]}")
+        # Demo does not host /api/v3/account/switch-deduct.
+        if not bool(getattr(self, "sandbox", False)):
+            uta = getattr(self.exchange, "private_uta_post_v3_account_switch_deduct", None)
+            if callable(uta):
+                try:
+                    uta(payload)
+                    print("[BITGET] fee deduct in BGB armed (uta v3 switch-deduct)", flush=True)
+                    return {"ok": True, "deduct": "on", "via": "uta_v3"}
+                except Exception:
+                    # 40404 and any other UTA rejection fall through to classic spot.
+                    pass
         try:
             self.exchange.request(
                 "v2/spot/account/switch-deduct",
@@ -496,9 +537,11 @@ class BitgetPaperConnector:
             print("[BITGET] fee deduct in BGB armed (spot v2 switch-deduct)", flush=True)
             return {"ok": True, "deduct": "on", "via": "spot_v2"}
         except Exception as exc:
-            errors.append(f"spot_v2:{str(exc)[:120]}")
-        note = " | ".join(errors)[:240] if errors else "unsupported"
-        print(f"[BITGET] fee deduct in BGB skipped — {note}", flush=True)
+            if _is_missing_route(exc):
+                note = "switch-deduct route is not on this account"
+            else:
+                note = "switch-deduct unavailable"
+        print(f"[BITGET] fee deduct in BGB left off — {note}", flush=True)
         return {"ok": False, "deduct": "off", "via": None, "error": note}
 
     def discover_equity_universe(self, markets: dict[str, Any] | None = None) -> list[str]:
@@ -656,7 +699,13 @@ class BitgetPaperConnector:
         }
 
     def fetch_live_price(self, symbol: str) -> dict[str, Any]:
-        """Mainnet last/bid/ask for /price. Spot first, then any public listing."""
+        """Mainnet last plus 24h high/low/volume and cap or book liquidity.
+
+        Last/bid/ask stay on the mainnet BBO. High, low, and quote volume come
+        from the same CCXT ticker. Market cap is taken from ticker/market info
+        when the venue publishes one; otherwise the visible book notional is
+        returned as notional liquidity. Missing fields stay None.
+        """
         resolved = self.resolve_spot_symbol(symbol) or (symbol or "").strip()
         quote = self.fetch_bbo(resolved, side="buy")
         last = coerce_price(
@@ -666,6 +715,23 @@ class BitgetPaperConnector:
             quote.get("best_bid"),
             quote.get("mark"),
         )
+        high = _first_positive(quote.get("high"))
+        low = _first_positive(quote.get("low"))
+        volume = _first_positive(quote.get("quote_volume"))
+        mcap: float | None = None
+        try:
+            fund = self.fetch_fundamentals(resolved)
+        except Exception:
+            fund = {}
+        if isinstance(fund, dict):
+            mcap = _first_positive(fund.get("market_cap_usdt"))
+            if volume is None:
+                volume = _first_positive(fund.get("volume_24h_usdt"))
+            if high is None:
+                high = _first_positive(fund.get("high"))
+            if low is None:
+                low = _first_positive(fund.get("low"))
+        liquidity = _first_positive(quote.get("book_notional"))
         return {
             "ok": last > 0,
             "symbol": str(quote.get("public_symbol") or quote.get("symbol") or resolved),
@@ -673,6 +739,11 @@ class BitgetPaperConnector:
             "bid": quote.get("best_bid"),
             "ask": quote.get("best_ask"),
             "mark": quote.get("mark"),
+            "high": high,
+            "low": low,
+            "volume_24h": volume,
+            "market_cap": mcap,
+            "notional_liquidity": None if mcap is not None else liquidity,
             "source": quote.get("source") or "bitget.mainnet",
             "error": None if last > 0 else (quote.get("error") or f"No live mainnet price for {symbol}."),
         }
@@ -705,23 +776,28 @@ class BitgetPaperConnector:
         return {"ok": True, "assets": assets, "error": None}
 
     def fetch_asset_balance(self, coin: str) -> dict[str, Any]:
-        """Free/total for one asset across Spot + swap. Any CCXT coin key, case-insensitive."""
+        """Free/used/total for one asset from the live Bitget ledger.
+
+        Spot and swap are read separately. Identical snapshots (UTA reports the
+        same wallet on both types) are counted once so the figure is not doubled.
+        Distinct classic wallets are summed. No hardcoded balances.
+        """
         wanted = str(coin or "").strip()
         if not wanted:
             return {
                 "ok": False,
                 "coin": "",
                 "free": 0.0,
+                "used": 0.0,
                 "total": 0.0,
                 "found": False,
                 "error": "coin required",
             }
         wanted_u = wanted.upper()
-        free_sum = 0.0
-        total_sum = 0.0
         found = False
         matched = wanted_u
         errors: list[str] = []
+        legs: list[tuple[float, float, float, str]] = []
         for account_type in ("spot", "swap"):
             try:
                 raw = self._ccxt(
@@ -731,22 +807,54 @@ class BitgetPaperConnector:
             except Exception as exc:
                 errors.append(f"{account_type}:{str(exc)[:120]}")
                 continue
+            if not isinstance(raw, dict):
+                errors.append(f"{account_type}:empty ledger")
+                continue
             frees = raw.get("free") if isinstance(raw.get("free"), dict) else {}
             totals = raw.get("total") if isinstance(raw.get("total"), dict) else {}
-            keys = {str(k) for k in list(frees.keys()) + list(totals.keys())}
+            useds = raw.get("used") if isinstance(raw.get("used"), dict) else {}
+            keys = {str(k) for k in list(frees.keys()) + list(totals.keys()) + list(useds.keys())}
+            leg_free = 0.0
+            leg_total = 0.0
+            leg_used = 0.0
+            hit = False
             for key in keys:
                 if key.upper() != wanted_u:
                     continue
+                hit = True
                 found = True
                 matched = key
-                free_sum += _coin_amt(frees.get(key))
-                total_sum += _coin_amt(totals.get(key))
+                leg_free += _coin_amt(frees.get(key))
+                leg_total += _coin_amt(totals.get(key))
+                leg_used += _coin_amt(useds.get(key))
+            if not hit:
+                continue
+            if leg_used <= 0 and leg_total > leg_free:
+                leg_used = leg_total - leg_free
+            legs.append((leg_free, leg_total, leg_used, account_type))
+        unique: list[tuple[float, float, float, str]] = []
+        for leg in legs:
+            if any(
+                abs(leg[0] - prev[0]) <= 1e-8 and abs(leg[1] - prev[1]) <= 1e-8
+                for prev in unique
+            ):
+                continue
+            unique.append(leg)
+        free_sum = sum(leg[0] for leg in unique)
+        total_sum = sum(leg[1] for leg in unique)
+        used_sum = sum(leg[2] for leg in unique)
+        if used_sum <= 0 and total_sum > free_sum:
+            used_sum = total_sum - free_sum
+        sources = "+".join(leg[3] for leg in unique)
+        ledger_ok = bool(unique) or not errors
         return {
-            "ok": True if found or not errors else False,
+            "ok": ledger_ok,
             "coin": matched,
             "free": max(0.0, free_sum),
+            "used": max(0.0, used_sum),
             "total": max(0.0, total_sum),
             "found": found,
+            "source": sources or "bitget.fetch_balance",
             "error": " | ".join(errors)[:240] if errors and not found else None,
         }
 
@@ -1120,6 +1228,10 @@ class BitgetPaperConnector:
             "is_contract": is_contract,
             "spread_pct": book.get("spread_pct"),
             "mark_divergence_pct": div,
+            "high": _first_positive(ticker.get("high")),
+            "low": _first_positive(ticker.get("low")),
+            "quote_volume": _first_positive(ticker.get("quoteVolume")),
+            "book_notional": _depth_notional(book),
             "error": error,
         }
 
@@ -1151,7 +1263,9 @@ class BitgetPaperConnector:
                 "symbol": target,
                 "side": pos.get("side"),
                 "contracts": _position_contracts(pos),
-                "entry_price": pos.get("entryPrice") or pos.get("markPrice"),
+                "entry_price": position_entry_price(pos),
+                "mark_price": position_mark_price(pos),
+                "hedged": pos.get("hedged"),
                 "raw": _slim_position(pos),
                 "error": None,
             }
@@ -1724,8 +1838,26 @@ class BitgetPaperConnector:
             qty = self._size_amount(symbol, total, mark or 1.0)
         return qty, "ok"
 
+    def _min_order_notional(self, symbol: str) -> float:
+        """Bitget's 1 USDT floor, or the market cost.min when that is higher."""
+        floor = MIN_CLOSE_NOTIONAL_USDT
+        try:
+            market = self.exchange.market(symbol)
+            limits = market.get("limits") if isinstance(market.get("limits"), dict) else {}
+            cost_min = float((limits.get("cost") or {}).get("min") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            cost_min = 0.0
+        if cost_min > floor:
+            return cost_min
+        return floor
+
     def _close_chunk_qty(self, symbol: str, remaining: float, mark: float) -> float:
-        """Single-order slice under Bitget max qty / max notional (45113)."""
+        """One reduce slice under the max-order cap that does not leave <1 USDT.
+
+        A trailing crumb below the minimum is absorbed into this slice when the
+        venue caps allow it. A book that is itself under 1 USDT returns 0 so
+        the caller drops it instead of sending a 45110 order.
+        """
         try:
             left = max(0.0, float(remaining or 0.0))
         except (TypeError, ValueError):
@@ -1744,17 +1876,45 @@ class BitgetPaperConnector:
             min_amt = float((limits.get("amount") or {}).get("min") or 0.0)
         except (TypeError, ValueError, AttributeError):
             pass
+        min_notional = self._min_order_notional(symbol)
+
+        def _fit(amount: float) -> float:
+            sized_amt = self._size_amount(symbol, amount, px)
+            if sized_amt > left + 1e-9:
+                try:
+                    sized_amt = float(self.exchange.amount_to_precision(symbol, left))
+                except Exception:
+                    sized_amt = left
+            if sized_amt > left + 1e-9:
+                return 0.0
+            return max(0.0, sized_amt)
+
         caps = [left, CLOSE_CHUNK_QTY_DEFAULT, CLOSE_CHUNK_NOTIONAL_USDT / px]
         if max_amt > 0:
             caps.append(max_amt)
         if max_cost > 0:
             caps.append(max_cost / px)
         chunk = min(c for c in caps if c > 0)
-        sized = self._size_amount(symbol, chunk, px)
+        sized = _fit(chunk)
         if min_amt and sized < min_amt <= left:
-            sized = self._size_amount(symbol, min_amt, px)
-        if sized > left:
-            sized = self._size_amount(symbol, left, px)
+            sized = _fit(min_amt)
+        if px > 0 and sized > 0 and sized * px < min_notional - 1e-9:
+            need = min_notional / px
+            cost_cap = CLOSE_CHUNK_NOTIONAL_USDT if max_cost <= 0 else min(CLOSE_CHUNK_NOTIONAL_USDT, max_cost)
+            if need <= left + 1e-12 and (max_amt <= 0 or need <= max_amt + 1e-12) and need * px <= cost_cap + 1e-6:
+                sized = _fit(max(need, sized))
+            if sized <= 0 or sized * px < min_notional - 1e-9:
+                return 0.0
+        if px > 0 and 0 < sized < left - 1e-12:
+            crumb = left - sized
+            if crumb * px < min_notional - 1e-9:
+                cost_cap = CLOSE_CHUNK_NOTIONAL_USDT if max_cost <= 0 else min(CLOSE_CHUNK_NOTIONAL_USDT, max_cost)
+                within_amt = max_amt <= 0 or left <= max_amt + 1e-9
+                within_cost = left * px <= cost_cap + min_notional
+                if within_amt and within_cost:
+                    sized = _fit(left)
+        if px > 0 and 0 < sized * px < min_notional - 1e-9:
+            return 0.0
         return max(0.0, sized)
 
     def _submit_reduce_order(
@@ -1765,19 +1925,29 @@ class BitgetPaperConnector:
         param_sets: list[dict[str, Any]],
     ) -> dict[str, Any]:
         last_exc: Exception | None = None
-        for params in param_sets:
+        last_unconfirmed: dict[str, Any] | None = None
+        for raw in param_sets:
+            params = dict(raw)
+            side = str(params.pop("_order_side", "") or close_side)
             try:
-                return self._ccxt(
-                    lambda p=params: self.exchange.create_order(
-                        symbol, "market", close_side, qty, None, p
+                order = self._ccxt(
+                    lambda s=side, p=params: self.exchange.create_order(
+                        symbol, "market", s, qty, None, p
                     ),
                     label="bitget.close_market",
                 )
             except Exception as exc:
                 last_exc = exc
-                if _is_max_order_fault(exc):
+                if _is_max_order_fault(exc) or _is_min_notional_fault(exc):
                     raise
                 continue
+            parsed = order if isinstance(order, dict) else {"raw": order}
+            if _confirmed_fill_qty(parsed, qty) > 0:
+                return parsed
+            # Id-only ack. Try the next position mode before counting a fill.
+            last_unconfirmed = parsed
+        if last_unconfirmed is not None:
+            return last_unconfirmed
         raise last_exc or RuntimeError("close_market failed")
 
     def _reduce_until_flat(
@@ -1790,47 +1960,113 @@ class BitgetPaperConnector:
         *,
         fraction: float,
     ) -> tuple[dict[str, Any] | None, float, int]:
-        """Slice 45113-sized books. Loop until this close's qty is filled or the book is 0."""
+        """Slice 45113-sized books. A final crumb under 1 USDT is dropped, not errored."""
         remaining = max(0.0, float(target_qty or 0.0))
         filled = 0.0
         last_order: dict[str, Any] | None = None
-        chunk = self._close_chunk_qty(symbol, remaining, mark)
+        px = mark if mark and mark > 0 else 1.0
+        min_notional = self._min_order_notional(symbol)
+        chunk = self._close_chunk_qty(symbol, remaining, px)
         loops = 0
         while remaining > 1e-9 and loops < CLOSE_CHUNK_MAX_LOOPS:
             loops += 1
-            this = min(remaining, chunk) if chunk > 0 else remaining
-            this = self._size_amount(symbol, this, mark or 1.0)
-            if this <= 0:
+            this = min(remaining, chunk) if chunk > 0 else 0.0
+            if this > 0:
+                this = self._size_amount(symbol, this, px)
+                if this > remaining + 1e-9:
+                    try:
+                        this = float(self.exchange.amount_to_precision(symbol, remaining))
+                    except Exception:
+                        this = remaining
+            if this <= 0 or (px > 0 and this * px < min_notional - 1e-9):
+                if last_order is None:
+                    last_order = {"id": None, "dust": True, "status": "dust"}
+                remaining = 0.0
                 break
-            try:
-                order = self._submit_reduce_order(symbol, close_side, this, param_sets)
-            except Exception as exc:
-                if not _is_max_order_fault(exc):
-                    raise
-                halved = self._size_amount(symbol, this / 2.0, mark or 1.0)
+            order = None
+            got = 0.0
+            reject: Exception | None = None
+            for params in param_sets or [{}]:
+                try:
+                    order = self._submit_reduce_order(symbol, close_side, this, [params])
+                except Exception as exc:
+                    if _is_min_notional_fault(exc) or _is_max_order_fault(exc):
+                        reject = exc
+                        break
+                    continue
+                parsed = order if isinstance(order, dict) else {"raw": order}
+                got = _confirmed_fill_qty(parsed, this)
+                if got <= 0 and fraction >= 0.999:
+                    live_qty, known = self._read_open_qty(symbol)
+                    if known and live_qty + 1e-8 < remaining:
+                        got = remaining - live_qty
+                    elif known and live_qty <= 1e-9:
+                        got = remaining
+                if got > 0:
+                    order = parsed
+                    break
+                order = None
+                got = 0.0
+            if reject is not None:
+                exc = reject
+                if _is_min_notional_fault(exc):
+                    # Venue rejected a sub-minimum slice. Drop it instead of
+                    # printing 45110 over a book that cannot be reduced further.
+                    if this * px <= min_notional * 1.05:
+                        if last_order is None:
+                            last_order = {"id": None, "dust": True, "status": "dust"}
+                        remaining = 0.0
+                        break
+                    raise exc
+                halved = self._size_amount(symbol, this / 2.0, px)
                 if halved <= 0 or halved >= this - 1e-12:
-                    raise
+                    raise exc
+                if halved * px < min_notional - 1e-9:
+                    if remaining * px < min_notional - 1e-9:
+                        if last_order is None:
+                            last_order = {"id": None, "dust": True, "status": "dust"}
+                        remaining = 0.0
+                        break
+                    raise exc
                 chunk = halved
                 time.sleep(CLOSE_CHUNK_SLEEP_S)
                 continue
-            last_order = order if isinstance(order, dict) else {"raw": order}
-            filled += this
-            remaining = max(0.0, remaining - this)
+            if got <= 0 or order is None:
+                raise RuntimeError(
+                    "Bitget returned an order id but the position size did not change"
+                )
+            last_order = order
+            filled += got
+            remaining = max(0.0, remaining - got)
             if remaining <= 1e-9:
                 break
             time.sleep(CLOSE_CHUNK_SLEEP_S)
             if fraction >= 0.999:
-                live = self.fetch_open_position(symbol)
-                if not live.get("open"):
+                live_qty, known = self._read_open_qty(symbol)
+                if known and live_qty <= 1e-9:
                     remaining = 0.0
                     break
-                try:
-                    live_qty = abs(float(live.get("contracts") or 0.0))
-                except (TypeError, ValueError):
-                    live_qty = remaining
-                remaining = min(remaining, live_qty)
-            chunk = self._close_chunk_qty(symbol, remaining, mark)
+                if known:
+                    remaining = min(remaining, live_qty)
+            chunk = self._close_chunk_qty(symbol, remaining, px)
         return last_order, filled, loops
+
+    def _read_open_qty(self, symbol: str) -> tuple[float | None, bool]:
+        """(contracts, known). A fetch error is unknown, not flat."""
+        try:
+            live = self.fetch_open_position(symbol)
+        except Exception:
+            return None, False
+        if not isinstance(live, dict):
+            return None, False
+        if live.get("error") and not live.get("open"):
+            return None, False
+        if not live.get("open"):
+            return 0.0, True
+        try:
+            return abs(float(live.get("contracts") or 0.0)), True
+        except (TypeError, ValueError):
+            return None, False
 
     def _first_order(
         self,
@@ -2066,6 +2302,8 @@ class BitgetPaperConnector:
             "market_cap_usdt": mcap,
             "total_supply": supply,
             "volume_24h_usdt": volume,
+            "high": _first_positive(ticker.get("high")),
+            "low": _first_positive(ticker.get("low")),
             "is_swap": is_swap,
             "source": "ccxt",
             "error": ticker.get("error"),
@@ -2110,8 +2348,10 @@ class BitgetPaperConnector:
                 ticker = self.fetch_ticker(symbol) or {}
                 mark = coerce_price(ticker.get("mark"), ticker.get("last"), ticker.get("bid"), ticker.get("ask"))
                 qty = float(spot.get("contracts") or 0.0)
-                entry = coerce_price(spot.get("entry_price"), mark)
-                pnl_usdt, pnl_pct = unrealized_pnl(entry, mark, qty, "buy")
+                entry = _positive_float(spot.get("entry_price"))
+                pnl_usdt, pnl_pct = (
+                    unrealized_pnl(entry, mark, qty, "buy") if entry is not None and mark > 0 else (None, None)
+                )
                 row = {
                     "open": True,
                     "source": "spot",
@@ -2119,7 +2359,7 @@ class BitgetPaperConnector:
                     "side": "buy",
                     "contracts": qty,
                     "entry_price": entry,
-                    "mark_price": mark,
+                    "mark_price": mark if mark > 0 else None,
                     "pnl_usdt": pnl_usdt,
                     "pnl_pct": pnl_pct,
                     "raw": spot.get("raw") or {},
@@ -2194,26 +2434,25 @@ class BitgetPaperConnector:
                 "pnl_pct": 0.0,
             }
         close_side = "buy" if pos_side in {"sell", "short"} else "sell"
+        # Hedge mode on Bitget: CCXT treats `side` as the position side and flips it.
+        # Passing the order side with hedged=True closes the opposite book and
+        # still returns an order id. One-way reduceOnly (no flip) is tried first.
+        position_side = "buy" if pos_side in {"buy", "long"} else "sell"
         is_swap = self._is_swap(symbol)
-        hold = "short" if close_side == "buy" else "long"
+        hold = "long" if position_side == "buy" else "short"
         param_sets: list[dict[str, Any]] = [{}]
         if is_swap:
             param_sets = [
+                {"reduceOnly": True, "marginMode": "crossed", "hedged": False},
                 {
                     "reduceOnly": True,
                     "marginMode": "crossed",
-                    "tradeSide": "close",
                     "hedged": True,
                     "holdSide": hold,
+                    "_order_side": position_side,
                 },
-                {
-                    "reduceOnly": True,
-                    "marginMode": "crossed",
-                    "tradeSide": "close",
-                    "holdSide": hold,
-                },
-                {"reduceOnly": True, "holdSide": hold},
-                {"reduceOnly": True},
+                {"reduceOnly": True, "holdSide": hold, "hedged": False},
+                {"reduceOnly": True, "hedged": False},
             ]
         balance_before = self._snapshot_usdt()
         record: dict[str, Any] = {
@@ -2241,8 +2480,37 @@ class BitgetPaperConnector:
                 param_sets,
                 fraction=fraction,
             )
+            dust_only = isinstance(order, dict) and bool(order.get("dust")) and filled_qty <= 0
+            if dust_only:
+                record.update(
+                    {
+                        "ok": True,
+                        "status": "DUST",
+                        "amount": 0.0,
+                        "error": None,
+                        "note": "remainder below Bitget minimum 1 USDT — not sent",
+                        "pnl_usdt": 0.0,
+                        "pnl_pct": 0.0,
+                        "notional_usdt": 0.0,
+                        "close_chunks": chunks,
+                    }
+                )
+                self._apply_balance_change(record, balance_before=balance_before, filled=False)
+                log_path = _append_trade(record)
+                record["log_path"] = str(log_path)
+                return record
             if filled_qty <= 0 or order is None:
                 raise RuntimeError("close_market failed")
+            if fraction >= 0.999:
+                live_qty, known = self._read_open_qty(symbol)
+                if not known:
+                    raise RuntimeError(
+                        "close was not verified — the live position could not be re-read"
+                    )
+                if live_qty > 1e-6:
+                    raise RuntimeError(
+                        f"position still open qty={live_qty} after close"
+                    )
             qty = filled_qty
             record["amount"] = qty
             demo_fill = coerce_price(order.get("average"), order.get("price"))
@@ -2312,32 +2580,48 @@ class BitgetPaperConnector:
                 )
         return results
 
+    def _ticker_mark(self, ticker: dict[str, Any] | None) -> float:
+        payload = ticker if isinstance(ticker, dict) else {}
+        if payload.get("ok") is False and not any(
+            payload.get(key) not in (None, "") for key in ("mark", "last", "bid", "ask")
+        ):
+            return 0.0
+        return coerce_price(payload.get("mark"), payload.get("last"), payload.get("bid"), payload.get("ask"))
+
     def _overlay_live_mark(self, snap: dict[str, Any]) -> None:
-        """Reprice an open Demo book to live mainnet mark / BBO for realistic PnL."""
+        """Reprice an open Demo book from the live mainnet ticker.
+
+        The mark is never copied from the entry. A failed ticker leaves the
+        venue mark in place only when the exchange actually sent markPrice.
+        """
         symbol = str(snap.get("symbol") or "")
         if not symbol:
             return
+        ticker: dict[str, Any] = {}
         try:
-            ticker = self.fetch_ticker(symbol)
+            ticker = self.fetch_ticker(symbol) or {}
         except Exception:
-            return
-        mark = coerce_price(
-            ticker.get("mark"),
-            ticker.get("last"),
-            ticker.get("bid"),
-            ticker.get("ask"),
-            snap.get("mark_price"),
-        )
-        if mark <= 0:
-            return
-        entry = coerce_price(snap.get("entry_price"), mark)
+            ticker = {}
+        mark = self._ticker_mark(ticker)
+        if mark <= 0 and ":" not in symbol and "/" in symbol:
+            try:
+                ticker = self.fetch_ticker(f"{symbol}:USDT") or {}
+            except Exception:
+                ticker = {}
+            mark = self._ticker_mark(ticker)
+        if mark > 0:
+            snap["mark_price"] = mark
+            snap["mark_source"] = str(ticker.get("source") or "bitget.mainnet")
+        else:
+            snap["mark_source"] = "unavailable"
+        entry = _positive_float(snap.get("entry_price"))
+        live = _positive_float(snap.get("mark_price"))
         qty = float(snap.get("contracts") or 0.0)
         side = str(snap.get("side") or "buy")
-        pnl_usdt, pnl_pct = unrealized_pnl(entry, mark, qty, side)
-        snap["mark_price"] = mark
-        snap["pnl_usdt"] = pnl_usdt
-        snap["pnl_pct"] = pnl_pct
-        snap["mark_source"] = ticker.get("source") or "bitget.mainnet"
+        if entry is not None and live is not None:
+            pnl_usdt, pnl_pct = unrealized_pnl(entry, live, qty, side)
+            snap["pnl_usdt"] = pnl_usdt
+            snap["pnl_pct"] = pnl_pct
 
     def _is_swap(self, symbol: str) -> bool:
         try:
@@ -2591,24 +2875,28 @@ def normalize_position(pos: dict[str, Any] | None) -> dict[str, Any] | None:
     side = _norm_side(str(pos.get("side") or info.get("holdSide") or info.get("posSide") or ""))
     if not symbol or qty <= 0 or side in {"flat", "none", "closed", ""}:
         return None
-    entry = coerce_price(pos.get("entryPrice"), info.get("openPriceAvg"), pos.get("markPrice"))
-    mark = coerce_price(pos.get("markPrice"), pos.get("entryPrice"), entry)
-    pnl_usdt = pos.get("unrealizedPnl")
-    try:
-        pnl_usdt_f = float(pnl_usdt) if pnl_usdt not in (None, "") else None
-    except (TypeError, ValueError):
-        pnl_usdt_f = None
-    pnl_pct = pos.get("percentage")
-    try:
-        pnl_pct_f = float(pnl_pct) if pnl_pct not in (None, "") else None
-    except (TypeError, ValueError):
-        pnl_pct_f = None
-    if pnl_usdt_f is None or pnl_pct_f is None:
-        calc_usdt, calc_pct = unrealized_pnl(entry, mark, qty, side)
-        if pnl_usdt_f is None:
-            pnl_usdt_f = calc_usdt
-        if pnl_pct_f is None:
-            pnl_pct_f = calc_pct
+    entry = position_entry_price(pos)
+    mark = position_mark_price(pos)
+    pnl_usdt_f: float | None = None
+    pnl_pct_f: float | None = None
+    if entry is not None and mark is not None:
+        pnl_usdt_f, pnl_pct_f = unrealized_pnl(entry, mark, qty, side)
+    else:
+        raw_pnl = pos.get("unrealizedPnl")
+        try:
+            if raw_pnl not in (None, ""):
+                pnl_usdt_f = float(raw_pnl)
+        except (TypeError, ValueError):
+            pnl_usdt_f = None
+        raw_pct = pos.get("percentage")
+        try:
+            if raw_pct not in (None, ""):
+                parsed_pct = float(raw_pct)
+                # A flat 0% with no separate entry is the stuck-mark bug, not a real print.
+                if entry is not None or parsed_pct != 0.0:
+                    pnl_pct_f = parsed_pct
+        except (TypeError, ValueError):
+            pnl_pct_f = None
     return {
         "open": True,
         "source": "positions",
@@ -2617,8 +2905,9 @@ def normalize_position(pos: dict[str, Any] | None) -> dict[str, Any] | None:
         "contracts": qty,
         "entry_price": entry,
         "mark_price": mark,
-        "pnl_usdt": round(float(pnl_usdt_f or 0.0), 6),
-        "pnl_pct": round(float(pnl_pct_f or 0.0), 4),
+        "pnl_usdt": None if pnl_usdt_f is None else round(float(pnl_usdt_f), 6),
+        "pnl_pct": None if pnl_pct_f is None else round(float(pnl_pct_f), 4),
+        "hedged": pos.get("hedged"),
         "raw": _slim_position(pos),
         "error": None,
     }
@@ -2636,21 +2925,15 @@ def _fill_price(order: dict[str, Any], last: float) -> float:
 
 
 def _position_contracts(pos: dict[str, Any]) -> float:
-    for key in ("contracts", "contractSize", "notional"):
-        try:
-            value = abs(float(pos.get(key) or 0))
-        except (TypeError, ValueError):
-            continue
-        if value > 0:
-            return value
+    """Position size in contracts. Not contractSize (the multiplier) and not USDT notional."""
+    parsed = _positive_float(pos.get("contracts"))
+    if parsed is not None:
+        return parsed
     info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
-    for key in ("total", "available", "openSizeQty"):
-        try:
-            value = abs(float(info.get(key) or 0))
-        except (TypeError, ValueError):
-            continue
-        if value > 0:
-            return value
+    for key in ("total", "available", "size", "openSizeQty"):
+        parsed = _positive_float(info.get(key))
+        if parsed is not None:
+            return parsed
     return 0.0
 
 
@@ -2743,6 +3026,69 @@ def _is_margin_error(message: str) -> bool:
         token in lowered
         for token in ("25203", "25202", "insufficient margin", "insufficient balance")
     )
+
+
+def _positive_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed or parsed <= 0 or parsed in {float("inf"), float("-inf")}:
+        return None
+    return parsed
+
+
+def position_entry_price(pos: dict[str, Any] | None) -> float | None:
+    """Exchange open price. Never the mark, last, or bid."""
+    payload = pos if isinstance(pos, dict) else {}
+    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+    for value in (
+        payload.get("entryPrice"),
+        info.get("openPriceAvg"),
+        info.get("openAvgPrice"),
+        info.get("avgPrice"),
+    ):
+        parsed = _positive_float(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def position_mark_price(pos: dict[str, Any] | None) -> float | None:
+    """Venue mark only. Missing mark stays missing — do not copy the entry."""
+    payload = pos if isinstance(pos, dict) else {}
+    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+    for value in (payload.get("markPrice"), info.get("markPrice")):
+        parsed = _positive_float(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _confirmed_fill_qty(order: dict[str, Any] | None, requested: float) -> float:
+    """Size the exchange actually executed.
+
+    An id-only acknowledgement (filled/status/amount all empty) is not a fill.
+    That is the ghost close Bitget demo returned for PRESPCX.
+    """
+    payload = order if isinstance(order, dict) else {}
+    try:
+        want = max(0.0, float(requested or 0.0))
+    except (TypeError, ValueError):
+        want = 0.0
+    filled = _positive_float(payload.get("filled"))
+    if filled is not None:
+        return min(filled, want) if want > 0 else filled
+    status = str(payload.get("status") or "").lower()
+    amount = _positive_float(payload.get("amount"))
+    price = _positive_float(payload.get("average")) or _positive_float(payload.get("price"))
+    if status in {"closed", "filled"} and (amount is not None or want > 0):
+        return min(amount if amount is not None else want, want) if want > 0 else (amount or 0.0)
+    if amount is not None and price is not None:
+        return min(amount, want) if want > 0 else amount
+    return 0.0
 
 
 def _slim_order(order: dict[str, Any]) -> dict[str, Any]:

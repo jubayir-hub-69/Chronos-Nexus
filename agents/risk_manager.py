@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from agents.analyst import session_clock
 from core.llm import API_QUOTA_VETO, API_TIMEOUT_VETO, QwenCortex
 from core.schemas import AnalystBrief, RiskReport
 from connectors.bitget_paper import SWAP_LEVERAGE, protective_prices
@@ -269,6 +270,10 @@ class RiskManagerAgent:
         frames = ta_snap.get("frames") if isinstance(ta_snap.get("frames"), dict) else {}
         if not frames:
             frames = {"15m": dict(ta_snap)}
+        try:
+            session_name = str(session_clock().get("session") or "")
+        except Exception:
+            session_name = ""
         setup_reason, setup = setup_veto(
             side=brief.side,
             frames=frames,
@@ -278,6 +283,8 @@ class RiskManagerAgent:
             conviction=int(brief.conviction or 0),
             high_24h=_px(ticker.get("high"), fund.get("high_24h")),
             low_24h=_px(ticker.get("low"), fund.get("low_24h")),
+            volume_24h=fund.get("volume_24h_usdt"),
+            session=session_name,
         )
         if setup_reason:
             already = verdict == "VETO"
