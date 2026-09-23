@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     bitget_api_secret: str = ""
     bitget_passphrase: str = ""
     bitget_paper_trading: bool = True
-    bitget_symbol: str = "rNVDA/USDT"
+    bitget_symbol: str = "rNVDA/USDT:USDT"
 
     arbitrum_sepolia_rpc: str = "https://sepolia-rollup.arbitrum.io/rpc"
     arbitrum_sepolia_chain_id: int = 421614

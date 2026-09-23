@@ -17,8 +17,8 @@ TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_PHOTO = "https://api.telegram.org/bot{token}/sendPhoto"
 STARTUP_TEXT = (
     "Chronos-Nexus is ONLINE — glasshouse desk, SL/TP armed, hourly tape scan.\n"
-    "Commands: /menu  /positions  /close SYMBOL  /closeall  /price SYMBOL  /balance SYMBOL  /pnl  /status  /help\n"
-    "Spot chatbox: NVDA/USDT BUY $10  (Confirm / Cancel in-chat, Spot market only)"
+    "Commands: /menu  /positions  /close SYMBOL  /closeall  /price SYMBOL  /balance  /pnl  /status  /help\n"
+    "AI cycle is Demo USDT-M only. Operator chat can send BUY 1000 USDT BTC on Spot."
 )
 TELEGRAM_EDIT = "https://api.telegram.org/bot{token}/editMessageText"
 TELEGRAM_CALLBACK = "https://api.telegram.org/bot{token}/answerCallbackQuery"

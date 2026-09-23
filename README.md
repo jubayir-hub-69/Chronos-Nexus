@@ -19,7 +19,7 @@
 
 **Event-Driven Agent** for news-driven directional trading on tokenized US equities (rTokens / stock perps).
 
-Bitget AI Base Camp Hackathon S2 · Track: **Agentic Trading** · Sub-theme: **Event-Driven Agent** · Mode: **Paper / Demo only** · Version: **1.1.0-nexus**
+Bitget AI Base Camp Hackathon S2 · Track: **Agentic Trading** · Sub-theme: **Event-Driven Agent** · Mode: **Paper / Demo only** · Version: **1.3.0-desk**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![Bitget Qwen 3.8 Max](https://img.shields.io/badge/Bitget-Hackathon%20Qwen%203.8%20Max-00C3A5?style=for-the-badge)](https://bitget-ai.gitbook.io/bitgetai_hackathons2)
@@ -49,13 +49,27 @@ GitBook: *“The LLM is the primary trading decision-maker, not just an assistan
 
 ---
 
-## Hybrid system (mainnet pricing + Demo execution)
+## Hybrid execution (manual Spot + AI futures)
 
-Paper trading is worthless if the fill is a sandbox mid. Chronos-Nexus splits the rail in two:
+Two order routes. Both are real Bitget Demo calls. Neither uses a local balance.
+
+| Who | Market | CCXT route | What it does |
+|---|---|---|---|
+| **Operator Telegram** | Demo **Spot** | `type=spot` | `BUY 1000 USDT BTC`, `NVDA/USDT BUY $10`, `/buy NVDA 10`. Spends the spot USDT wallet. No leverage, no SL/TP. |
+| **ORACLE → SENTINEL → CHAIRMAN** | Demo **USDT-M perpetuals** and allowed stock/rToken contracts | `type=swap`, `productType=USDT-FUTURES` | Hourly cycle only. Cash symbols such as `BTC/USDT` are refused. Crypto perps such as `BTC/USDT:USDT` stay off the board. |
+| **Perception** | Keyless **mainnet** `spot` + `swap` | public | Live last, bid, ask, markPrice, L2, OHLCV. Marks and PnL use this tape, not a sandbox print. |
+
+`/balance` prints the spot ledger and the futures ledger on separate lines. They are not added together. `/positions` lists the USDT-M book (entry, live mark, real PnL) and spot holdings (qty and live last; no invented entry). `/close SYMBOL` reduces a futures position or market-sells a spot holding. `/closeall` flattens both.
+
+AI protective orders are attached on the swap fill: stop is 50–100% of invested margin, first take-profit at +25% PnL, then a trail. Unrealized PnL is `(mark − entry) × qty` from the exchange entry and the live mainnet mark. A missing entry prints `n/a`, not 0%.
+
+## Hybrid pricing (mainnet BBO + Demo fill)
+
+Paper trading is worthless if the fill is a sandbox mid. Private orders stay on Demo:
 
 | Rail | Client | What it does |
 |---|---|---|
-| **Execution** | Authenticated CCXT Bitget **sandbox** | `set_sandbox_mode(True)` first. Header `PAPTRADING: 1`. Market opens, SL/TP, closes, Spot chatbox fills. |
+| **Execution** | Authenticated CCXT Bitget **sandbox** | `set_sandbox_mode(True)` first. Header `PAPTRADING: 1`. Swap opens, SL/TP, closes, and operator Spot fills. |
 | **Perception** | Keyless CCXT Bitget **mainnet** (`spot` + `swap`) | Live last, bid, ask, markPrice, L2, OHLCV. Never a sandbox print. |
 
 **Fill peg (never a mid):**
@@ -97,7 +111,7 @@ Three agents. Python rails bind the model. A trade needs **multi-timeframe candl
  Bitget Demo  ·  mainnet BBO peg  ·  margin SL  ·  +25% scaled TP
       │
       ▼
- Telegram  ·  /pnl /status /price /balance  ·  Spot chatbox
+ Telegram  ·  /pnl /status /price /balance  ·  operator Spot + AI futures
  sleep 3600s
 ```
 
@@ -143,7 +157,7 @@ score = 0.10·news + 0.22·HTF + 0.18·entry + 0.18·volume
 
 **If `score < 75` → `VETO: Setup confidence below 75 — wait for a cleaner TA tape`.**
 
-The 75% rail requires a live 1h/4h tape from Bitget OHLCV (the hourly daemon always fetches it). Unmeasured HTF does not invent a 50 and kill the trade — same fail-open as unmeasured RSI — so daily limits, RSI, spread, BBO, Spot chatbox, and Telegram buttons stay intact.
+The 75% rail requires a live 1h/4h tape from Bitget OHLCV (the hourly daemon always fetches it). Unmeasured HTF does not invent a 50 and kill the trade — same fail-open as unmeasured RSI — so daily limits, RSI, spread, BBO, and the Telegram desk stay intact.
 
 ---
 
@@ -170,24 +184,27 @@ The 75% rail requires a live 1h/4h tape from Bitget OHLCV (the hourly daemon alw
 
 ## Telegram desk — how judges test
 
-The native Telegram **Menu** is registered with `setMyCommands`. Chat id is pinned; other chats are ignored.
+The native Menu is registered with `setMyCommands`. `TELEGRAM_CHAT_ID` is the operator. Every other chat gets a reply. Nothing is dropped silently.
+
+**Guests.** `/start` and `/menu` greet the sender by Telegram name, print their user id, and state that access is read-only. They can use `/help`, `/price`, `/status`, and `/positions`. A trade, close, `/balance`, or `/pnl` replies exactly `Access Denied: Operator command only.`
+
+**Operator.**
 
 | Command | What you should see |
 |---|---|
-| `/menu` or `/dashboard` | Headless terminal with inline buttons. **Live Market Status** = `/status`. **My Real PnL** = `/pnl`. **Open Positions** = `/positions`. **Force Close All** confirms then `/closeall`. |
-| `/price BGB` or `/price BGB/USDT` | Live **mainnet** last / bid / ask (not Demo) |
-| `/balance USDT` | Wallet free + total for that asset (any coin; pairs collapse to the base) |
-| `/balance NVDA` | `0.00 NVDA found in wallet.` if missing — never a dummy USDT row |
-| `/pnl` | **Today’s realized PnL (USDT)**, real W/L, `Trades left: X`, halt, live unrealized from Bitget |
-| `/status` | Live ORACLE sentiment (e.g. `NEUTRAL 50.17`), AI conviction `/100`, desk `ARMED` or `STAND_DOWN`, SENTINEL verdict, last scan. No scan → `NO SCAN YET` |
-| `/positions` | Open Demo book + mark PnL |
-| `/close SYMBOL` | Market-close one name |
-| `/closeall` | Flatten the Demo book |
-| `NVDA/USDT BUY $10` | Spot **preview** with Confirm / Cancel. Bitget **Spot only**. AI cycle is not used. |
+| `/menu` or `/dashboard` | Headless terminal. **Live Market Status** = `/status`. **My Real PnL** = `/pnl`. **Open Positions** = `/positions`. **Force Close All** confirms, then flattens futures and spot. |
+| `/price BGB` or `/price BGB/USDT` | Live **mainnet** last, 24h high, 24h low, 24h quote volume, and market cap or visible book notional |
+| `/balance` | Spot USDT and futures USDT, each with free / used / total. Not summed. |
+| `/balance NVDA` | That coin on both ledgers, or `0.00 NVDA found in wallet.` if both are empty |
+| `/pnl` | Today’s realized PnL from the daily ledger, real W/L, `Trades left: X`, halt, plus unrealized from the live futures book |
+| `/status` | Live ORACLE sentiment, conviction, desk `ARMED` or `STAND_DOWN`, SENTINEL verdict. No scan → `NO SCAN YET` |
+| `/positions` | Futures rows with entry, live mark, and PnL. Spot rows with qty, live last, and market value |
+| `/close SYMBOL` | Reduce-only close if it is a futures position; otherwise a spot market sell |
+| `/closeall` | Flatten the USDT-M book and sell spot holdings above the 1 USDT minimum |
+| `BUY 1000 USDT BTC` | Immediate Demo **Spot** market buy. Receipt shows the spot USDT balance before and after |
+| `NVDA/USDT BUY $10` or `/buy NVDA 10` | Same Spot route. A bare `/buy` without a size is refused |
 
-`/pnl` and `/status` read `data/history.json` and live Bitget. They do not invent numbers.
-
-Manual `/buy` / `/sell` / `/open` on the AI desk is refused. Spot tickets go through the chatbox.
+The AI hourly cycle does not see these Spot tickets. `/pnl` and `/status` read `data/history.json` and the live Bitget book. They do not invent numbers.
 
 ---
 
@@ -259,14 +276,14 @@ Audited against [Bitget AI Hackathon S2 Developer Handbook](https://bitget-ai.gi
 | On-chain proof | **PASS** | Arbitrum Sepolia chain **421614**, `value = 0`, calldata `CHRONOS-NEXUS/v1:{sha256}`. |
 | Runnable Demo + ≥2-week paper log | **PASS** | `python main.py` hourly daemon. Log started 2026-09-10. |
 | Hybrid mainnet BBO | **PASS** | Public (keyless) market data only. Orders stay on Demo. |
-| Spot chatbox vs AI cycle | **PASS** | Manual Spot is isolated. Hourly AI still uses swap/paper. `/price` `/balance` `/pnl` `/status` are not tickets. |
+| Manual Spot vs AI futures | **PASS** | Operator chat executes Demo Spot (`type=spot`). The hourly cycle executes USDT-M only (`type=swap`). Guests are read-only. |
 | Daily limits + scaled TP + anti-stack | **PASS** | Unchanged by the 75% TA brain. HTF-unmeasured fixtures no longer false-veto those rails. |
 
-**Fixes in this revision (no feature removed):**
+What the running desk actually does:
 
-1. The setup ensemble was vetoing RSI-only unit fixtures because missing 1h/4h scored ~50. The rail now **requires a measured HTF tape** (what the live daemon always fetches). RSI, spread, daily limits, BBO, Spot chatbox, `/pnl`, `/status`, and Telegram buttons keep their previous behaviour.
-2. Bitget `45113` (max order value) on `/closeall` is sliced into ≤100-lot / ≤8000 USDT chunks with 0.5s between orders until the book is flat.
-2. README was stale (flat SL −2% / TP +5%, no hybrid BBO, no Telegram analytics). This document matches the code.
+- The hourly cycle places Demo USDT-M orders only, with a live-mark SL/TP and a chunked reduce-only close when Bitget returns `45113`.
+- The operator Telegram chat can place a Demo Spot market order. Guests can read `/help`, `/price`, `/status`, and `/positions`.
+- Balances, positions, and fills come from Bitget. A failed wallet read is reported as a failure or as zero change, not a simulated balance.
 
 ---
 
@@ -304,7 +321,7 @@ BITGET_API_KEY=your_demo_api_key
 BITGET_API_SECRET=your_demo_secret
 BITGET_PASSPHRASE=your_demo_passphrase
 BITGET_PAPER_TRADING=true
-BITGET_SYMBOL=rNVDA/USDT
+BITGET_SYMBOL=rNVDA/USDT:USDT
 
 ARBITRUM_SEPOLIA_RPC=https://sepolia-rollup.arbitrum.io/rpc
 ARBITRUM_SEPOLIA_CHAIN_ID=421614
@@ -337,7 +354,7 @@ python -m unittest discover -s tests -v
 | direction | `direction` | `buy` / `sell` / `none` |
 | quantity | `quantity` | sized contracts / base |
 | price | `price` (never null) | mainnet BBO peg, else live last, else `0.0` on stand-down |
-| account balance change | `account_balance_change` | Demo USDT after − before; else simulated margin + taker fee; `0.0` on veto |
+| account balance change | `account_balance_change` | Live wallet after − before on the ledger that filled (spot or futures). `0.0` when the read fails or the row is a veto. |
 
 | File | Role |
 |---|---|
@@ -375,7 +392,7 @@ Evaluators: run Demo + Sepolia as shipped.
 
 ```text
 Chronos-Nexus/
-├── main.py                      # Rich CIC · hourly Event-Driven Agent (v1.1.0-nexus)
+├── main.py                      # Rich CIC · hourly Event-Driven Agent (v1.3.0-desk)
 ├── requirements.txt
 ├── agents/
 │   ├── analyst.py               # ORACLE — RSS, NLP 0–100, NONE stand-down
@@ -389,18 +406,18 @@ Chronos-Nexus/
 │   ├── positions.py             # Trail, +25% partial, thesis close
 │   └── schemas.py
 ├── connectors/
-│   ├── bitget_paper.py          # Demo execute · mainnet BBO · BGB deduct
+│   ├── bitget_paper.py          # Spot + USDT-M execute · mainnet marks · BGB deduct
 │   └── arbitrum.py              # Sepolia Proof of Thought
 ├── utils/
-│   ├── commands.py              # Menu + /price /balance /pnl /status
-│   ├── spot_chat.py             # Spot preview / confirm
+│   ├── commands.py              # Guest/admin desk, hybrid /balance /positions /close
+│   ├── spot_chat.py             # Operator Spot command parser
 │   ├── notifier.py
 │   └── pnl_card.py
 ├── data/
 │   ├── history.json
 │   ├── desk.json
 │   └── logs/trades.json
-└── tests/                       # phase1 … phase10_brain
+└── tests/                       # phase1 through phase13_futures_access
 ```
 
 ---
@@ -419,4 +436,4 @@ MIT. Use, fork, and modify with attribution. Keep Demo keys, Telegram tokens, an
 
 **CHRONOS-NEXUS** — *Bitget AI Base Camp Hackathon S2 · Agentic Trading · Event-Driven Agent*  
 ORACLE · SENTINEL · CHAIRMAN  
-**Hybrid mainnet BBO. 75% TA setup. Chunked close. Hourly daemon. Paper only.**
+**Manual Spot. AI USDT-M futures. Mainnet marks. Guest read-only. Paper only.**

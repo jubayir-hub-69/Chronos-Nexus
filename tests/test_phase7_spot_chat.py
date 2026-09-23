@@ -42,6 +42,14 @@ class ParseSpotIntentTests(unittest.TestCase):
         self.assertEqual(intent.symbol, "BTC/USDT")
         self.assertEqual(intent.side, "buy")
 
+    def test_buy_amount_usdt_then_coin(self) -> None:
+        intent = parse_spot_intent("BUY 1000 USDT BTC")
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.symbol, "BTC")
+        self.assertEqual(intent.side, "buy")
+        self.assertEqual(intent.quote_usdt, 1000.0)
+
     def test_slash_buy_with_amount(self) -> None:
         intent = parse_spot_intent("/buy NVDA 10")
         self.assertIsNotNone(intent)
@@ -188,6 +196,7 @@ class SpotMarketGuardTests(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertEqual(out["status"], "INSUFFICIENT_MARGIN")
         self.assertIn("10.0000", str(out.get("error") or ""))
+        conn.exchange.create_order.assert_not_called()
 
     def test_slash_buy_without_amount_still_disabled_on_desk(self) -> None:
         desk = CommandDesk(None, PositionDesk())
@@ -275,13 +284,11 @@ class PriceBalanceCommandTests(unittest.TestCase):
 
     def test_balance_ledger_error_is_not_a_fake_zero(self) -> None:
         bitget = MagicMock()
-        bitget.fetch_asset_balance.return_value = {
+        bitget.fetch_ledger_balance.return_value = {
             "ok": False,
             "coin": "USDT",
-            "free": 0.0,
-            "used": 0.0,
-            "total": 0.0,
-            "found": False,
+            "spot": {},
+            "swap": {},
             "error": "spot:timeout | swap:timeout",
         }
         desk = CommandDesk(bitget, PositionDesk())
@@ -296,21 +303,36 @@ class PriceBalanceCommandTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("/price", result.plain.lower())
 
-    def test_balance_requires_symbol(self) -> None:
-        desk = CommandDesk(MagicMock(), PositionDesk())
+    def test_balance_bare_reads_both_usdt_ledgers(self) -> None:
+        bitget = MagicMock()
+        bitget.fetch_ledger_balance.return_value = {
+            "ok": True,
+            "coin": "USDT",
+            "spot": {"ok": True, "free": 10000.0, "used": 0.0, "total": 10000.0, "found": True},
+            "swap": {
+                "ok": True,
+                "free": 9981.86145408,
+                "used": 18.13854592,
+                "total": 10000.0,
+                "found": True,
+            },
+        }
+        desk = CommandDesk(bitget, PositionDesk())
         result = desk.handle("/balance", source="telegram")
-        self.assertFalse(result.ok)
-        self.assertIn("Please specify a token", result.plain)
-        self.assertIn("/balance USDT", result.plain)
+        self.assertTrue(result.ok)
+        bitget.fetch_ledger_balance.assert_called_once_with("USDT")
+        self.assertIn("spot free", result.plain)
+        self.assertIn("futures free", result.plain)
+        self.assertIn("9981.86145408", result.plain)
+        self.assertIn("10000.00000000", result.plain)
 
     def test_balance_shows_only_requested_coin(self) -> None:
         bitget = MagicMock()
-        bitget.fetch_asset_balance.return_value = {
+        bitget.fetch_ledger_balance.return_value = {
             "ok": True,
             "coin": "BGB",
-            "free": 3.0,
-            "total": 3.0,
-            "found": True,
+            "spot": {"ok": True, "free": 3.0, "used": 0.0, "total": 3.0, "found": True},
+            "swap": {"ok": True, "free": 0.0, "used": 0.0, "total": 0.0, "found": False},
         }
         desk = CommandDesk(bitget, PositionDesk())
         result = desk.handle("/balance BGB", source="telegram")
@@ -319,18 +341,17 @@ class PriceBalanceCommandTests(unittest.TestCase):
         self.assertIn("BGB", result.plain)
         self.assertIn("3.00000000", result.plain)
         self.assertNotIn("USDT", result.plain)
-        bitget.fetch_asset_balance.assert_called_with("BGB")
+        bitget.fetch_ledger_balance.assert_called_with("BGB")
         desk.handle("/balance usdt", source="telegram")
-        bitget.fetch_asset_balance.assert_called_with("USDT")
+        bitget.fetch_ledger_balance.assert_called_with("USDT")
 
     def test_balance_zero_or_missing_is_explicit(self) -> None:
         bitget = MagicMock()
-        bitget.fetch_asset_balance.return_value = {
+        bitget.fetch_ledger_balance.return_value = {
             "ok": True,
             "coin": "NVDA",
-            "free": 0.0,
-            "total": 0.0,
-            "found": False,
+            "spot": {"ok": True, "free": 0.0, "used": 0.0, "total": 0.0, "found": False},
+            "swap": {"ok": True, "free": 0.0, "used": 0.0, "total": 0.0, "found": False},
         }
         desk = CommandDesk(bitget, PositionDesk())
         result = desk.handle("/balance NVDA", source="telegram")
@@ -339,16 +360,15 @@ class PriceBalanceCommandTests(unittest.TestCase):
 
     def test_balance_pair_uses_base_asset(self) -> None:
         bitget = MagicMock()
-        bitget.fetch_asset_balance.return_value = {
+        bitget.fetch_ledger_balance.return_value = {
             "ok": True,
             "coin": "NVDA",
-            "free": 1.5,
-            "total": 1.5,
-            "found": True,
+            "spot": {"ok": True, "free": 1.5, "used": 0.0, "total": 1.5, "found": True},
+            "swap": {"ok": True, "free": 0.0, "used": 0.0, "total": 0.0, "found": False},
         }
         desk = CommandDesk(bitget, PositionDesk())
         desk.handle("/balance NVDA/USDT", source="telegram")
-        bitget.fetch_asset_balance.assert_called_once_with("NVDA")
+        bitget.fetch_ledger_balance.assert_called_once_with("NVDA")
 
     def test_fetch_asset_balance_any_coin_case_insensitive(self) -> None:
         conn = BitgetPaperConnector.__new__(BitgetPaperConnector)
@@ -389,11 +409,15 @@ class PriceBalanceCommandTests(unittest.TestCase):
         conn.exchange.fetch_balance.side_effect = lambda params: books[params["type"]]
         bgb = conn.fetch_asset_balance("BGB")
         self.assertTrue(bgb["ok"])
-        self.assertEqual(bgb["free"], 3.0)
-        self.assertEqual(bgb["used"], 0.25)
-        self.assertEqual(bgb["total"], 3.25)
-        self.assertIn("spot", bgb["source"])
-        self.assertIn("swap", bgb["source"])
+        self.assertEqual(bgb["free"], 2.0)
+        self.assertEqual(bgb["used"], 0.0)
+        self.assertEqual(bgb["total"], 2.0)
+        self.assertEqual(bgb["source"], "bitget.futures_demo")
+        self.assertNotIn("spot", bgb["source"])
+        conn.exchange.fetch_balance.assert_called_once()
+        params = conn.exchange.fetch_balance.call_args[0][0]
+        self.assertEqual(params.get("type"), "swap")
+        self.assertEqual(params.get("productType"), "USDT-FUTURES")
 
 
 class BgbFeeDeductTests(unittest.TestCase):

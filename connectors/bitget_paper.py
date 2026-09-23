@@ -139,6 +139,44 @@ def _looks_contract(symbol: str) -> bool:
     return ":USDT" in u or ":USDC" in u or ":USD" in u or u.endswith(":USDT")
 
 
+def _futures_params() -> dict[str, str]:
+    """USDT-M mix account. Demo adds PAPTRADING when productType stays USDT-FUTURES."""
+    return {"type": "swap", "productType": "USDT-FUTURES"}
+
+
+def _to_contract_symbol(symbol: str) -> str:
+    """Spot-form ticker → USDT-M perp. Already-settled symbols pass through."""
+    raw = (symbol or "").strip()
+    if not raw or _looks_contract(raw):
+        return raw
+    base = raw.upper().split(":")[0]
+    if "/" not in base:
+        base = f"{base}/USDT"
+    return f"{base}:USDT"
+
+
+def _contract_root(symbol: str) -> str:
+    base = (symbol or "").split(":")[0].split("/")[0].upper()
+    if base.startswith("R") and len(base) > 2 and base[1:].isalpha():
+        base = base[1:]
+    return "GOOG" if base == "GOOGL" else base
+
+
+def _is_contract_market(symbol: str, market: dict[str, Any] | None = None) -> bool:
+    """USDT-M perp or dated future. A cash spot listing is never tradable."""
+    name = str(symbol or "")
+    row = market or {}
+    if row.get("option"):
+        return False
+    if row.get("spot") is True and not (row.get("swap") or row.get("future")):
+        return False
+    if row.get("swap") or row.get("future"):
+        return True
+    if row.get("spot") is True:
+        return False
+    return ":USDT" in name or ":USDC" in name or name.endswith(":USD")
+
+
 def public_symbol_candidates(symbol: str) -> list[str]:
     """Demo/sandbox symbol → live Bitget unified-symbol tries (spot + swap)."""
     raw = (symbol or "").strip()
@@ -361,7 +399,7 @@ class BitgetPaperConnector:
                 "enableRateLimit": True,
                 "timeout": 20000,
                 "options": {
-                    "defaultType": "spot",
+                    "defaultType": "swap",
                     "sandboxMode": True,
                     # Bitget native-token fee: pay in BGB (20% discount) when the
                     # account switch-deduct endpoint is armed. Unknown order-body
@@ -481,11 +519,8 @@ class BitgetPaperConnector:
             markets = self._ccxt(lambda: self.exchange.load_markets(reload=True), label="bitget.load_markets.reload")
         self.universe = self.discover_equity_universe(markets)
         self.resolved_symbol = self._resolve_symbol(markets)
+        self.exchange.options["defaultType"] = "swap"
         market = markets.get(self.resolved_symbol) or {}
-        if market.get("swap") or market.get("future"):
-            self.exchange.options["defaultType"] = "swap"
-        else:
-            self.exchange.options["defaultType"] = "spot"
         self.bgb_fee_deduct = self._enable_bgb_fee_deduct()
         self._ensure_public_markets()
         public_n = len((getattr(self, "public", None).markets or {}) if getattr(self, "public", None) else {})
@@ -496,7 +531,7 @@ class BitgetPaperConnector:
             "universe": len(self.universe),
             "universe_source": self.universe_source,
             "symbol": self.resolved_symbol,
-            "market_type": "swap" if market.get("swap") else "spot",
+            "market_type": "swap" if _is_contract_market(str(self.resolved_symbol or ""), market) else "unlisted",
             "id": self.exchange.id,
             "bgb_fee_deduct": self.bgb_fee_deduct.get("deduct") or "off",
             "bgb_fee_deduct_via": self.bgb_fee_deduct.get("via"),
@@ -561,7 +596,7 @@ class BitgetPaperConnector:
             self.universe = equity
             return list(equity)
         fallback = _usdt_fallback_universe(book or {})
-        self.universe_source = "usdt-fallback" if fallback else "empty"
+        self.universe_source = "perp-fallback" if fallback else "empty"
         self.universe = fallback
         return list(fallback)
 
@@ -579,40 +614,75 @@ class BitgetPaperConnector:
             return list(self.universe)
         return self.discover_equity_universe(self.exchange.markets or {})
 
-    def fetch_demo_balance(self) -> dict[str, Any]:
-        assets: dict[str, dict[str, float]] = {}
-        errors: list[str] = []
-        for account_type in ("spot", "swap"):
-            try:
-                raw = self._ccxt(
-                    lambda t=account_type: self.exchange.fetch_balance({"type": t}),
-                    label=f"bitget.balance.{account_type}",
-                )
-            except Exception as exc:
-                errors.append(f"{account_type}:{str(exc)[:120]}")
+    def resolve_contract_symbol(self, query: str) -> str | None:
+        """USDT-M perp for this root. Never returns a spot listing."""
+        raw = (query or "").strip()
+        if not raw:
+            return None
+        formed = _to_contract_symbol(raw)
+        markets = getattr(self.exchange, "markets", None)
+        if not isinstance(markets, dict) or not markets:
+            return formed if _looks_contract(formed) else None
+        row = markets.get(formed)
+        if _is_contract_market(formed, row if isinstance(row, dict) else {}):
+            if formed in markets:
+                return formed
+        root = _contract_root(raw)
+        hits: list[str] = []
+        for name, market in markets.items():
+            info = market if isinstance(market, dict) else {}
+            if not _is_contract_market(str(name), info):
                 continue
-            totals = raw.get("total") or {}
-            frees = raw.get("free") or {}
-            for coin, total in totals.items():
-                try:
-                    total_f = float(total or 0)
-                except (TypeError, ValueError):
-                    continue
-                try:
-                    free_f = float(frees.get(coin) or 0)
-                except (TypeError, ValueError):
-                    free_f = 0.0
-                if coin in {"USDT", "USDC"} or total_f > 0:
-                    prev = assets.get(str(coin), {"free": 0.0, "total": 0.0})
-                    assets[str(coin)] = {
-                        "free": prev["free"] + free_f,
-                        "total": prev["total"] + total_f,
-                    }
+            if _contract_root(str(name)) == root:
+                hits.append(str(name))
+        if not hits:
+            return None
+        hits.sort(
+            key=lambda n: (
+                0 if n == formed else 1,
+                0 if str(n).split("/")[0].upper().startswith("R") else 1,
+                n,
+            )
+        )
+        return hits[0]
+
+    def fetch_demo_balance(self) -> dict[str, Any]:
+        """USDT-M Demo ledger only. Spot wallets are not the trading book."""
+        try:
+            raw = self._ccxt(
+                lambda: self.exchange.fetch_balance(_futures_params()),
+                label="bitget.balance.swap",
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "sandbox": True,
+                "assets": {},
+                "source": "bitget.futures_demo",
+                "error": str(exc)[:240],
+            }
+        if not isinstance(raw, dict):
+            return {
+                "ok": False,
+                "sandbox": True,
+                "assets": {},
+                "source": "bitget.futures_demo",
+                "error": "empty futures ledger",
+            }
+        totals = raw.get("total") if isinstance(raw.get("total"), dict) else {}
+        frees = raw.get("free") if isinstance(raw.get("free"), dict) else {}
+        assets: dict[str, dict[str, float]] = {}
+        for coin, total in totals.items():
+            total_f = _coin_amt(total)
+            free_f = _coin_amt(frees.get(coin))
+            if str(coin).upper() in {"USDT", "USDC"} or total_f > 0 or free_f > 0:
+                assets[str(coin)] = {"free": free_f, "total": total_f}
         return {
-            "ok": bool(assets) or not errors,
+            "ok": True,
             "sandbox": True,
             "assets": assets,
-            "error": " | ".join(errors)[:240] if errors and not assets else None,
+            "source": "bitget.futures_demo",
+            "error": None,
         }
 
     def resolve_spot_symbol(self, query: str) -> str | None:
@@ -776,11 +846,9 @@ class BitgetPaperConnector:
         return {"ok": True, "assets": assets, "error": None}
 
     def fetch_asset_balance(self, coin: str) -> dict[str, Any]:
-        """Free/used/total for one asset from the live Bitget ledger.
+        """Free/used/total for one asset on the Bitget Demo USDT-M ledger.
 
-        Spot and swap are read separately. Identical snapshots (UTA reports the
-        same wallet on both types) are counted once so the figure is not doubled.
-        Distinct classic wallets are summed. No hardcoded balances.
+        Spot balances are not consulted. There is no local wallet.
         """
         wanted = str(coin or "").strip()
         if not wanted:
@@ -791,71 +859,65 @@ class BitgetPaperConnector:
                 "used": 0.0,
                 "total": 0.0,
                 "found": False,
+                "source": "bitget.futures_demo",
                 "error": "coin required",
             }
         wanted_u = wanted.upper()
+        try:
+            raw = self._ccxt(
+                lambda: self.exchange.fetch_balance(_futures_params()),
+                label="bitget.balance.swap.asset",
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "coin": wanted_u,
+                "free": 0.0,
+                "used": 0.0,
+                "total": 0.0,
+                "found": False,
+                "source": "bitget.futures_demo",
+                "error": f"swap:{str(exc)[:160]}",
+            }
+        if not isinstance(raw, dict):
+            return {
+                "ok": False,
+                "coin": wanted_u,
+                "free": 0.0,
+                "used": 0.0,
+                "total": 0.0,
+                "found": False,
+                "source": "bitget.futures_demo",
+                "error": "swap:empty ledger",
+            }
+        frees = raw.get("free") if isinstance(raw.get("free"), dict) else {}
+        totals = raw.get("total") if isinstance(raw.get("total"), dict) else {}
+        useds = raw.get("used") if isinstance(raw.get("used"), dict) else {}
+        keys = {str(k) for k in list(frees.keys()) + list(totals.keys()) + list(useds.keys())}
+        free_sum = 0.0
+        total_sum = 0.0
+        used_sum = 0.0
         found = False
         matched = wanted_u
-        errors: list[str] = []
-        legs: list[tuple[float, float, float, str]] = []
-        for account_type in ("spot", "swap"):
-            try:
-                raw = self._ccxt(
-                    lambda t=account_type: self.exchange.fetch_balance({"type": t}),
-                    label=f"bitget.balance.{account_type}.asset",
-                )
-            except Exception as exc:
-                errors.append(f"{account_type}:{str(exc)[:120]}")
+        for key in keys:
+            if key.upper() != wanted_u:
                 continue
-            if not isinstance(raw, dict):
-                errors.append(f"{account_type}:empty ledger")
-                continue
-            frees = raw.get("free") if isinstance(raw.get("free"), dict) else {}
-            totals = raw.get("total") if isinstance(raw.get("total"), dict) else {}
-            useds = raw.get("used") if isinstance(raw.get("used"), dict) else {}
-            keys = {str(k) for k in list(frees.keys()) + list(totals.keys()) + list(useds.keys())}
-            leg_free = 0.0
-            leg_total = 0.0
-            leg_used = 0.0
-            hit = False
-            for key in keys:
-                if key.upper() != wanted_u:
-                    continue
-                hit = True
-                found = True
-                matched = key
-                leg_free += _coin_amt(frees.get(key))
-                leg_total += _coin_amt(totals.get(key))
-                leg_used += _coin_amt(useds.get(key))
-            if not hit:
-                continue
-            if leg_used <= 0 and leg_total > leg_free:
-                leg_used = leg_total - leg_free
-            legs.append((leg_free, leg_total, leg_used, account_type))
-        unique: list[tuple[float, float, float, str]] = []
-        for leg in legs:
-            if any(
-                abs(leg[0] - prev[0]) <= 1e-8 and abs(leg[1] - prev[1]) <= 1e-8
-                for prev in unique
-            ):
-                continue
-            unique.append(leg)
-        free_sum = sum(leg[0] for leg in unique)
-        total_sum = sum(leg[1] for leg in unique)
-        used_sum = sum(leg[2] for leg in unique)
+            found = True
+            matched = key
+            free_sum += _coin_amt(frees.get(key))
+            total_sum += _coin_amt(totals.get(key))
+            used_sum += _coin_amt(useds.get(key))
         if used_sum <= 0 and total_sum > free_sum:
             used_sum = total_sum - free_sum
-        sources = "+".join(leg[3] for leg in unique)
-        ledger_ok = bool(unique) or not errors
         return {
-            "ok": ledger_ok,
+            "ok": True,
             "coin": matched,
             "free": max(0.0, free_sum),
             "used": max(0.0, used_sum),
             "total": max(0.0, total_sum),
             "found": found,
-            "source": sources or "bitget.fetch_balance",
-            "error": " | ".join(errors)[:240] if errors and not found else None,
+            "source": "bitget.futures_demo",
+            "error": None,
         }
 
     def execute_spot_market(
@@ -864,7 +926,19 @@ class BitgetPaperConnector:
         side: str,
         quote_usdt: float,
     ) -> dict[str, Any]:
-        """Manual Telegram fill. Spot market only. Never leverage, never SL/TP, never swap."""
+        """Manual Telegram fill on the Demo spot wallet. Never a swap order."""
+        lock = getattr(self, "_order_lock", None)
+        if lock is None:
+            return self._execute_spot_market(symbol, side, quote_usdt)
+        with lock:
+            return self._execute_spot_market(symbol, side, quote_usdt)
+
+    def _execute_spot_market(
+        self,
+        symbol: str,
+        side: str,
+        quote_usdt: float,
+    ) -> dict[str, Any]:
         if not self.sandbox:
             raise RuntimeError("REFUSING live spot order — sandbox lock tripped")
         side_n = (side or "").lower().strip()
@@ -881,7 +955,8 @@ class BitgetPaperConnector:
             return {
                 "ok": False,
                 "status": "NOT_SPOT",
-                "error": f"{symbol} is not listed on Bitget Spot. Manual chat trades are SPOT only.",
+                "market_type": "spot",
+                "error": f"{symbol} is not a Bitget Spot listing. Manual chat trades are SPOT only.",
                 "symbol": symbol,
             }
         try:
@@ -892,12 +967,14 @@ class BitgetPaperConnector:
             return {
                 "ok": False,
                 "status": "NOT_SPOT",
-                "error": f"{resolved} is not a Spot market. Manual chat trades cannot use futures/margin.",
+                "market_type": "spot",
+                "error": f"{resolved} is not a Spot market. Manual chat trades cannot use futures.",
                 "symbol": resolved,
             }
-
-        prev = (self.exchange.options or {}).get("defaultType")
-        balance_before: float | None = None
+        options = getattr(self.exchange, "options", None)
+        prev = options.get("defaultType") if isinstance(options, dict) else None
+        if isinstance(options, dict):
+            options["defaultType"] = "spot"
         record: dict[str, Any] = {
             "id": str(uuid.uuid4()),
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -911,22 +988,19 @@ class BitgetPaperConnector:
             "notional_usdt": round(cost, 6),
         }
         try:
-            self.exchange.options["defaultType"] = "spot"
             quote = self.fetch_spot_quote(resolved, side=side_n)
-            last = coerce_price(quote.get("peg"), quote.get("last"))
+            last = coerce_price(quote.get("peg"), quote.get("last"), quote.get("ask"), quote.get("bid"))
             if last <= 0:
                 record.update(
                     {
                         "ok": False,
                         "status": "NO_LIVE_PRICE",
-                        "error": "No live Bitget mainnet Spot BBO.",
+                        "error": "No live Bitget mainnet Spot price.",
                         "amount": 0.0,
                         "price": 0.0,
                     }
                 )
-                log_path = _append_trade(record)
-                record["log_path"] = str(log_path)
-                return record
+                return self._finish_spot_record(record)
             qty = self._size_amount(resolved, cost / last, last)
             record["amount"] = qty
             record["quantity"] = qty
@@ -934,19 +1008,21 @@ class BitgetPaperConnector:
             record["entry_price"] = last
             _stamp_bbo(record, quote)
             free = self.fetch_spot_usdt_free()
+            record["account_balance_before"] = free
             if side_n == "buy" and free + 1e-9 < cost:
                 record.update(
                     {
                         "ok": False,
                         "status": "INSUFFICIENT_MARGIN",
                         "error": f"Spot USDT free {free:.4f} < {cost:.4f} requested.",
+                        "account_balance_change": 0.0,
+                        "account_balance_change_source": "spot_demo",
+                        "account_balance_after": free,
                     }
                 )
-                log_path = _append_trade(record)
-                record["log_path"] = str(log_path)
-                return record
-            balance_before = self._snapshot_usdt()
-            order = self._place_spot_market(resolved, side_n, qty, last, cost)
+                return self._finish_spot_record(record)
+            order = self._submit_spot_order(resolved, side_n, qty, cost)
+            after = self.fetch_spot_usdt_free()
             demo_fill = coerce_price(order.get("average"), order.get("price"))
             fill = last if last > 0 else demo_fill
             filled_qty = coerce_price(order.get("filled"), order.get("amount"), qty)
@@ -962,10 +1038,12 @@ class BitgetPaperConnector:
                     "amount": filled_qty,
                     "quantity": filled_qty,
                     "notional_usdt": round(abs(fill * filled_qty), 6) if fill and filled_qty else round(cost, 6),
+                    "account_balance_after": after,
+                    "account_balance_change": round(after - free, 8),
+                    "account_balance_change_source": "spot_demo",
                 }
             )
             _stamp_bbo(record, quote)
-            self._apply_balance_change(record, balance_before=balance_before, filled=True)
         except Exception as exc:
             record.update(
                 {
@@ -974,47 +1052,267 @@ class BitgetPaperConnector:
                     "error": str(exc)[:400],
                     "order_id": None,
                     "raw_order": {},
+                    "account_balance_change": 0.0,
+                    "account_balance_change_source": "unmeasured",
                 }
             )
-            self._apply_balance_change(record, balance_before=None, filled=False)
         finally:
-            self.exchange.options["defaultType"] = prev
+            if isinstance(options, dict):
+                options["defaultType"] = prev or "swap"
+        return self._finish_spot_record(record)
+
+    def _finish_spot_record(self, record: dict[str, Any]) -> dict[str, Any]:
         log_path = _append_trade(record)
         record["log_path"] = str(log_path)
         return record
 
-    def _place_spot_market(
-        self,
-        symbol: str,
-        side: str,
-        amount: float,
-        last: float,
-        cost: float,
-    ) -> dict[str, Any]:
+    def _submit_spot_order(self, symbol: str, side: str, amount: float, cost: float) -> dict[str, Any]:
+        """Spot market routed with CCXT type=spot. The param is not an order-body field."""
         params = {"type": "spot"}
         if side == "buy" and hasattr(self.exchange, "create_market_buy_order_with_cost"):
             try:
-                return self._ccxt(
+                order = self._ccxt(
                     lambda: self.exchange.create_market_buy_order_with_cost(symbol, cost, params),
                     label="bitget.spot.buy_cost",
                 )
+                return order if isinstance(order, dict) else {"raw": order}
             except TypeError:
                 try:
-                    return self._ccxt(
+                    order = self._ccxt(
                         lambda: self.exchange.create_market_buy_order_with_cost(symbol, cost),
                         label="bitget.spot.buy_cost.noparams",
                     )
+                    return order if isinstance(order, dict) else {"raw": order}
                 except Exception:
                     pass
             except Exception:
                 pass
-        return self._ccxt(
+        order = self._ccxt(
             lambda: self.exchange.create_order(symbol, "market", side, amount, None, params),
-            label="bitget.spot.create_order",
+            label="bitget.create_order.spot",
         )
+        return order if isinstance(order, dict) else {"raw": order}
+
+    def fetch_ledger_balance(self, coin: str) -> dict[str, Any]:
+        """Spot and USDT-M balances for one coin. The two ledgers are never added together."""
+        wanted = str(coin or "").strip().upper()
+        if not wanted:
+            return {"ok": False, "coin": "", "spot": {}, "swap": {}, "error": "coin required"}
+        legs: dict[str, dict[str, Any]] = {}
+        errors: list[str] = []
+        routes = (
+            ("spot", {"type": "spot"}),
+            ("swap", _futures_params()),
+        )
+        for name, params in routes:
+            try:
+                raw = self._ccxt(
+                    lambda p=dict(params): self.exchange.fetch_balance(p),
+                    label=f"bitget.balance.{name}.ledger",
+                )
+            except Exception as exc:
+                errors.append(f"{name}:{str(exc)[:120]}")
+                legs[name] = {
+                    "ok": False,
+                    "free": 0.0,
+                    "used": 0.0,
+                    "total": 0.0,
+                    "found": False,
+                }
+                continue
+            if not isinstance(raw, dict):
+                errors.append(f"{name}:empty ledger")
+                legs[name] = {
+                    "ok": False,
+                    "free": 0.0,
+                    "used": 0.0,
+                    "total": 0.0,
+                    "found": False,
+                }
+                continue
+            frees = raw.get("free") if isinstance(raw.get("free"), dict) else {}
+            totals = raw.get("total") if isinstance(raw.get("total"), dict) else {}
+            useds = raw.get("used") if isinstance(raw.get("used"), dict) else {}
+            keys = {str(k) for k in list(frees.keys()) + list(totals.keys()) + list(useds.keys())}
+            free_sum = total_sum = used_sum = 0.0
+            found = False
+            for key in keys:
+                if key.upper() != wanted:
+                    continue
+                found = True
+                free_sum += _coin_amt(frees.get(key))
+                total_sum += _coin_amt(totals.get(key))
+                used_sum += _coin_amt(useds.get(key))
+            if used_sum <= 0 and total_sum > free_sum:
+                used_sum = total_sum - free_sum
+            legs[name] = {
+                "ok": True,
+                "free": max(0.0, free_sum),
+                "used": max(0.0, used_sum),
+                "total": max(0.0, total_sum),
+                "found": found,
+            }
+        return {
+            "ok": any(bool(leg.get("ok")) for leg in legs.values()),
+            "coin": wanted,
+            "spot": legs.get("spot") or {},
+            "swap": legs.get("swap") or {},
+            "error": " | ".join(errors)[:240] if errors and not any(leg.get("ok") for leg in legs.values()) else None,
+        }
+
+    def fetch_spot_holdings(self, *, price: bool = True) -> list[dict[str, Any]]:
+        """Non-stable Spot balances. Entry is unknown, so PnL stays unset.
+
+        price=False skips the ticker so a flatten does not quote every coin.
+        """
+        try:
+            raw = self._ccxt(
+                lambda: self.exchange.fetch_balance({"type": "spot"}),
+                label="bitget.balance.spot.holdings",
+            )
+        except Exception as exc:
+            return [{"open": False, "source": "spot", "error": str(exc)[:160], "symbol": ""}]
+        if not isinstance(raw, dict):
+            return []
+        totals = raw.get("total") if isinstance(raw.get("total"), dict) else {}
+        rows: list[dict[str, Any]] = []
+        skip = {"USDT", "USDC", "USD", "EUR", "DAI", "BUSD"}
+        for coin, total in totals.items():
+            name = str(coin or "").upper()
+            if not name or name in skip:
+                continue
+            qty = _coin_amt(total)
+            if qty <= 1e-8:
+                continue
+            symbol = f"{name}/USDT"
+            last = 0.0
+            if price:
+                try:
+                    ticker = self.fetch_ticker(symbol) or {}
+                    last = coerce_price(ticker.get("last"), ticker.get("bid"), ticker.get("ask"))
+                except Exception:
+                    last = 0.0
+            value = round(qty * last, 6) if last > 0 else None
+            rows.append(
+                {
+                    "open": True,
+                    "source": "spot",
+                    "symbol": symbol,
+                    "side": "buy",
+                    "contracts": qty,
+                    "entry_price": None,
+                    "mark_price": last if last > 0 else None,
+                    "pnl_usdt": None,
+                    "pnl_pct": None,
+                    "value_usdt": value,
+                    "error": None,
+                }
+            )
+            if len(rows) >= 12:
+                break
+        return rows
+
+    def close_spot_holding(self, symbol: str, *, reason: str = "manual") -> dict[str, Any]:
+        """Market-sell a Spot balance. Does not touch the USDT-M book."""
+        if not self.sandbox:
+            raise RuntimeError("REFUSING live spot close — sandbox lock tripped")
+        resolved = self.resolve_spot_symbol(symbol) or ""
+        if not resolved:
+            return {
+                "ok": False,
+                "status": "FLAT",
+                "symbol": symbol,
+                "error": "No spot holding",
+                "pnl_usdt": 0.0,
+                "pnl_pct": 0.0,
+            }
+        try:
+            market = self.exchange.market(resolved)
+        except Exception:
+            market = {}
+        base = str((market or {}).get("base") or resolved.split("/")[0])
+        try:
+            raw = self._ccxt(
+                lambda: self.exchange.fetch_balance({"type": "spot"}),
+                label="bitget.balance.spot.close",
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "ERROR",
+                "symbol": resolved,
+                "error": str(exc)[:240],
+                "pnl_usdt": 0.0,
+                "pnl_pct": 0.0,
+            }
+        totals = raw.get("total") if isinstance(raw, dict) and isinstance(raw.get("total"), dict) else {}
+        qty = 0.0
+        for key, total in totals.items():
+            if str(key).upper() == base.upper():
+                qty = _coin_amt(total)
+                break
+        quote = self.fetch_spot_quote(resolved, side="sell")
+        last = coerce_price(quote.get("peg"), quote.get("bid"), quote.get("last"))
+        if qty <= 0:
+            return {
+                "ok": False,
+                "status": "FLAT",
+                "symbol": resolved,
+                "error": "No spot holding",
+                "pnl_usdt": 0.0,
+                "pnl_pct": 0.0,
+            }
+        if last > 0 and qty * last < MIN_CLOSE_NOTIONAL_USDT:
+            return {
+                "ok": True,
+                "status": "DUST",
+                "symbol": resolved,
+                "error": None,
+                "amount": qty,
+                "pnl_usdt": 0.0,
+                "pnl_pct": 0.0,
+            }
+        options = getattr(self.exchange, "options", None)
+        prev = options.get("defaultType") if isinstance(options, dict) else None
+        if isinstance(options, dict):
+            options["defaultType"] = "spot"
+        before = self.fetch_spot_usdt_free()
+        try:
+            order = self._submit_spot_order(resolved, "sell", qty, qty * last if last > 0 else qty)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "ERROR",
+                "symbol": resolved,
+                "error": str(exc)[:400],
+                "pnl_usdt": 0.0,
+                "pnl_pct": 0.0,
+            }
+        finally:
+            if isinstance(options, dict):
+                options["defaultType"] = prev or "swap"
+        after = self.fetch_spot_usdt_free()
+        fill = coerce_price(order.get("average"), order.get("price"), last)
+        return {
+            "ok": True,
+            "status": "CLOSED",
+            "market_type": "spot",
+            "symbol": resolved,
+            "side": "sell",
+            "amount": qty,
+            "price": fill,
+            "reason": reason,
+            "order_id": order.get("id"),
+            "pnl_usdt": round(after - before, 8) if before is not None else 0.0,
+            "pnl_pct": 0.0,
+            "account_balance_before": before,
+            "account_balance_after": after,
+            "account_balance_change": round(after - before, 8),
+            "account_balance_change_source": "spot_demo",
+        }
 
     def fetch_account_equity(self) -> dict[str, Any]:
-        """Live USDT equity via CCXT fetch_balance. Caps the 5–6% daily risk budget."""
+        """Live USDT-M Demo equity. Caps the daily risk budget. No spot wallet."""
         payload = self.fetch_demo_balance()
         usdt = (payload.get("assets") or {}).get("USDT") or {}
         equity = 0.0
@@ -1028,12 +1326,12 @@ class BitgetPaperConnector:
         return {
             "ok": bool(payload.get("ok")) and equity > 0,
             "equity_usdt": round(equity, 6) if equity > 0 else None,
-            "source": "ccxt.fetch_balance",
+            "source": "bitget.futures_demo",
             "error": payload.get("error"),
         }
 
     def _snapshot_usdt(self) -> float | None:
-        """Live Demo USDT total. None if the wallet call fails — caller simulates Δ."""
+        """Live Demo USDT-M total. None if the futures ledger cannot be read."""
         try:
             payload = self.fetch_demo_balance()
             usdt = (payload.get("assets") or {}).get("USDT") or {}
@@ -1055,36 +1353,21 @@ class BitgetPaperConnector:
         balance_before: float | None,
         filled: bool,
     ) -> None:
-        """Set account_balance_change from wallet delta, else margin+fee simulation."""
+        """Stamp the futures-ledger delta. A missed read stays unmeasured, never simulated."""
         record["account_balance_before"] = balance_before
-        if filled:
-            after = self._snapshot_usdt()
-            record["account_balance_after"] = after
-            if balance_before is not None and after is not None:
-                record["account_balance_change"] = round(after - balance_before, 8)
-                record["account_balance_change_source"] = "demo_wallet"
-                return
-        else:
+        if not filled:
             record["account_balance_after"] = balance_before
-        try:
-            notional = float(record.get("notional_usdt") or 0.0)
-        except (TypeError, ValueError):
-            notional = 0.0
-        symbol = str(record.get("symbol") or "")
-        try:
-            is_swap = self._is_swap(symbol) if symbol else True
-        except Exception:
-            is_swap = ":USDT" in symbol
-        change = simulate_account_balance_change(
-            side=str(record.get("side") or ""),
-            notional_usdt=notional,
-            filled=filled,
-            is_swap=is_swap,
-        )
-        record["account_balance_change"] = change
-        record["account_balance_change_source"] = "simulated_margin_fee" if filled else "none"
-        if filled and balance_before is not None and record.get("account_balance_after") is None:
-            record["account_balance_after"] = round(balance_before + change, 8)
+            record["account_balance_change"] = 0.0
+            record["account_balance_change_source"] = "none"
+            return
+        after = self._snapshot_usdt()
+        record["account_balance_after"] = after
+        if balance_before is not None and after is not None:
+            record["account_balance_change"] = round(after - balance_before, 8)
+            record["account_balance_change_source"] = "futures_demo"
+            return
+        record["account_balance_change"] = 0.0
+        record["account_balance_change_source"] = "unmeasured"
 
     def fetch_ticker(self, symbol: str | None = None) -> dict[str, Any]:
         """Live Bitget MAINNET ticker (spot or swap). Never a sandbox print."""
@@ -1236,31 +1519,44 @@ class BitgetPaperConnector:
         }
 
     def fetch_open_position(self, symbol: str | None = None) -> dict[str, Any]:
-        """Live CCXT positions for the target. Never invents an open book."""
+        """Live USDT-M position. Spot wallet coins are not a position."""
         target = symbol or self.resolved_symbol or self.preferred_symbol
+        contract = self.resolve_contract_symbol(str(target or "")) or (
+            str(target) if _looks_contract(str(target or "")) else ""
+        )
         errors: list[str] = []
         positions: list[dict[str, Any]] = []
-        try:
-            raw = self._ccxt(
-                lambda: self.exchange.fetch_positions([target]),
-                label="bitget.fetch_positions",
-            )
-            positions = list(raw or [])
-        except Exception as exc:
-            errors.append(str(exc)[:160])
+        targeted_ok = False
+        if contract:
             try:
-                raw = self._ccxt(lambda: self.exchange.fetch_positions(), label="bitget.fetch_positions.all")
+                raw = self._ccxt(
+                    lambda: self.exchange.fetch_positions([contract], _futures_params()),
+                    label="bitget.fetch_positions",
+                )
+                positions = list(raw or [])
+                targeted_ok = True
+            except Exception as exc:
+                errors.append(str(exc)[:160])
+        if not targeted_ok:
+            try:
+                raw = self._ccxt(
+                    lambda: self.exchange.fetch_positions(None, _futures_params()),
+                    label="bitget.fetch_positions.all",
+                )
                 positions = list(raw or [])
             except Exception as exc2:
                 errors.append(str(exc2)[:160])
 
+        wanted = contract or str(target or "")
         for pos in positions:
-            if not _position_is_open(pos, target):
+            if not isinstance(pos, dict):
+                continue
+            if wanted and not _position_is_open(pos, wanted):
                 continue
             return {
                 "open": True,
                 "source": "positions",
-                "symbol": target,
+                "symbol": str(pos.get("symbol") or wanted),
                 "side": pos.get("side"),
                 "contracts": _position_contracts(pos),
                 "entry_price": position_entry_price(pos),
@@ -1270,13 +1566,10 @@ class BitgetPaperConnector:
                 "error": None,
             }
 
-        spot = self._spot_base_holding(target)
-        if spot.get("open"):
-            return spot
         return {
             "open": False,
             "source": "positions",
-            "symbol": target,
+            "symbol": wanted,
             "side": None,
             "contracts": 0.0,
             "entry_price": None,
@@ -1327,6 +1620,45 @@ class BitgetPaperConnector:
         side_n = side.lower().strip()
         if side_n not in {"buy", "sell"}:
             raise ValueError("side must be buy or sell")
+
+        contract = self.resolve_contract_symbol(symbol)
+        markets = getattr(self.exchange, "markets", None)
+        row = markets.get(contract) if isinstance(markets, dict) and contract else None
+        if contract and not _is_equity_market(contract, row if isinstance(row, dict) else {}):
+            contract = None
+        if not contract:
+            record = {
+                "id": str(uuid.uuid4()),
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "venue": "bitget-demo",
+                "sandbox": True,
+                "live_trading": False,
+                "symbol": symbol,
+                "side": side_n,
+                "amount": 0.0,
+                "notional_usdt": 0.0,
+                "reasoning_hash": reasoning_hash,
+                "ok": False,
+                "status": "NOT_PERP",
+                "order_id": None,
+                "raw_order": {},
+                "error": (
+                    "SPOT trading is disabled. Chronos-Nexus executes "
+                    "Bitget Demo USDT-M perpetuals only."
+                ),
+                "price": 0.0,
+                "entry_price": 0.0,
+                "account_balance_change": 0.0,
+                "account_balance_change_source": "none",
+                "sl_price": None,
+                "tp_price": None,
+            }
+            if extra:
+                record["board"] = extra
+            log_path = _append_trade(record)
+            record["log_path"] = str(log_path)
+            return record
+        symbol = contract
 
         try:
             existing = self.fetch_open_position(symbol)
@@ -1562,6 +1894,8 @@ class BitgetPaperConnector:
         sl_margin_frac: float | None = None,
     ) -> dict[str, Any]:
         is_swap = self._is_swap(symbol)
+        if not is_swap:
+            raise RuntimeError("REFUSING spot order — desk is USDT-M perpetuals only")
         if is_swap:
             try:
                 self._ccxt(lambda: self.exchange.set_leverage(5, symbol), label="bitget.leverage")
@@ -1584,6 +1918,7 @@ class BitgetPaperConnector:
             tp_px = self._price(symbol, tp)
             param_sets: list[dict[str, Any]] = [
                 {
+                    "type": "swap",
                     "marginMode": "crossed",
                     "tradeSide": "open",
                     "hedged": True,
@@ -1593,13 +1928,14 @@ class BitgetPaperConnector:
                     "presetTakeProfitPrice": tp_px,
                 },
                 {
+                    "type": "swap",
                     "marginMode": "crossed",
                     "tradeSide": "open",
                     "hedged": True,
                     "stopLossPrice": sl_px,
                     "takeProfitPrice": tp_px,
                 },
-                {"marginMode": "crossed", "tradeSide": "open", "hedged": True},
+                {"type": "swap", "marginMode": "crossed", "tradeSide": "open", "hedged": True},
             ]
             last_exc: Exception | None = None
             for params in param_sets:
@@ -1616,23 +1952,6 @@ class BitgetPaperConnector:
             if last_exc is not None:
                 raise last_exc
             raise RuntimeError("swap create_order failed")
-
-        try:
-            return self._ccxt(
-                lambda: self.exchange.create_order(symbol, "market", side, amount),
-                label="bitget.create_order.spot",
-            )
-        except Exception as first:
-            if side == "buy" and hasattr(self.exchange, "create_market_buy_order_with_cost"):
-                cost = max(amount * last, 10.0)
-                try:
-                    return self._ccxt(
-                        lambda: self.exchange.create_market_buy_order_with_cost(symbol, cost),
-                        label="bitget.market_buy_cost",
-                    )
-                except Exception as second:
-                    raise RuntimeError(f"{first} | fallback: {second}") from second
-            raise
 
     def _place_sl_tp(
         self,
@@ -1685,6 +2004,10 @@ class BitgetPaperConnector:
             "tp_error": None,
         }
         is_swap = self._is_swap(symbol)
+        if not is_swap:
+            out["sl_error"] = "spot protective orders are disabled"
+            out["tp_error"] = "spot protective orders are disabled"
+            return out
         close_side = "buy" if short else "sell"
         hold = "short" if short else "long"
         close = {
@@ -1712,12 +2035,6 @@ class BitgetPaperConnector:
                     {**close, "triggerPrice": sl, "planType": "pos_loss", "triggerType": "mark_price"},
                 ),
             ]
-        else:
-            sl_attempts = [
-                ("stop_market", None, {"stopPrice": sl, "triggerPrice": sl}),
-                ("stop", sl, {"stopPrice": sl, "triggerPrice": sl}),
-                ("market", None, {"stopLossPrice": sl}),
-            ]
         sl_order, sl_err = self._first_order(symbol, close_side, qty, sl_attempts)
         out["sl_order"] = _slim_order(sl_order) if sl_order else None
         out["sl_error"] = sl_err
@@ -1737,11 +2054,6 @@ class BitgetPaperConnector:
                     None,
                     {**close, "triggerPrice": tp, "planType": "pos_profit", "triggerType": "mark_price"},
                 ),
-            ]
-        else:
-            tp_attempts = [
-                ("limit", tp, {"timeInForce": "GTC"}),
-                ("limit", tp, {"takeProfitPrice": tp}),
             ]
         tp_order, tp_err = self._first_order(symbol, close_side, tp_qty, tp_attempts)
         out["tp_order"] = _slim_order(tp_order) if tp_order else None
@@ -1777,6 +2089,14 @@ class BitgetPaperConnector:
         close_side = "buy" if short else "sell"
         hold = "short" if short else "long"
         is_swap = self._is_swap(symbol)
+        if not is_swap:
+            return {
+                "ok": False,
+                "sl_price": sl,
+                "sl_order": None,
+                "error": "spot protective orders are disabled",
+                "qty": qty,
+            }
         close = {
             "reduceOnly": True,
             "marginMode": "crossed",
@@ -1790,11 +2110,6 @@ class BitgetPaperConnector:
                 ("market", None, {**close, "stopLossPrice": sl, "presetStopLossPrice": sl}),
                 ("stop", sl, {**close, "stopPrice": sl, "triggerPrice": sl}),
                 ("stop_market", None, {**close, "stopPrice": sl, "triggerPrice": sl}),
-            ]
-        else:
-            attempts = [
-                ("stop_market", None, {"stopPrice": sl, "triggerPrice": sl}),
-                ("stop", sl, {"stopPrice": sl, "triggerPrice": sl}),
             ]
         order, err = self._first_order(symbol, close_side, qty, attempts)
         return {
@@ -2090,47 +2405,6 @@ class BitgetPaperConnector:
                 continue
         return None, last_err
 
-    def _spot_base_holding(self, symbol: str) -> dict[str, Any]:
-        try:
-            market = self.exchange.market(symbol)
-        except Exception:
-            return {"open": False, "source": "spot", "symbol": symbol}
-        if market.get("swap") or market.get("future"):
-            return {"open": False, "source": "spot", "symbol": symbol}
-        base = str(market.get("base") or "")
-        if not base or base.upper() in {"USDT", "USDC"}:
-            return {"open": False, "source": "spot", "symbol": symbol}
-        try:
-            raw = self._ccxt(
-                lambda: self.exchange.fetch_balance({"type": "spot"}),
-                label="bitget.balance.spot.position",
-            )
-        except Exception as exc:
-            return {"open": False, "source": "spot", "symbol": symbol, "error": str(exc)[:160]}
-        totals = raw.get("total") or {}
-        try:
-            held = float(totals.get(base) or 0)
-        except (TypeError, ValueError):
-            held = 0.0
-        min_amt = 0.0
-        try:
-            min_amt = float(((market.get("limits") or {}).get("amount") or {}).get("min") or 0)
-        except (TypeError, ValueError):
-            min_amt = 0.0
-        dust = max(min_amt, 1e-8)
-        if held > dust:
-            return {
-                "open": True,
-                "source": "spot",
-                "symbol": symbol,
-                "side": "long",
-                "contracts": held,
-                "entry_price": None,
-                "raw": {"base": base, "total": held},
-                "error": None,
-            }
-        return {"open": False, "source": "spot", "symbol": symbol, "contracts": held}
-
     def fetch_ohlcv(
         self,
         symbol: str,
@@ -2315,12 +2589,15 @@ class BitgetPaperConnector:
         return compute_atr(rows, period)
 
     def fetch_open_book(self) -> list[dict[str, Any]]:
-        """Every live Demo position with mark, entry, and unrealized PnL."""
+        """Every live USDT-M Demo position. Spot balances are not positions."""
         raw: list[Any] = []
         errors: list[str] = []
         try:
             raw = list(
-                self._ccxt(lambda: self.exchange.fetch_positions(), label="bitget.fetch_positions.book")
+                self._ccxt(
+                    lambda: self.exchange.fetch_positions(None, _futures_params()),
+                    label="bitget.fetch_positions.book",
+                )
                 or []
             )
         except Exception as exc:
@@ -2328,8 +2605,13 @@ class BitgetPaperConnector:
         book: list[dict[str, Any]] = []
         seen: set[str] = set()
         for pos in raw:
+            if not isinstance(pos, dict):
+                continue
             snap = normalize_position(pos)
             if not snap or not snap.get("open"):
+                continue
+            symbol = str(snap.get("symbol") or "")
+            if not _looks_contract(symbol) and not _is_contract_market(symbol, None):
                 continue
             key = f"{snap['symbol']}|{snap['side']}"
             if key in seen:
@@ -2337,36 +2619,6 @@ class BitgetPaperConnector:
             seen.add(key)
             self._overlay_live_mark(snap)
             book.append(snap)
-        if not book:
-            for symbol in list(self.universe or [])[:40]:
-                try:
-                    spot = self._spot_base_holding(symbol)
-                except Exception:
-                    continue
-                if not spot.get("open"):
-                    continue
-                ticker = self.fetch_ticker(symbol) or {}
-                mark = coerce_price(ticker.get("mark"), ticker.get("last"), ticker.get("bid"), ticker.get("ask"))
-                qty = float(spot.get("contracts") or 0.0)
-                entry = _positive_float(spot.get("entry_price"))
-                pnl_usdt, pnl_pct = (
-                    unrealized_pnl(entry, mark, qty, "buy") if entry is not None and mark > 0 else (None, None)
-                )
-                row = {
-                    "open": True,
-                    "source": "spot",
-                    "symbol": symbol,
-                    "side": "buy",
-                    "contracts": qty,
-                    "entry_price": entry,
-                    "mark_price": mark if mark > 0 else None,
-                    "pnl_usdt": pnl_usdt,
-                    "pnl_pct": pnl_pct,
-                    "raw": spot.get("raw") or {},
-                    "error": None,
-                }
-                self._overlay_live_mark(row)
-                book.append(row)
         if errors and not book:
             return [{"open": False, "error": " | ".join(errors), "symbol": "", "side": "none"}]
         return book
@@ -2393,6 +2645,37 @@ class BitgetPaperConnector:
     ) -> dict[str, Any]:
         if not self.sandbox:
             raise RuntimeError("REFUSING live close — sandbox lock tripped")
+        contract = self.resolve_contract_symbol(symbol) or (
+            symbol if _looks_contract(symbol) else ""
+        )
+        if not contract:
+            return {
+                "ok": False,
+                "status": "FLAT",
+                "symbol": symbol,
+                "error": "No open USDT-M position",
+                "pnl_usdt": 0.0,
+                "pnl_pct": 0.0,
+            }
+        symbol = contract
+        options = getattr(self.exchange, "options", None)
+        prev_type = options.get("defaultType") if isinstance(options, dict) else None
+        if isinstance(options, dict):
+            options["defaultType"] = "swap"
+        try:
+            return self._close_market_on_swap(symbol, fraction=fraction, reason=reason, side=side)
+        finally:
+            if isinstance(options, dict):
+                options["defaultType"] = prev_type or "swap"
+
+    def _close_market_on_swap(
+        self,
+        symbol: str,
+        *,
+        fraction: float = 1.0,
+        reason: str = "manual",
+        side: str | None = None,
+    ) -> dict[str, Any]:
         existing = self.fetch_open_position(symbol)
         if side:
             wanted = _norm_side(side)
@@ -2409,6 +2692,9 @@ class BitgetPaperConnector:
                 "pnl_usdt": 0.0,
                 "pnl_pct": 0.0,
             }
+        live_symbol = str(existing.get("symbol") or symbol)
+        if _looks_contract(live_symbol):
+            symbol = live_symbol
         pos_side = _norm_side(str(existing.get("side") or side or "buy"))
         entry = coerce_price(existing.get("entry_price"), (existing.get("raw") or {}).get("entryPrice"))
         close_side_guess = "buy" if pos_side in {"sell", "short"} else "sell"
@@ -2443,16 +2729,17 @@ class BitgetPaperConnector:
         param_sets: list[dict[str, Any]] = [{}]
         if is_swap:
             param_sets = [
-                {"reduceOnly": True, "marginMode": "crossed", "hedged": False},
+                {"type": "swap", "reduceOnly": True, "marginMode": "crossed", "hedged": False},
                 {
+                    "type": "swap",
                     "reduceOnly": True,
                     "marginMode": "crossed",
                     "hedged": True,
                     "holdSide": hold,
                     "_order_side": position_side,
                 },
-                {"reduceOnly": True, "holdSide": hold, "hedged": False},
-                {"reduceOnly": True, "hedged": False},
+                {"type": "swap", "reduceOnly": True, "holdSide": hold, "hedged": False},
+                {"type": "swap", "reduceOnly": True, "hedged": False},
             ]
         balance_before = self._snapshot_usdt()
         record: dict[str, Any] = {
@@ -2660,13 +2947,18 @@ class BitgetPaperConnector:
             if not symbol or symbol in seen:
                 continue
             seen.add(symbol)
-            if symbol in markets:
+            market = markets.get(symbol)
+            if not isinstance(market, dict):
+                formed = _to_contract_symbol(symbol)
+                market = markets.get(formed)
+                symbol = formed
+            if isinstance(market, dict) and _is_equity_market(symbol, market):
                 return symbol
-        # last resort: any USDT spot
         for symbol, market in markets.items():
-            if market.get("spot") and str(symbol).endswith("/USDT"):
+            row = market if isinstance(market, dict) else {}
+            if _is_equity_market(str(symbol), row):
                 return str(symbol)
-        raise RuntimeError("No tradable Demo market found on Bitget sandbox")
+        raise RuntimeError("No tradable Demo USDT-M perp found on Bitget sandbox")
 
 
 _CRYPTO_DENY = {
@@ -2693,7 +2985,7 @@ def _select_equity_universe(markets: dict[str, Any]) -> list[str]:
 
 
 def _usdt_fallback_universe(markets: dict[str, Any]) -> list[str]:
-    """When Demo lists no tagged stock/rToken markets, keep a live USDT book rather than a hardcoded five."""
+    """USDT-M perps only, when the tagged equity pass is empty. Never spot."""
     out: list[str] = []
     seen: set[str] = set()
     for symbol, market in (markets or {}).items():
@@ -2701,10 +2993,7 @@ def _usdt_fallback_universe(markets: dict[str, Any]) -> list[str]:
         if not name or name in seen:
             continue
         row = market if isinstance(market, dict) else {}
-        quote = str(row.get("quote") or "").upper()
-        if quote not in {"USDT", "USD", "USDC"} and "USDT" not in name.upper():
-            continue
-        if not (row.get("swap") or row.get("future") or row.get("spot") or ":USDT" in name or name.endswith("/USDT")):
+        if not _is_equity_market(name, row):
             continue
         seen.add(name)
         out.append(name)
@@ -2730,8 +3019,10 @@ def _is_spot_market(symbol: str, market: dict[str, Any] | None = None) -> bool:
 
 
 def _is_equity_market(symbol: str, market: dict[str, Any] | None = None) -> bool:
-    """True for Bitget stock perps, rTokens, and US-equity-like Demo listings."""
+    """Stock perps, rToken perps, and equity-like USDT-M contracts. Never spot."""
     market = market or {}
+    if not _is_contract_market(symbol, market):
+        return False
     info = market.get("info") if isinstance(market.get("info"), dict) else {}
     tags = " ".join(
         str(info.get(key) or "")
@@ -2746,21 +3037,20 @@ def _is_equity_market(symbol: str, market: dict[str, Any] | None = None) -> bool
             "symbol",
         )
     ).upper()
-    if any(tok in tags for tok in ("STOCK", "EQUITY", "RTOKEN", "SUSDT", "SHARE")):
-        return True
     base = str(market.get("base") or symbol.split(":")[0].split("/")[0] or "").strip()
     if not base:
         return False
+    root = base[1:].upper() if base[0] in {"r", "R"} and len(base) > 2 and base[1:].isalpha() else base.upper()
+    if root in _CRYPTO_DENY or base.upper() in _CRYPTO_DENY:
+        return False
+    if any(tok in tags for tok in ("STOCK", "EQUITY", "RTOKEN", "SHARE")):
+        return True
     if base[0] in {"r", "R"} and len(base) > 2 and base[1:].replace("-", "").isalpha():
         return True
-    root = base[1:].upper() if base[0] in {"r", "R"} and len(base) > 2 and base[1:].isalpha() else base.upper()
-    if root in _CRYPTO_DENY:
-        return False
     quote = str(market.get("quote") or "").upper()
     usdtish = quote in {"USDT", "USD", "USDC", ""} or "USDT" in symbol.upper()
-    if root.isalpha() and 1 <= len(root) <= 6 and usdtish:
-        if market.get("swap") or market.get("future") or ":USDT" in symbol:
-            return True
+    if root.isalpha() and 1 <= len(root) <= 10 and usdtish:
+        return True
     return False
 
 

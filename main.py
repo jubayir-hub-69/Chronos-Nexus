@@ -147,17 +147,17 @@ def listed_demo_symbol(
     markets = {}
     if bitget is not None:
         markets = getattr(bitget.exchange, "markets", None) or {}
-    aliases = _symbol_aliases(snapped)
-    for cand in aliases:
+    for cand in _symbol_aliases(snapped):
         if not markets or cand in markets:
-            if not markets:
-                return snapped
             return cand
+    root = _ticker_root(snapped)
     for member in universe:
+        if _ticker_root(member) != root:
+            continue
         for cand in _symbol_aliases(member):
-            if cand in markets and _ticker_root(cand) == _ticker_root(snapped):
+            if not markets or cand in markets:
                 return cand
-    return snapped
+    return STAND_DOWN_SYMBOL
 
 
 def _ticker_root(symbol: str) -> str:
@@ -168,10 +168,16 @@ def _ticker_root(symbol: str) -> str:
 
 
 def _symbol_aliases(symbol: str) -> list[str]:
+    """Contract aliases only. Spot `BASE/USDT` is not an execution target."""
     root = _ticker_root(symbol)
-    alts = [symbol, root, f"{root}/USDT", f"{root}/USDT:USDT"]
+    raw = (symbol or "").strip()
+    alts = []
+    if ":" in raw:
+        alts.append(raw)
+    alts.append(f"{root}/USDT:USDT")
+    alts.append(f"r{root}/USDT:USDT")
     if root == "GOOG":
-        alts += ["GOOGL", "GOOGL/USDT", "GOOGL/USDT:USDT"]
+        alts.append("GOOGL/USDT:USDT")
     out: list[str] = []
     for item in alts:
         if item and item not in out:
@@ -1141,7 +1147,7 @@ def _main() -> int:
     )
     table.add_row(
         "Telegram Commands",
-        "/positions /close /closeall /price /balance /pnl /status + Spot chatbox"
+        "/positions /close /closeall /price /balance /pnl /status · AI futures, operator spot"
         if notifier.enabled and bitget is not None
         else "disarmed",
         status_dot(notifier.enabled and bitget is not None, label_ok="ARMED", label_bad="OFF"),

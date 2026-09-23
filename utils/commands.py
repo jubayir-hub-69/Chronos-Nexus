@@ -29,8 +29,6 @@ from utils.spot_chat import (
     parse_callback,
     parse_spot_intent,
     preview_html,
-    receipt_html,
-    timeline_html,
 )
 
 OFFSET_PATH = PROJECT_ROOT / "data" / "telegram_offset.json"
@@ -46,34 +44,55 @@ BOT_MENU = [
     {"command": "pnl", "description": "Today's realized PnL and daily limits"},
     {"command": "status", "description": "Live ORACLE / SENTINEL desk state"},
 ]
+ACCESS_DENIED = "Access Denied: Operator command only."
 HELP_PLAIN = (
     "CHRONOS-NEXUS COMMANDS\n"
-    "AI desk opens are automated only. Manual chatbox is Bitget SPOT.\n\n"
+    "AI cycle: Bitget Demo USDT-M perpetuals only.\n"
+    "Operator chat: manual Spot, e.g. BUY 1000 USDT BTC.\n\n"
     "/menu               headless terminal dashboard + buttons\n"
-    "/positions          live book + PnL\n"
-    "/close SYMBOL       market-close one name\n"
-    "/closeall           flatten the whole Demo book\n"
+    "/positions          futures book + spot holdings\n"
+    "/close SYMBOL       close one futures position or spot holding\n"
+    "/closeall           flatten futures and spot\n"
     "/price SYMBOL       last, 24h high/low, volume, market cap\n"
-    "/balance SYMBOL     live ledger free / used / total\n"
+    "/balance            spot and futures ledgers (or /balance COIN)\n"
     "/pnl                today's realized PnL, W/L, trades left\n"
     "/status             live ORACLE sentiment + SENTINEL desk\n"
-    "NVDA/USDT BUY $10   Spot preview + confirm buttons\n"
     "/help               this list"
 )
 HELP_HTML = (
     "<b>CHRONOS-NEXUS COMMANDS</b>\n"
-    "AI cycle is untouched. Manual chatbox is <b>Bitget Spot</b> only.\n\n"
+    "AI cycle trades <b>Bitget Demo USDT-M perpetuals</b> only.\n"
+    "Operator chat can send a Spot order: <code>BUY 1000 USDT BTC</code>.\n\n"
     "<code>/menu</code> — headless terminal dashboard + live buttons\n"
-    "<code>/positions</code> — live book + PnL\n"
-    "<code>/close SYMBOL</code> — market-close one name\n"
-    "<code>/closeall</code> — flatten the whole Demo book\n"
+    "<code>/positions</code> — futures book + spot holdings\n"
+    "<code>/close SYMBOL</code> — close one futures position or spot holding\n"
+    "<code>/closeall</code> — flatten futures and spot\n"
     "<code>/price SYMBOL</code> — last, 24h high/low, volume, market cap\n"
-    "<code>/balance SYMBOL</code> — live ledger free / used / total\n"
+    "<code>/balance</code> — spot and futures ledgers, or <code>/balance COIN</code>\n"
     "<code>/pnl</code> — today's realized PnL, win/loss, trades left\n"
     "<code>/status</code> — live ORACLE sentiment + SENTINEL desk\n"
-    "<code>NVDA/USDT BUY $10</code> — Spot preview, then Confirm / Cancel\n"
     "<code>/help</code> — this list"
 )
+GUEST_HELP_HTML = (
+    "<b>CHRONOS-NEXUS</b> · guest access\n"
+    "Read-only commands: <code>/help</code> <code>/price</code> "
+    "<code>/status</code> <code>/positions</code>.\n"
+    "Those read the live desk and the mainnet price feed.\n"
+    "Orders, closes, and the futures wallet belong to the operator.\n"
+    f"<code>{ACCESS_DENIED}</code>"
+)
+_GUEST_READ = {"help", "price", "status", "positions"}
+_OPERATOR_CMDS = {
+    "close",
+    "closeall",
+    "buy",
+    "sell",
+    "open",
+    "long",
+    "short",
+    "balance",
+    "pnl",
+}
 _DESK_CALLBACKS = {
     "nx:status": "status",
     "nx:pnl": "pnl",
@@ -199,8 +218,9 @@ class CommandDesk:
             return self._cmd_menu()
         if cmd in {"buy", "sell", "open", "long", "short"}:
             msg = (
-                "REFUSED — manual open is disabled on the AI desk. "
-                "For a Bitget Spot chatbox fill send: NVDA/USDT BUY $10"
+                "REFUSED — manual /buy without an amount is disabled. "
+                "Send BUY 10 USDT AAPL for a Bitget Spot fill. "
+                "The AI cycle stays on USDT-M perpetuals."
             )
             return CommandResult(cmd, False, msg, f"<b>{msg}</b>", [])
         msg = f"Unknown command /{cmd}. Try /help."
@@ -210,14 +230,34 @@ class CommandDesk:
         if self.bitget is None:
             msg = "Bitget Demo rail unbound — cannot read positions."
             return CommandResult("positions", False, msg, msg, [])
-        book = self.desk.snapshot(self.bitget)
-        if not book:
-            plain = "FLAT — no open Demo positions."
-            html = "<b>CHRONOS-NEXUS</b>\n📊 <b>OPEN POSITIONS</b>\n\nFLAT — no open Demo positions."
+        try:
+            futures = [row for row in self.desk.snapshot(self.bitget) if row.get("open")]
+        except Exception as exc:
+            futures = [{"open": False, "error": str(exc), "symbol": "futures"}]
+        try:
+            raw_spots = self.bitget.fetch_spot_holdings()
+            spots = list(raw_spots) if isinstance(raw_spots, list) else []
+        except Exception as exc:
+            spots = [{"open": False, "source": "spot", "error": str(exc), "symbol": ""}]
+        spot_open = [row for row in spots if row.get("open")]
+        futures_err = next((row.get("error") for row in futures if row.get("error") and not row.get("open")), None)
+        spot_err = next((row.get("error") for row in spots if row.get("error") and not row.get("open")), None)
+        if not futures and not spot_open and not futures_err and not spot_err:
+            plain = "FLAT — no open futures positions or spot holdings."
+            html = (
+                "<b>CHRONOS-NEXUS</b>\n📊 <b>OPEN POSITIONS</b>\n\n"
+                "FLAT — no open futures positions or spot holdings."
+            )
             return CommandResult("positions", True, plain, html, [])
         plain_lines = ["OPEN POSITIONS"]
         html_lines = ["<b>CHRONOS-NEXUS</b>", "📊 <b>OPEN POSITIONS</b>", ""]
-        for pos in book:
+        if futures_err:
+            plain_lines.append(f"FUTURES ledger: {futures_err}")
+            html_lines.append(f"<b>FUTURES</b> ledger: {escape_html(str(futures_err))}")
+        if futures:
+            plain_lines.append("FUTURES")
+            html_lines.append("<b>FUTURES</b>")
+        for pos in futures:
             pnl_pct = _opt_float(pos.get("pnl_pct"))
             pnl_usdt = _opt_float(pos.get("pnl_usdt"))
             symbol = pos.get("symbol")
@@ -246,6 +286,27 @@ class CommandDesk:
                 f"mark <code>{mark_s}</code>\n"
                 f"PnL <b>{pnl_pct_s}</b>  "
                 f"<b>{pnl_usdt_s} USDT</b>"
+            )
+            html_lines.append("")
+        if spot_err:
+            plain_lines.append(f"SPOT ledger: {spot_err}")
+            html_lines.append(f"<b>SPOT</b> ledger: {escape_html(str(spot_err))}")
+        if spot_open:
+            plain_lines.append("SPOT")
+            html_lines.append("<b>SPOT</b>")
+        for pos in spot_open:
+            symbol = pos.get("symbol")
+            qty = pos.get("contracts")
+            mark_s = _fmt_px(pos.get("mark_price"))
+            value = _opt_float(pos.get("value_usdt"))
+            value_s = "n/a" if value is None else f"{value:.4f}"
+            plain_lines.append(
+                f"SPOT {symbol}  qty={qty}  last={mark_s}  value {value_s} USDT"
+            )
+            html_lines.append(
+                f"🟢 <code>{symbol}</code>  SPOT\n"
+                f"qty <code>{qty}</code>  last <code>{mark_s}</code>\n"
+                f"value <b>{value_s} USDT</b>"
             )
             html_lines.append("")
         return CommandResult(
@@ -331,52 +392,45 @@ class CommandDesk:
         return CommandResult("price", True, plain, "\n".join(html_lines), [])
 
     def _cmd_balance(self, arg: str) -> CommandResult:
-        coin = _wallet_coin(arg)
-        if not coin:
-            msg = "Please specify a token (e.g., /balance USDT or /balance NVDA)"
-            return CommandResult("balance", False, msg, msg, [])
+        coin = _wallet_coin(arg) or "USDT"
         if self.bitget is None:
             msg = "Bitget rail unbound — cannot read the wallet."
             return CommandResult("balance", False, msg, msg, [])
         try:
-            payload = self.bitget.fetch_asset_balance(coin)
+            payload = self.bitget.fetch_ledger_balance(coin)
         except Exception as exc:
             msg = f"Wallet lookup failed: {exc}"
             return CommandResult("balance", False, msg, f"<b>Wallet lookup failed</b>\n{exc}", [])
-        if payload.get("ok") is False:
-            err = str(payload.get("error") or "Bitget ledger unavailable")
+        if not isinstance(payload, dict) or payload.get("ok") is False:
+            err = str((payload or {}).get("error") or "Bitget ledger unavailable") if isinstance(payload, dict) else "Bitget ledger unavailable"
             msg = f"Wallet lookup failed: {err}"
             return CommandResult("balance", False, msg, f"<b>Wallet lookup failed</b>\n{escape_html(err)}", [])
-        free = _amt0(payload.get("free"))
-        used = _amt0(payload.get("used"))
-        total = _amt0(payload.get("total"))
-        found = bool(payload.get("found"))
-        if not found or (free <= 0 and total <= 0):
-            msg = f"0.00 {coin} found in wallet."
-            return CommandResult(
-                "balance",
-                True,
-                msg,
-                f"<code>0.00 {coin}</code> found in wallet.",
-                [],
-            )
         label = str(payload.get("coin") or coin).upper()
-        source = str(payload.get("source") or "bitget.fetch_balance")
+        spot = payload.get("spot") if isinstance(payload.get("spot"), dict) else {}
+        swap = payload.get("swap") if isinstance(payload.get("swap"), dict) else {}
+        spot_free = _amt0(spot.get("free"))
+        spot_used = _amt0(spot.get("used"))
+        spot_total = _amt0(spot.get("total"))
+        swap_free = _amt0(swap.get("free"))
+        swap_used = _amt0(swap.get("used"))
+        swap_total = _amt0(swap.get("total"))
+        found = bool(spot.get("found") or swap.get("found"))
+        if not found or (
+            spot_free <= 0 and spot_total <= 0 and swap_free <= 0 and swap_total <= 0
+        ):
+            msg = f"0.00 {label} found in wallet."
+            return CommandResult("balance", True, msg, f"<code>0.00 {label}</code> found in wallet.", [])
         plain = (
             f"{label}\n"
-            f"free  {free:.8f}\n"
-            f"used  {used:.8f}\n"
-            f"total {total:.8f}\n"
-            f"ledger {source}"
+            f"spot free {spot_free:.8f}  used {spot_used:.8f}  total {spot_total:.8f}\n"
+            f"futures free {swap_free:.8f}  used {swap_used:.8f}  total {swap_total:.8f}"
         )
         html = "\n".join(
             [
                 "<b>CHRONOS-NEXUS</b>",
                 f"<code>{label}</code>",
-                f"free <code>{free:.8f}</code>",
-                f"used <code>{used:.8f}</code>",
-                f"total <code>{total:.8f}</code>",
-                f"ledger <code>{escape_html(source)}</code>",
+                f"spot free <code>{spot_free:.8f}</code>  used <code>{spot_used:.8f}</code>  total <code>{spot_total:.8f}</code>",
+                f"futures free <code>{swap_free:.8f}</code>  used <code>{swap_used:.8f}</code>  total <code>{swap_total:.8f}</code>",
             ]
         )
         return CommandResult("balance", True, plain, html, [])
@@ -646,16 +700,42 @@ class CommandDesk:
             return CommandResult("close", False, msg, "Usage: <code>/close SYMBOL</code>", [])
         book = self.desk.snapshot(self.bitget)
         match = _match_symbol(arg, book)
+        tag = f"MANUAL /close ({source})"
         if match is None:
-            msg = f"No open position matching {arg}."
+            spots = []
+            try:
+                raw_spots = self.bitget.fetch_spot_holdings()
+                spots = list(raw_spots) if isinstance(raw_spots, list) else []
+            except Exception:
+                spots = []
+            spot = _match_symbol(arg, [row for row in spots if row.get("open")])
+            if spot is None:
+                msg = f"No open position matching {arg}."
+                return CommandResult(
+                    "close",
+                    False,
+                    msg,
+                    f"No open position matching <code>{arg}</code>.",
+                    [],
+                )
+            result = self.bitget.close_spot_holding(str(spot.get("symbol")), reason=tag)
+            result["kind"] = "MANUAL"
+            result["reason"] = tag
+            if result.get("ok") and str(result.get("status") or "") == "DUST":
+                msg = f"DUST {spot.get('symbol')} — below 1 USDT minimum, not sent"
+                return CommandResult("close", True, msg, f"<b>{msg}</b>", [result])
+            if result.get("ok"):
+                msg = f"CLOSED SPOT {spot.get('symbol')}  qty={result.get('amount')}"
+                return CommandResult("close", True, msg, f"<b>{msg}</b>", [result])
+            err = str(result.get("error") or result.get("status") or "close failed")
+            msg = f"CLOSE FAILED {spot.get('symbol')} — {err}"
             return CommandResult(
                 "close",
                 False,
                 msg,
-                f"No open position matching <code>{arg}</code>.",
-                [],
+                f"<b>CLOSE FAILED</b> <code>{spot.get('symbol')}</code>\n{err}",
+                [result],
             )
-        tag = f"MANUAL /close ({source})"
         result = self.bitget.close_market(
             str(match.get("symbol")),
             fraction=1.0,
@@ -692,7 +772,44 @@ class CommandDesk:
             msg = "Bitget Demo rail unbound — cannot close."
             return CommandResult("closeall", False, msg, msg, [])
         tag = f"MANUAL /closeall ({source})"
-        results = self.bitget.close_all(reason=tag)
+        try:
+            results = list(self.bitget.close_all(reason=tag) or [])
+        except Exception as exc:
+            results = [{
+                "ok": False,
+                "status": "ERROR",
+                "symbol": "FUTURES",
+                "error": str(exc)[:240],
+                "pnl_usdt": 0.0,
+                "pnl_pct": 0.0,
+            }]
+        try:
+            raw_spots = self.bitget.fetch_spot_holdings(price=False)
+            spots = [row for row in raw_spots if isinstance(row, dict) and row.get("open")] if isinstance(raw_spots, list) else []
+        except Exception as exc:
+            spots = []
+            results.append({
+                "ok": False,
+                "status": "ERROR",
+                "symbol": "SPOT",
+                "error": str(exc)[:240],
+                "pnl_usdt": 0.0,
+                "pnl_pct": 0.0,
+            })
+        for row in spots:
+            try:
+                results.append(
+                    self.bitget.close_spot_holding(str(row.get("symbol") or ""), reason=tag)
+                )
+            except Exception as exc:
+                results.append({
+                    "ok": False,
+                    "status": "ERROR",
+                    "symbol": row.get("symbol"),
+                    "error": str(exc)[:240],
+                    "pnl_usdt": 0.0,
+                    "pnl_pct": 0.0,
+                })
         if not results:
             msg = "FLAT — nothing to close."
             return CommandResult("closeall", True, msg, msg, [])
@@ -768,7 +885,7 @@ class TelegramCommandLoop:
         print(
             "[TELEGRAM] command loop armed  "
             "/menu /positions /close /closeall /price /balance /pnl /status  "
-            f"+ Spot chatbox  ({menu_bit})",
+            f"USDT-M only  ({menu_bit})",
             flush=True,
         )
 
@@ -822,35 +939,97 @@ class TelegramCommandLoop:
                 continue
         return updates, nxt
 
+    def _is_operator(self, chat_id: str) -> bool:
+        admin = str(getattr(self.notifier, "chat_id", "") or "").strip()
+        return bool(admin) and str(chat_id) == admin
+
+    def _reply_html(
+        self,
+        chat_id: str,
+        html: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        if not chat_id:
+            print("[TELEGRAM] update had no chat id — not delivered", flush=True)
+            return
+        self.notifier.send_html_sync(html, reply_markup=reply_markup, chat_id=chat_id)
+
     def _handle(self, update: dict[str, Any]) -> None:
         callback = update.get("callback_query") if isinstance(update.get("callback_query"), dict) else None
         if callback:
             self._handle_callback(callback)
             return
         message = update.get("message") if isinstance(update.get("message"), dict) else {}
-        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
-        chat_id = str(chat.get("id") or "")
-        if chat_id != str(self.notifier.chat_id):
+        if not message:
+            print("[TELEGRAM] update had no message — not delivered", flush=True)
+            return
+        chat_id, user_id, name = _telegram_identity(message)
+        if not chat_id:
+            print("[TELEGRAM] message had no chat id — not delivered", flush=True)
             return
         text = str(message.get("text") or "").strip()
+        if self._is_operator(chat_id):
+            self._handle_operator(chat_id, text)
+            return
+        self._handle_guest(chat_id, user_id, name, text)
+
+    def _handle_operator(self, chat_id: str, text: str) -> None:
         if not text:
+            self._reply_html(chat_id, "Send /help for desk commands.")
             return
         intent = parse_spot_intent(text)
         if intent is not None:
-            self._preview_spot(intent, chat_id)
+            self._run_manual_spot(chat_id, intent)
             return
         result = self.commands.handle(text, source="telegram")
         if not result.cmd:
+            self._reply_html(chat_id, "Unknown input. Try /help.")
             return
         if result.cmd == "menu":
-            self.notifier.send_html_sync(
-                result.html,
-                reply_markup=desk_keyboard(),
-                chat_id=chat_id,
+            self._reply_html(chat_id, result.html, desk_keyboard())
+            return
+        self._reply_html(chat_id, result.html or result.plain or "No live data.")
+
+    def _handle_guest(self, chat_id: str, user_id: str, name: str, text: str) -> None:
+        raw = _raw_cmd(text)
+        if not text or raw in {"start", "menu", "dashboard"}:
+            self._reply_html(
+                chat_id,
+                guest_access_html(name, user_id),
+                guest_keyboard(),
             )
             return
-        if result.html:
-            self.notifier.reply(result.html)
+        if parse_spot_intent(text) is not None:
+            self._reply_html(chat_id, f"<b>{ACCESS_DENIED}</b>")
+            return
+        cmd, _arg = parse_command(text)
+        if cmd in _GUEST_READ:
+            if cmd == "help":
+                self._reply_html(chat_id, GUEST_HELP_HTML)
+                return
+            result = self.commands.handle(text, source="telegram")
+            body = result.html or result.plain or guest_access_html(name, user_id)
+            self._reply_html(chat_id, body)
+            return
+        if cmd or text.startswith("/"):
+            self._reply_html(chat_id, f"<b>{ACCESS_DENIED}</b>")
+            return
+        self._reply_html(chat_id, guest_access_html(name, user_id), guest_keyboard())
+
+    def _run_manual_spot(self, chat_id: str, intent: Any) -> None:
+        bitget = self.commands.bitget
+        if bitget is None:
+            self._reply_html(chat_id, "<b>Bitget Demo rail unbound</b> — Spot order not sent.")
+            return
+        try:
+            order = bitget.execute_spot_market(intent.symbol, intent.side, intent.quote_usdt)
+        except Exception as exc:
+            self._reply_html(
+                chat_id,
+                f"<b>SPOT ORDER FAILED</b>\n{escape_html(str(exc)[:300])}",
+            )
+            return
+        self._reply_html(chat_id, _spot_receipt_html(order if isinstance(order, dict) else {}))
 
     def _preview_spot(self, intent: Any, chat_id: str) -> None:
         bitget = self.commands.bitget
@@ -902,8 +1081,37 @@ class TelegramCommandLoop:
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         chat_id = str(chat.get("id") or "")
         message_id = message.get("message_id")
-        if chat_id != str(self.notifier.chat_id):
-            self.notifier.answer_callback(cq_id, "Ignored.")
+        user = callback.get("from") if isinstance(callback.get("from"), dict) else {}
+        _cid, user_id, name = _telegram_identity({"chat": chat, "from": user})
+        if not chat_id:
+            self.notifier.answer_callback(cq_id, "No chat on this button.")
+            return
+        operator = self._is_operator(chat_id)
+        desk_action = parse_desk_callback(data)
+        if not operator:
+            if desk_action == "menu":
+                self.notifier.answer_callback(cq_id, "Guest access")
+                if message_id:
+                    self.notifier.edit_html(
+                        int(message_id),
+                        guest_access_html(name, user_id),
+                        reply_markup=guest_keyboard(),
+                        chat_id=chat_id,
+                    )
+                else:
+                    self._reply_html(chat_id, guest_access_html(name, user_id), guest_keyboard())
+                return
+            if desk_action not in {"status", "positions"}:
+                self.notifier.answer_callback(cq_id, ACCESS_DENIED)
+                if message_id:
+                    self.notifier.edit_html(
+                        int(message_id),
+                        f"<b>{ACCESS_DENIED}</b>",
+                        chat_id=chat_id,
+                    )
+                return
+        if desk_action is None and not operator:
+            self.notifier.answer_callback(cq_id, ACCESS_DENIED)
             return
         desk_action = parse_desk_callback(data)
         if desk_action:
@@ -1019,43 +1227,22 @@ class TelegramCommandLoop:
 
     def _execute_spot(self, ticket: Any, message_id: int, chat_id: str) -> None:
         bitget = self.commands.bitget
-        edit = self.notifier.edit_html
         if bitget is None:
-            edit(message_id, "<b>Bitget unbound</b> — Spot order not sent.", chat_id=chat_id)
-            return
-        edit(message_id, timeline_html(ticket, "processing"), chat_id=chat_id)
-        edit(message_id, timeline_html(ticket, "balance"), chat_id=chat_id)
-        try:
-            free = float(bitget.fetch_spot_usdt_free())
-        except Exception as exc:
-            edit(
+            self.notifier.edit_html(
                 message_id,
-                timeline_html(ticket, "balance", f"Balance check failed: {exc}"),
+                "<b>Bitget unbound</b> — Spot order not sent.",
                 chat_id=chat_id,
             )
             return
-        if ticket.side == "buy" and free + 1e-9 < ticket.quote_usdt:
-            edit(
-                message_id,
-                receipt_html(
-                    ticket,
-                    {
-                        "ok": False,
-                        "status": "INSUFFICIENT_MARGIN",
-                        "error": f"Spot USDT free {free:.4f} < {ticket.quote_usdt:.2f}",
-                        "symbol": ticket.symbol,
-                    },
-                ),
-                chat_id=chat_id,
-            )
-            return
-        edit(message_id, timeline_html(ticket, "submit"), chat_id=chat_id)
         try:
             order = bitget.execute_spot_market(ticket.symbol, ticket.side, ticket.quote_usdt)
         except Exception as exc:
-            order = {"ok": False, "status": "ERROR", "error": str(exc)[:400], "symbol": ticket.symbol}
-        edit(message_id, timeline_html(ticket, "done"), chat_id=chat_id)
-        edit(message_id, receipt_html(ticket, order), chat_id=chat_id)
+            order = {"ok": False, "status": "ERROR", "error": str(exc)[:300], "symbol": ticket.symbol}
+        self.notifier.edit_html(
+            message_id,
+            _spot_receipt_html(order if isinstance(order, dict) else {}),
+            chat_id=chat_id,
+        )
 
 
 class TerminalCommandLoop:
@@ -1101,7 +1288,7 @@ class TerminalCommandLoop:
                 continue
             if parse_spot_intent(text):
                 self.printer(
-                    "Spot chatbox is Telegram-only. Send NVDA/USDT BUY $10 in Telegram to preview + confirm."
+                    "Manual Spot runs in the operator Telegram chat. Send BUY 1000 USDT BTC there."
                 )
                 continue
             try:
@@ -1114,6 +1301,87 @@ class TerminalCommandLoop:
                 continue
             if result.plain:
                 self.printer(result.plain)
+
+
+def _spot_receipt_html(order: dict[str, Any]) -> str:
+    symbol = escape_html(str(order.get("symbol") or ""))
+    status = escape_html(str(order.get("status") or ""))
+    if order.get("ok"):
+        before = order.get("account_balance_before")
+        after = order.get("account_balance_after")
+        change = order.get("account_balance_change")
+        lines = [
+            "<b>CHRONOS-NEXUS</b>",
+            "✅ <b>SPOT FILLED</b>",
+            "<i>Bitget Demo spot wallet. The AI cycle was not used.</i>",
+            "",
+            f"<b>Symbol:</b> <code>{symbol}</code>",
+            f"<b>Side:</b> <code>{escape_html(str(order.get('side') or '').upper())}</code>",
+            f"<b>Status:</b> <code>{status}</code>",
+            f"<b>Qty:</b> <code>{order.get('amount')}</code>",
+            f"<b>Price:</b> <code>{order.get('price')}</code>",
+        ]
+        if before is not None and after is not None:
+            lines.append(f"<b>Spot USDT:</b> <code>{before}</code> → <code>{after}</code>")
+        if change is not None:
+            lines.append(f"<b>Ledger change:</b> <code>{change}</code>")
+        return "\n".join(lines)
+    err = escape_html(str(order.get("error") or status or "Spot order failed"))
+    return (
+        "<b>CHRONOS-NEXUS</b>\n"
+        "❌ <b>SPOT ORDER REJECTED</b>\n"
+        f"<code>{symbol}</code>\n{err}"
+    )
+
+
+def _raw_cmd(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw.startswith("/"):
+        return ""
+    token = raw[1:].split()[0] if raw[1:].split() else ""
+    return token.split("@")[0].lower()
+
+
+def _telegram_identity(message: dict[str, Any]) -> tuple[str, str, str]:
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    user = message.get("from") if isinstance(message.get("from"), dict) else {}
+    chat_id = str(chat.get("id") or "")
+    user_id = str(user.get("id") or chat_id)
+    first = str(user.get("first_name") or "").strip()
+    last = str(user.get("last_name") or "").strip()
+    username = str(user.get("username") or "").strip()
+    name = " ".join(part for part in (first, last) if part)
+    if not name and username:
+        name = f"@{username}"
+    return chat_id, user_id, name or "there"
+
+
+def guest_access_html(name: str, user_id: str) -> str:
+    safe_name = escape_html(name or "there")
+    safe_id = escape_html(user_id or "unknown")
+    return (
+        "<b>CHRONOS-NEXUS</b>\n"
+        f"Hello, <b>{safe_name}</b>.\n\n"
+        f"<b>Telegram User ID:</b> <code>{safe_id}</code>\n"
+        "<b>Access:</b> Guest — read-only.\n\n"
+        "You can inspect the live desk with /help, /price, /status, and /positions. "
+        "Those commands read the AI snapshot, the open USDT-M book, and the mainnet price feed.\n\n"
+        "Orders, closes, and the futures wallet stay with the operator. "
+        "An execution attempt replies:\n"
+        f"<code>{ACCESS_DENIED}</code>"
+    )
+
+
+def guest_keyboard() -> dict[str, Any]:
+    """Read-only pad. No flatten button."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📡 Live Market Status", "callback_data": "nx:status"},
+                {"text": "📊 Open Positions", "callback_data": "nx:positions"},
+            ]
+        ]
+    }
 
 
 def desk_keyboard() -> dict[str, Any]:

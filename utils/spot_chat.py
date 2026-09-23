@@ -26,7 +26,7 @@ MAX_QUOTE_USDT = 1_000_000_000.0
 _LOCK = threading.Lock()
 _TICKETS: dict[str, "SpotTicket"] = {}
 
-# NVDA/USDT BUY $10  |  NVDA BUY 10 USDT  |  BUY BTC 10  |  /buy NVDA 10
+# NVDA/USDT BUY $10  |  NVDA BUY 10 USDT  |  BUY BTC 10  |  BUY 1000 USDT BTC  |  /buy NVDA 10
 _RE_SYM_SIDE_AMT = re.compile(
     r"^(?P<symbol>[A-Za-z0-9]{2,15}(?:/[A-Za-z]{3,6})?(?::[A-Za-z]{3,6})?)\s+"
     r"(?P<side>buy|sell)\s+"
@@ -43,6 +43,13 @@ _RE_SLASH = re.compile(
     r"^/(?P<side>buy|sell)\s+"
     r"(?P<symbol>[A-Za-z0-9]{2,15}(?:/[A-Za-z]{3,6})?(?::[A-Za-z]{3,6})?)\s+"
     r"\$?\s*(?P<amount>\d+(?:\.\d+)?)\s*(?:usdt|usd)?\s*$",
+    re.IGNORECASE,
+)
+# BUY 1000 USDT BTC  |  /sell 25 USDT ETH
+_RE_SIDE_AMT_COIN = re.compile(
+    r"^(?:/(?P<side>buy|sell)|(?P<side2>buy|sell))\s+"
+    r"\$?\s*(?P<amount>\d+(?:\.\d+)?)\s*(?:usdt|usd)\s+"
+    r"(?P<symbol>[A-Za-z0-9]{2,15}(?:/[A-Za-z]{3,6})?)\s*$",
     re.IGNORECASE,
 )
 
@@ -101,7 +108,12 @@ def parse_spot_intent(text: str) -> SpotIntent | None:
     head = lowered.split()[0].lstrip("/")
     if head.split("@")[0] in _DESK_CMDS:
         return None
-    match = _RE_SLASH.match(raw) or _RE_SYM_SIDE_AMT.match(raw) or _RE_SIDE_SYM_AMT.match(raw)
+    match = (
+        _RE_SLASH.match(raw)
+        or _RE_SYM_SIDE_AMT.match(raw)
+        or _RE_SIDE_SYM_AMT.match(raw)
+        or _RE_SIDE_AMT_COIN.match(raw)
+    )
     if match is None:
         return None
     try:
@@ -112,7 +124,7 @@ def parse_spot_intent(text: str) -> SpotIntent | None:
         return None
     if amount < MIN_QUOTE_USDT or amount > MAX_QUOTE_USDT:
         return None
-    side = match.group("side").lower().strip()
+    side = (match.groupdict().get("side") or match.groupdict().get("side2") or "").lower().strip()
     if side not in {"buy", "sell"}:
         return None
     symbol = match.group("symbol").strip().upper().replace("USDT:USDT", "USDT")

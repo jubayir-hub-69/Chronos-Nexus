@@ -161,23 +161,43 @@ class UniverseTests(unittest.TestCase):
         )
         self.assertTrue(any("miss" in f.lower() or "NFLX" in f for f in flags))
 
-    def test_equity_universe_keeps_stocks_drops_btc(self) -> None:
+    def test_equity_universe_keeps_stock_perps_drops_spot_and_btc(self) -> None:
         markets = {
             "rNVDA/USDT": {"base": "rNVDA", "quote": "USDT", "spot": True, "info": {}},
+            "rNVDA/USDT:USDT": {"base": "rNVDA", "quote": "USDT", "swap": True, "info": {}},
+            "PRESPCX/USDT": {
+                "base": "PRESPCX",
+                "quote": "USDT",
+                "spot": True,
+                "info": {"category": "STOCK"},
+            },
+            "PRESPCX/USDT:USDT": {
+                "base": "PRESPCX",
+                "quote": "USDT",
+                "swap": True,
+                "info": {"category": "STOCK"},
+            },
             "AAPL/USDT:USDT": {
                 "base": "AAPL",
                 "quote": "USDT",
                 "swap": True,
                 "info": {"productType": "SUSDT-FUTURES"},
             },
+            "BTC/USDT": {"base": "BTC", "quote": "USDT", "spot": True, "info": {}},
             "BTC/USDT:USDT": {"base": "BTC", "quote": "USDT", "swap": True, "info": {}},
             "ETH/USDT": {"base": "ETH", "quote": "USDT", "spot": True, "info": {}},
         }
         uni = _select_equity_universe(markets)
-        self.assertIn("rNVDA/USDT", uni)
+        self.assertIn("rNVDA/USDT:USDT", uni)
+        self.assertIn("PRESPCX/USDT:USDT", uni)
         self.assertIn("AAPL/USDT:USDT", uni)
+        self.assertNotIn("rNVDA/USDT", uni)
+        self.assertNotIn("PRESPCX/USDT", uni)
+        self.assertNotIn("BTC/USDT", uni)
         self.assertNotIn("BTC/USDT:USDT", uni)
+        self.assertNotIn("ETH/USDT", uni)
         self.assertTrue(_is_equity_market("MSFT/USDT:USDT", {"base": "MSFT", "quote": "USDT", "swap": True}))
+        self.assertFalse(_is_equity_market("PRESPCX/USDT", {"base": "PRESPCX", "quote": "USDT", "spot": True}))
 
 
 class MemoryTests(unittest.TestCase):
