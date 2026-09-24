@@ -13,6 +13,7 @@ from core.config import (
     DEFAULT_QWEN_MODEL,
     Settings,
     normalize_model_name,
+    openai_sdk_base_url,
 )
 from core.retry import call_with_backoff
 
@@ -206,7 +207,7 @@ class QwenCortex:
         try:
             self._client = OpenAI(
                 api_key=key,
-                base_url=QWEN_BASE_URL,
+                base_url=openai_sdk_base_url(QWEN_BASE_URL),
                 timeout=float(LLM_TIMEOUT_S),
                 max_retries=0,
             )
@@ -222,7 +223,7 @@ class QwenCortex:
         self.backend = CORTEX_BACKEND_LABEL
         print(
             f"[CORTEX] running on {CORTEX_BACKEND_LABEL} · {self.selected_model} "
-            "· Responses API · thinking off",
+            f"· {QWEN_BASE_URL} · thinking off",
             flush=True,
         )
 
@@ -309,16 +310,15 @@ class QwenCortex:
         temperature: float,
         json_mode: bool,
     ) -> str:
-        # Official Bitget hackathon proxy is the OpenAI Responses wire
-        # (Codex config: wire_api = "responses"). qwen3.8-max thinks by
-        # default; thinking on a board JSON prompt blows past 45s and the
-        # desk stands down. Disable thinking on every path.
+        # Official hackathon endpoint is chat completions. qwen3.8-max thinks
+        # by default; thinking on a board JSON prompt blows the desk timeout.
+        # Disable thinking on every path. Responses stays a fallback only.
         try:
-            return self._complete_via_responses(name, system, user, temperature, json_mode)
+            return self._complete_via_chat(name, system, user, temperature, json_mode)
         except Exception as exc:
             if _looks_timeout(exc) or _looks_quota(exc):
                 raise
-            return self._complete_via_chat(name, system, user, temperature, json_mode)
+            return self._complete_via_responses(name, system, user, temperature, json_mode)
 
     def _complete_via_responses(
         self,

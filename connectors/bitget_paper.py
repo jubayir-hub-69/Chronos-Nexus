@@ -134,14 +134,36 @@ _SYMBOL_CANDIDATES = (
 )
 
 
+def _spot_form(symbol: str) -> str:
+    """Cash pair for a Spot market sell. Contract symbols collapse to BASE/USDT."""
+    raw = (symbol or "").strip().upper()
+    if raw.endswith(":USDT"):
+        raw = raw[: -len(":USDT")]
+    if not raw or ":" in raw:
+        return ""
+    if "/" not in raw:
+        raw = f"{raw}/USDT"
+    return raw if "/" in raw else ""
+
+
 def _looks_contract(symbol: str) -> bool:
     u = (symbol or "").upper()
     return ":USDT" in u or ":USDC" in u or ":USD" in u or u.endswith(":USDT")
 
 
-def _futures_params() -> dict[str, str]:
-    """USDT-M mix account. Demo adds PAPTRADING when productType stays USDT-FUTURES."""
-    return {"type": "swap", "productType": "USDT-FUTURES"}
+def _futures_params() -> dict[str, Any]:
+    """Classic USDT-M mix account. uta=False keeps CCXT off the unified wallet.
+
+    Demo adds PAPTRADING when productType stays USDT-FUTURES. The unified
+    account returns the same asset list for every type, which duplicated
+    Spot balances onto the futures line.
+    """
+    return {"type": "swap", "productType": "USDT-FUTURES", "uta": False}
+
+
+def _spot_params() -> dict[str, Any]:
+    """Classic Spot wallet. uta=False keeps this read off the unified account."""
+    return {"type": "spot", "uta": False}
 
 
 def _to_contract_symbol(symbol: str) -> str:
@@ -735,7 +757,7 @@ class BitgetPaperConnector:
         """Spot wallet free USDT via fetch_balance(type=spot)."""
         try:
             raw = self._ccxt(
-                lambda: self.exchange.fetch_balance({"type": "spot"}),
+                lambda: self.exchange.fetch_balance(_spot_params()),
                 label="bitget.balance.spot.chat",
             )
         except Exception:
@@ -822,7 +844,7 @@ class BitgetPaperConnector:
         """Spot wallet free/total for named coins. None-safe; missing coins are 0."""
         try:
             raw = self._ccxt(
-                lambda: self.exchange.fetch_balance({"type": "spot"}),
+                lambda: self.exchange.fetch_balance(_spot_params()),
                 label="bitget.balance.spot.wallet",
             )
         except Exception as exc:
@@ -1068,7 +1090,7 @@ class BitgetPaperConnector:
 
     def _submit_spot_order(self, symbol: str, side: str, amount: float, cost: float) -> dict[str, Any]:
         """Spot market routed with CCXT type=spot. The param is not an order-body field."""
-        params = {"type": "spot"}
+        params = _spot_params()
         if side == "buy" and hasattr(self.exchange, "create_market_buy_order_with_cost"):
             try:
                 order = self._ccxt(
@@ -1101,7 +1123,7 @@ class BitgetPaperConnector:
         legs: dict[str, dict[str, Any]] = {}
         errors: list[str] = []
         routes = (
-            ("spot", {"type": "spot"}),
+            ("spot", _spot_params()),
             ("swap", _futures_params()),
         )
         for name, params in routes:
@@ -1111,23 +1133,27 @@ class BitgetPaperConnector:
                     label=f"bitget.balance.{name}.ledger",
                 )
             except Exception as exc:
-                errors.append(f"{name}:{str(exc)[:120]}")
+                err = f"{name}:{str(exc)[:120]}"
+                errors.append(err)
                 legs[name] = {
                     "ok": False,
                     "free": 0.0,
                     "used": 0.0,
                     "total": 0.0,
                     "found": False,
+                    "error": err,
                 }
                 continue
             if not isinstance(raw, dict):
-                errors.append(f"{name}:empty ledger")
+                err = f"{name}:empty ledger"
+                errors.append(err)
                 legs[name] = {
                     "ok": False,
                     "free": 0.0,
                     "used": 0.0,
                     "total": 0.0,
                     "found": False,
+                    "error": err,
                 }
                 continue
             frees = raw.get("free") if isinstance(raw.get("free"), dict) else {}
@@ -1167,7 +1193,7 @@ class BitgetPaperConnector:
         """
         try:
             raw = self._ccxt(
-                lambda: self.exchange.fetch_balance({"type": "spot"}),
+                lambda: self.exchange.fetch_balance(_spot_params()),
                 label="bitget.balance.spot.holdings",
             )
         except Exception as exc:
@@ -1216,7 +1242,7 @@ class BitgetPaperConnector:
         """Market-sell a Spot balance. Does not touch the USDT-M book."""
         if not self.sandbox:
             raise RuntimeError("REFUSING live spot close — sandbox lock tripped")
-        resolved = self.resolve_spot_symbol(symbol) or ""
+        resolved = self.resolve_spot_symbol(symbol) or _spot_form(symbol)
         if not resolved:
             return {
                 "ok": False,
@@ -1233,7 +1259,7 @@ class BitgetPaperConnector:
         base = str((market or {}).get("base") or resolved.split("/")[0])
         try:
             raw = self._ccxt(
-                lambda: self.exchange.fetch_balance({"type": "spot"}),
+                lambda: self.exchange.fetch_balance(_spot_params()),
                 label="bitget.balance.spot.close",
             )
         except Exception as exc:
@@ -2611,7 +2637,11 @@ class BitgetPaperConnector:
             if not snap or not snap.get("open"):
                 continue
             symbol = str(snap.get("symbol") or "")
-            if not _looks_contract(symbol) and not _is_contract_market(symbol, None):
+            if not _looks_contract(symbol):
+                continue
+            info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
+            category = str(info.get("category") or info.get("productType") or "").upper()
+            if category.startswith("SPOT"):
                 continue
             key = f"{snap['symbol']}|{snap['side']}"
             if key in seen:
@@ -2843,7 +2873,8 @@ class BitgetPaperConnector:
     def _close_all(self, *, reason: str = "closeall") -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         for pos in self.fetch_open_book():
-            if not pos.get("open"):
+            symbol = str(pos.get("symbol") or "")
+            if not pos.get("open") or not _looks_contract(symbol):
                 continue
             try:
                 results.append(

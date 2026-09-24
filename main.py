@@ -43,7 +43,7 @@ from agents.executive import ExecutiveAgent
 from agents.risk_manager import RiskManagerAgent
 from connectors.arbitrum import ArbitrumSepolia
 from connectors.bitget_paper import BitgetPaperConnector
-from core.config import Settings, load_settings
+from core.config import QWEN_BASE_URL, Settings, load_settings
 from core.llm import QwenCortex
 from core.memory import (
     DAILY_MAX_ENTRIES,
@@ -1039,7 +1039,7 @@ def _main() -> int:
             [
                 ("backend", cortex.backend),
                 ("model", cortex.selected_model),
-                ("base_url", "https://hackathon.bitgetops.com/v1"),
+                ("base_url", QWEN_BASE_URL),
                 ("source", settings.qwen_source or "default"),
             ],
             border="magenta",

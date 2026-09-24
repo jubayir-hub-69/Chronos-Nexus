@@ -104,7 +104,42 @@ class FuturesUniverseTests(unittest.TestCase):
         self.assertIsNone(args[0])
         self.assertEqual(args[1].get("type"), "swap")
         self.assertEqual(args[1].get("productType"), "USDT-FUTURES")
+        self.assertIs(args[1].get("uta"), False)
         conn.exchange.fetch_balance.assert_not_called()
+
+    def test_open_book_drops_spot_wallet_rows(self) -> None:
+        conn = BitgetPaperConnector.__new__(BitgetPaperConnector)
+        conn.exchange = MagicMock()
+        conn.exchange.fetch_positions.return_value = [
+            {
+                "symbol": "DOGE/USDT",
+                "contracts": 100.0,
+                "side": "long",
+                "entryPrice": 0.1,
+                "markPrice": 0.11,
+                "info": {"openPriceAvg": "0.1"},
+            },
+            {
+                "symbol": "ETH/USDT:USDT",
+                "contracts": 1.0,
+                "side": "long",
+                "entryPrice": 2000.0,
+                "markPrice": 2010.0,
+                "info": {"category": "SPOT", "openPriceAvg": "2000"},
+            },
+            {
+                "symbol": "SOL/USDT:USDT",
+                "contracts": 2.0,
+                "side": "long",
+                "entryPrice": 150.0,
+                "markPrice": 151.0,
+                "info": {"productType": "USDT-FUTURES", "openPriceAvg": "150"},
+            },
+        ]
+        conn._ccxt = lambda fn, label="": fn()  # type: ignore[method-assign]
+        conn._overlay_live_mark = lambda snap: None  # type: ignore[method-assign]
+        book = conn.fetch_open_book()
+        self.assertEqual([row["symbol"] for row in book], ["SOL/USDT:USDT"])
 
 
 class GuestAccessTests(unittest.TestCase):

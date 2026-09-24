@@ -18,6 +18,7 @@ from connectors.bitget_paper import (
     simulate_account_balance_change,
     stamp_gitbook_log,
 )
+from core.config import QWEN_BASE_URL, openai_sdk_base_url
 from core.llm import (
     API_QUOTA_VETO,
     API_TIMEOUT_VETO,
@@ -32,6 +33,19 @@ from core.llm import (
 )
 from core.retry import call_with_backoff, is_retryable
 from utils.notifier import TelegramNotifier, escape_html
+
+
+class QwenEndpointTests(unittest.TestCase):
+    def test_official_endpoint_is_chat_completions(self) -> None:
+        self.assertEqual(
+            QWEN_BASE_URL,
+            "https://hackathon.bitgetops.com/v1/chat/completions",
+        )
+        self.assertEqual(openai_sdk_base_url(), "https://hackathon.bitgetops.com/v1")
+        self.assertEqual(
+            openai_sdk_base_url(QWEN_BASE_URL) + "/chat/completions",
+            QWEN_BASE_URL,
+        )
 
 
 class ProtectiveOrderTests(unittest.TestCase):

@@ -36,9 +36,9 @@ TELEGRAM_UPDATES = "https://api.telegram.org/bot{token}/getUpdates"
 TELEGRAM_SET_COMMANDS = "https://api.telegram.org/bot{token}/setMyCommands"
 BOT_MENU = [
     {"command": "menu", "description": "Headless terminal dashboard"},
-    {"command": "positions", "description": "Live book + PnL"},
-    {"command": "close", "description": "Market-close one symbol"},
-    {"command": "closeall", "description": "Flatten the whole Demo book"},
+    {"command": "positions", "description": "Open USDT-M futures"},
+    {"command": "close", "description": "Close one futures position or spot coin"},
+    {"command": "closeall", "description": "Flatten open USDT-M futures"},
     {"command": "price", "description": "Last, 24h high/low, volume, cap"},
     {"command": "balance", "description": "Live ledger free / used / total"},
     {"command": "pnl", "description": "Today's realized PnL and daily limits"},
@@ -50,9 +50,9 @@ HELP_PLAIN = (
     "AI cycle: Bitget Demo USDT-M perpetuals only.\n"
     "Operator chat: manual Spot, e.g. BUY 1000 USDT BTC.\n\n"
     "/menu               headless terminal dashboard + buttons\n"
-    "/positions          futures book + spot holdings\n"
-    "/close SYMBOL       close one futures position or spot holding\n"
-    "/closeall           flatten futures and spot\n"
+    "/positions          open USDT-M futures only\n"
+    "/close SYMBOL       close one futures position, or market-sell a spot coin\n"
+    "/closeall           flatten open USDT-M futures\n"
     "/price SYMBOL       last, 24h high/low, volume, market cap\n"
     "/balance            spot and futures ledgers (or /balance COIN)\n"
     "/pnl                today's realized PnL, W/L, trades left\n"
@@ -64,9 +64,9 @@ HELP_HTML = (
     "AI cycle trades <b>Bitget Demo USDT-M perpetuals</b> only.\n"
     "Operator chat can send a Spot order: <code>BUY 1000 USDT BTC</code>.\n\n"
     "<code>/menu</code> — headless terminal dashboard + live buttons\n"
-    "<code>/positions</code> — futures book + spot holdings\n"
-    "<code>/close SYMBOL</code> — close one futures position or spot holding\n"
-    "<code>/closeall</code> — flatten futures and spot\n"
+    "<code>/positions</code> — open USDT-M futures only\n"
+    "<code>/close SYMBOL</code> — close one futures position, or market-sell a spot coin\n"
+    "<code>/closeall</code> — flatten open USDT-M futures\n"
     "<code>/price SYMBOL</code> — last, 24h high/low, volume, market cap\n"
     "<code>/balance</code> — spot and futures ledgers, or <code>/balance COIN</code>\n"
     "<code>/pnl</code> — today's realized PnL, win/loss, trades left\n"
@@ -231,33 +231,29 @@ class CommandDesk:
             msg = "Bitget Demo rail unbound — cannot read positions."
             return CommandResult("positions", False, msg, msg, [])
         try:
-            futures = [row for row in self.desk.snapshot(self.bitget) if row.get("open")]
+            futures = [
+                row
+                for row in self.desk.snapshot(self.bitget)
+                if row.get("open") and _looks_contract_symbol(str(row.get("symbol") or ""))
+            ]
         except Exception as exc:
             futures = [{"open": False, "error": str(exc), "symbol": "futures"}]
-        try:
-            raw_spots = self.bitget.fetch_spot_holdings()
-            spots = list(raw_spots) if isinstance(raw_spots, list) else []
-        except Exception as exc:
-            spots = [{"open": False, "source": "spot", "error": str(exc), "symbol": ""}]
-        spot_open = [row for row in spots if row.get("open")]
         futures_err = next((row.get("error") for row in futures if row.get("error") and not row.get("open")), None)
-        spot_err = next((row.get("error") for row in spots if row.get("error") and not row.get("open")), None)
-        if not futures and not spot_open and not futures_err and not spot_err:
-            plain = "FLAT — no open futures positions or spot holdings."
+        if not futures and not futures_err:
+            plain = "FLAT — no open USDT-M positions."
             html = (
                 "<b>CHRONOS-NEXUS</b>\n📊 <b>OPEN POSITIONS</b>\n\n"
-                "FLAT — no open futures positions or spot holdings."
+                "FLAT — no open USDT-M positions."
             )
             return CommandResult("positions", True, plain, html, [])
-        plain_lines = ["OPEN POSITIONS"]
-        html_lines = ["<b>CHRONOS-NEXUS</b>", "📊 <b>OPEN POSITIONS</b>", ""]
+        plain_lines = ["OPEN POSITIONS", "FUTURES"]
+        html_lines = ["<b>CHRONOS-NEXUS</b>", "📊 <b>OPEN POSITIONS</b>", "", "<b>FUTURES</b>"]
         if futures_err:
             plain_lines.append(f"FUTURES ledger: {futures_err}")
             html_lines.append(f"<b>FUTURES</b> ledger: {escape_html(str(futures_err))}")
-        if futures:
-            plain_lines.append("FUTURES")
-            html_lines.append("<b>FUTURES</b>")
         for pos in futures:
+            if not pos.get("open"):
+                continue
             pnl_pct = _opt_float(pos.get("pnl_pct"))
             pnl_usdt = _opt_float(pos.get("pnl_usdt"))
             symbol = pos.get("symbol")
@@ -286,27 +282,6 @@ class CommandDesk:
                 f"mark <code>{mark_s}</code>\n"
                 f"PnL <b>{pnl_pct_s}</b>  "
                 f"<b>{pnl_usdt_s} USDT</b>"
-            )
-            html_lines.append("")
-        if spot_err:
-            plain_lines.append(f"SPOT ledger: {spot_err}")
-            html_lines.append(f"<b>SPOT</b> ledger: {escape_html(str(spot_err))}")
-        if spot_open:
-            plain_lines.append("SPOT")
-            html_lines.append("<b>SPOT</b>")
-        for pos in spot_open:
-            symbol = pos.get("symbol")
-            qty = pos.get("contracts")
-            mark_s = _fmt_px(pos.get("mark_price"))
-            value = _opt_float(pos.get("value_usdt"))
-            value_s = "n/a" if value is None else f"{value:.4f}"
-            plain_lines.append(
-                f"SPOT {symbol}  qty={qty}  last={mark_s}  value {value_s} USDT"
-            )
-            html_lines.append(
-                f"🟢 <code>{symbol}</code>  SPOT\n"
-                f"qty <code>{qty}</code>  last <code>{mark_s}</code>\n"
-                f"value <b>{value_s} USDT</b>"
             )
             html_lines.append("")
         return CommandResult(
@@ -414,23 +389,20 @@ class CommandDesk:
         swap_free = _amt0(swap.get("free"))
         swap_used = _amt0(swap.get("used"))
         swap_total = _amt0(swap.get("total"))
+        spot_plain, spot_html = _ledger_line("spot", spot, spot_free, spot_used, spot_total)
+        swap_plain, swap_html = _ledger_line("futures", swap, swap_free, swap_used, swap_total)
         found = bool(spot.get("found") or swap.get("found"))
-        if not found or (
-            spot_free <= 0 and spot_total <= 0 and swap_free <= 0 and swap_total <= 0
-        ):
+        both_read = spot.get("ok") is not False and swap.get("ok") is not False
+        if both_read and not found and spot_total <= 0 and swap_total <= 0 and spot_free <= 0 and swap_free <= 0:
             msg = f"0.00 {label} found in wallet."
             return CommandResult("balance", True, msg, f"<code>0.00 {label}</code> found in wallet.", [])
-        plain = (
-            f"{label}\n"
-            f"spot free {spot_free:.8f}  used {spot_used:.8f}  total {spot_total:.8f}\n"
-            f"futures free {swap_free:.8f}  used {swap_used:.8f}  total {swap_total:.8f}"
-        )
+        plain = f"{label}\n{spot_plain}\n{swap_plain}"
         html = "\n".join(
             [
                 "<b>CHRONOS-NEXUS</b>",
                 f"<code>{label}</code>",
-                f"spot free <code>{spot_free:.8f}</code>  used <code>{spot_used:.8f}</code>  total <code>{spot_total:.8f}</code>",
-                f"futures free <code>{swap_free:.8f}</code>  used <code>{swap_used:.8f}</code>  total <code>{swap_total:.8f}</code>",
+                spot_html,
+                swap_html,
             ]
         )
         return CommandResult("balance", True, plain, html, [])
@@ -698,44 +670,15 @@ class CommandDesk:
         if not arg:
             msg = "Usage: /close SYMBOL"
             return CommandResult("close", False, msg, "Usage: <code>/close SYMBOL</code>", [])
+        tag = f"MANUAL /close ({source})"
+        # BTC/USDT is a Spot coin. Sell that wallet. Do not route it through
+        # the USDT-M reducer (that returns Invalid symbol).
+        if _looks_spot_pair(arg):
+            return self._close_spot_symbol(arg, tag)
         book = self.desk.snapshot(self.bitget)
         match = _match_symbol(arg, book)
-        tag = f"MANUAL /close ({source})"
-        if match is None:
-            spots = []
-            try:
-                raw_spots = self.bitget.fetch_spot_holdings()
-                spots = list(raw_spots) if isinstance(raw_spots, list) else []
-            except Exception:
-                spots = []
-            spot = _match_symbol(arg, [row for row in spots if row.get("open")])
-            if spot is None:
-                msg = f"No open position matching {arg}."
-                return CommandResult(
-                    "close",
-                    False,
-                    msg,
-                    f"No open position matching <code>{arg}</code>.",
-                    [],
-                )
-            result = self.bitget.close_spot_holding(str(spot.get("symbol")), reason=tag)
-            result["kind"] = "MANUAL"
-            result["reason"] = tag
-            if result.get("ok") and str(result.get("status") or "") == "DUST":
-                msg = f"DUST {spot.get('symbol')} — below 1 USDT minimum, not sent"
-                return CommandResult("close", True, msg, f"<b>{msg}</b>", [result])
-            if result.get("ok"):
-                msg = f"CLOSED SPOT {spot.get('symbol')}  qty={result.get('amount')}"
-                return CommandResult("close", True, msg, f"<b>{msg}</b>", [result])
-            err = str(result.get("error") or result.get("status") or "close failed")
-            msg = f"CLOSE FAILED {spot.get('symbol')} — {err}"
-            return CommandResult(
-                "close",
-                False,
-                msg,
-                f"<b>CLOSE FAILED</b> <code>{spot.get('symbol')}</code>\n{err}",
-                [result],
-            )
+        if match is None or not _looks_contract_symbol(str(match.get("symbol") or "")):
+            return self._close_spot_symbol(arg, tag)
         result = self.bitget.close_market(
             str(match.get("symbol")),
             fraction=1.0,
@@ -767,6 +710,44 @@ class CommandDesk:
             [result],
         )
 
+    def _close_spot_symbol(self, arg: str, tag: str) -> CommandResult:
+        """Spot MARKET SELL. Never a reduce-only futures close."""
+        if self.bitget is None:
+            msg = "Bitget Demo rail unbound — cannot close."
+            return CommandResult("close", False, msg, msg, [])
+        result = self.bitget.close_spot_holding(arg, reason=tag)
+        if not isinstance(result, dict):
+            result = {"ok": False, "status": "ERROR", "symbol": arg, "error": "spot close returned nothing"}
+        result["kind"] = "MANUAL"
+        result["reason"] = tag
+        result["market_type"] = result.get("market_type") or "spot"
+        symbol = str(result.get("symbol") or arg)
+        status = str(result.get("status") or "")
+        if result.get("ok") and status == "DUST":
+            msg = f"DUST {symbol} — below 1 USDT minimum, not sent"
+            return CommandResult("close", True, msg, f"<b>{msg}</b>", [result])
+        if result.get("ok"):
+            msg = f"CLOSED SPOT {symbol}  qty={result.get('amount')}"
+            return CommandResult("close", True, msg, f"<b>{msg}</b>", [result])
+        if status == "FLAT":
+            msg = f"No spot holding for {arg}."
+            return CommandResult(
+                "close",
+                False,
+                msg,
+                f"No spot holding for <code>{escape_html(arg)}</code>.",
+                [result],
+            )
+        err = str(result.get("error") or status or "close failed")
+        msg = f"CLOSE FAILED {symbol} — {err}"
+        return CommandResult(
+            "close",
+            False,
+            msg,
+            f"<b>CLOSE FAILED</b> <code>{escape_html(symbol)}</code>\n{escape_html(err)}",
+            [result],
+        )
+
     def _cmd_closeall(self, *, source: str) -> CommandResult:
         if self.bitget is None:
             msg = "Bitget Demo rail unbound — cannot close."
@@ -783,35 +764,13 @@ class CommandDesk:
                 "pnl_usdt": 0.0,
                 "pnl_pct": 0.0,
             }]
-        try:
-            raw_spots = self.bitget.fetch_spot_holdings(price=False)
-            spots = [row for row in raw_spots if isinstance(row, dict) and row.get("open")] if isinstance(raw_spots, list) else []
-        except Exception as exc:
-            spots = []
-            results.append({
-                "ok": False,
-                "status": "ERROR",
-                "symbol": "SPOT",
-                "error": str(exc)[:240],
-                "pnl_usdt": 0.0,
-                "pnl_pct": 0.0,
-            })
-        for row in spots:
-            try:
-                results.append(
-                    self.bitget.close_spot_holding(str(row.get("symbol") or ""), reason=tag)
-                )
-            except Exception as exc:
-                results.append({
-                    "ok": False,
-                    "status": "ERROR",
-                    "symbol": row.get("symbol"),
-                    "error": str(exc)[:240],
-                    "pnl_usdt": 0.0,
-                    "pnl_pct": 0.0,
-                })
+        results = [
+            row
+            for row in results
+            if _looks_contract_symbol(str(row.get("symbol") or "")) or str(row.get("symbol") or "") in {"", "FUTURES"}
+        ]
         if not results:
-            msg = "FLAT — nothing to close."
+            msg = "FLAT — no open USDT-M positions."
             return CommandResult("closeall", True, msg, msg, [])
         lines: list[str] = []
         html_lines: list[str] = []
@@ -1203,13 +1162,13 @@ class TelegramCommandLoop:
         if not book:
             return (
                 "<b>CHRONOS-NEXUS</b>\n🛑 <b>FORCE CLOSE ALL</b>\n\n"
-                "FLAT — nothing to close.",
+                "FLAT — no open USDT-M positions.",
                 desk_keyboard(),
             )
         lines = [
             "<b>CHRONOS-NEXUS</b>",
             "🛑 <b>FORCE CLOSE ALL</b>",
-            "<i>Live Demo book — same path as /closeall. Confirm to flatten.</i>",
+            "<i>Open USDT-M futures — same path as /closeall.</i>",
             "",
             f"<b>Open names:</b> <code>{len(book)}</code>",
             "",
@@ -1517,6 +1476,39 @@ def _amt0(value: Any) -> float:
     if parsed != parsed or parsed in {float("inf"), float("-inf")}:
         return 0.0
     return max(0.0, parsed)
+
+
+def _looks_contract_symbol(symbol: str) -> bool:
+    """USDT-M settle suffix. Spot pairs such as BTC/USDT are not positions."""
+    name = (symbol or "").upper()
+    return ":USDT" in name or ":USDC" in name or name.endswith(":USD")
+
+
+def _looks_spot_pair(query: str) -> bool:
+    """Cash pair. BTC/USDT sells on Spot. BTC/USDT:USDT stays a futures close."""
+    token = (query or "").strip().split()[0].split("@")[0] if (query or "").strip() else ""
+    return "/" in token and ":" not in token
+
+
+def _ledger_line(
+    name: str,
+    leg: dict[str, Any],
+    free: float,
+    used: float,
+    total: float,
+) -> tuple[str, str]:
+    """One wallet line. A failed read stays unmeasured and is not filled from the other wallet."""
+    if leg.get("ok") is False:
+        err = str(leg.get("error") or "unmeasured")
+        plain = f"{name} unmeasured ({err})"
+        html = f"{name} unmeasured (<code>{escape_html(err)}</code>)"
+        return plain, html
+    plain = f"{name} free {free:.8f}  used {used:.8f}  total {total:.8f}"
+    html = (
+        f"{name} free <code>{free:.8f}</code>  "
+        f"used <code>{used:.8f}</code>  total <code>{total:.8f}</code>"
+    )
+    return plain, html
 
 
 def _wallet_coin(arg: str) -> str:

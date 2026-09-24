@@ -418,6 +418,157 @@ class PriceBalanceCommandTests(unittest.TestCase):
         params = conn.exchange.fetch_balance.call_args[0][0]
         self.assertEqual(params.get("type"), "swap")
         self.assertEqual(params.get("productType"), "USDT-FUTURES")
+        self.assertIs(params.get("uta"), False)
+
+
+class LedgerSeparationTests(unittest.TestCase):
+    def test_balance_reads_spot_and_futures_as_different_wallets(self) -> None:
+        conn = BitgetPaperConnector.__new__(BitgetPaperConnector)
+        books = {
+            "spot": {
+                "free": {"BTC": 5.01},
+                "used": {"BTC": 0.0},
+                "total": {"BTC": 5.01},
+            },
+            "swap": {
+                "free": {"USDT": 1000.0},
+                "used": {"USDT": 0.0},
+                "total": {"USDT": 1000.0},
+            },
+        }
+
+        def _ccxt(fn, label=""):
+            del label
+            return fn()
+
+        conn._ccxt = _ccxt  # type: ignore[method-assign]
+        conn.exchange = MagicMock()
+        conn.exchange.fetch_balance.side_effect = lambda params: books[params["type"]]
+        out = conn.fetch_ledger_balance("BTC")
+        self.assertEqual(out["spot"]["total"], 5.01)
+        self.assertTrue(out["spot"]["found"])
+        self.assertEqual(out["swap"]["total"], 0.0)
+        self.assertFalse(out["swap"]["found"])
+        self.assertNotEqual(out["spot"]["total"], out["swap"]["total"])
+        calls = conn.exchange.fetch_balance.call_args_list
+        self.assertEqual(len(calls), 2)
+        spot_params = calls[0].args[0]
+        swap_params = calls[1].args[0]
+        self.assertEqual(spot_params.get("type"), "spot")
+        self.assertIs(spot_params.get("uta"), False)
+        self.assertEqual(swap_params.get("type"), "swap")
+        self.assertEqual(swap_params.get("productType"), "USDT-FUTURES")
+        self.assertIs(swap_params.get("uta"), False)
+
+    def test_positions_hide_spot_wallet_coins(self) -> None:
+        bitget = MagicMock()
+        bitget.fetch_open_book.return_value = [
+            {
+                "open": True,
+                "symbol": "ETH/USDT:USDT",
+                "side": "buy",
+                "contracts": 1.0,
+                "entry_price": 100.0,
+                "mark_price": 110.0,
+                "pnl_usdt": 10.0,
+                "pnl_pct": 10.0,
+            }
+        ]
+        bitget.fetch_spot_holdings.return_value = [
+            {"open": True, "source": "spot", "symbol": "DOGE/USDT", "contracts": 50.0}
+        ]
+        desk = CommandDesk(bitget, PositionDesk())
+        result = desk.handle("/positions", source="telegram")
+        self.assertIn("ETH/USDT:USDT", result.plain)
+        self.assertNotIn("DOGE", result.plain)
+        self.assertNotIn("SPOT", result.plain)
+        bitget.fetch_spot_holdings.assert_not_called()
+
+    def test_close_spot_pair_is_a_market_sell(self) -> None:
+        bitget = MagicMock()
+        bitget.fetch_open_book.return_value = [
+            {
+                "open": True,
+                "symbol": "BTC/USDT:USDT",
+                "side": "buy",
+                "contracts": 1.0,
+            }
+        ]
+        bitget.close_spot_holding.return_value = {
+            "ok": True,
+            "status": "CLOSED",
+            "market_type": "spot",
+            "symbol": "BTC/USDT",
+            "amount": 0.05,
+        }
+        desk = CommandDesk(bitget, PositionDesk())
+        result = desk.handle("/close BTC/USDT", source="telegram")
+        self.assertTrue(result.ok)
+        self.assertIn("CLOSED SPOT BTC/USDT", result.plain)
+        bitget.close_spot_holding.assert_called_once()
+        bitget.close_market.assert_not_called()
+        self.assertEqual(bitget.close_spot_holding.call_args.args[0], "BTC/USDT")
+
+    def test_closeall_does_not_sell_the_spot_wallet(self) -> None:
+        bitget = MagicMock()
+        bitget.close_all.return_value = [
+            {
+                "ok": True,
+                "status": "CLOSED",
+                "symbol": "ETH/USDT:USDT",
+                "side": "buy",
+                "pnl_pct": 1.0,
+                "pnl_usdt": 1.0,
+            }
+        ]
+        bitget.fetch_spot_holdings.return_value = [
+            {"open": True, "symbol": "SOL/USDT", "contracts": 3.0}
+        ]
+        desk = CommandDesk(bitget, PositionDesk())
+        result = desk.handle("/closeall", source="telegram")
+        bitget.close_all.assert_called_once()
+        bitget.fetch_spot_holdings.assert_not_called()
+        bitget.close_spot_holding.assert_not_called()
+        self.assertIn("ETH/USDT:USDT", result.plain)
+        self.assertNotIn("SOL", result.plain)
+
+    def test_close_spot_holding_sends_a_spot_market_sell(self) -> None:
+        conn = BitgetPaperConnector.__new__(BitgetPaperConnector)
+        conn.sandbox = True
+        conn.exchange = MagicMock()
+        conn.exchange.options = {"defaultType": "swap"}
+        conn.exchange.market.return_value = {"base": "BTC", "quote": "USDT", "spot": True}
+        conn._ccxt = lambda fn, label="": fn()  # type: ignore[method-assign]
+        conn.resolve_spot_symbol = lambda q: "BTC/USDT"  # type: ignore[method-assign]
+        conn.fetch_spot_quote = lambda s, side="sell": {  # type: ignore[method-assign]
+            "peg": 100.0,
+            "bid": 99.5,
+            "last": 100.0,
+        }
+        conn.fetch_spot_usdt_free = lambda: 50.0  # type: ignore[method-assign]
+        conn.exchange.fetch_balance.return_value = {
+            "free": {"BTC": 0.05},
+            "used": {"BTC": 0.0},
+            "total": {"BTC": 0.05},
+        }
+        conn.exchange.create_order.return_value = {
+            "id": "ord1",
+            "average": 99.5,
+            "filled": 0.05,
+            "status": "closed",
+        }
+        out = conn.close_spot_holding("BTC/USDT", reason="manual")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["status"], "CLOSED")
+        self.assertEqual(out["market_type"], "spot")
+        args = conn.exchange.create_order.call_args.args
+        self.assertEqual(args[0], "BTC/USDT")
+        self.assertEqual(args[1], "market")
+        self.assertEqual(args[2], "sell")
+        self.assertAlmostEqual(args[3], 0.05)
+        self.assertEqual(args[5].get("type"), "spot")
+        self.assertIs(args[5].get("uta"), False)
+        self.assertEqual(conn.exchange.options["defaultType"], "swap")
 
 
 class BgbFeeDeductTests(unittest.TestCase):

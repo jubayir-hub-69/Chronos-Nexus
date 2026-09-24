@@ -18,9 +18,20 @@ ENV_PATH = PROJECT_ROOT / ".env"
 
 load_dotenv(ENV_PATH, override=False)
 
-QWEN_BASE_URL = "https://hackathon.bitgetops.com/v1"
+# Official hackathon chat-completions endpoint. The OpenAI SDK appends
+# /chat/completions, so the client is given the /v1 prefix of this URL.
+QWEN_BASE_URL = "https://hackathon.bitgetops.com/v1/chat/completions"
 DEFAULT_QWEN_MODEL = "qwen3.8-max"
 CORTEX_BACKEND_LABEL = "Bitget Hackathon - Qwen 3.8 Max"
+
+
+def openai_sdk_base_url(endpoint: str | None = None) -> str:
+    """SDK base_url whose chat.completions call lands on QWEN_BASE_URL."""
+    cleaned = (endpoint or QWEN_BASE_URL).strip().rstrip("/")
+    suffix = "/chat/completions"
+    if cleaned.endswith(suffix):
+        return cleaned[: -len(suffix)]
+    return cleaned
 
 
 def mask_secret(value: str, keep: int = 4) -> str:
