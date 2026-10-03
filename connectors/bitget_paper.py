@@ -11,6 +11,7 @@ MAINNET via a second CCXT client with no keys and no sandbox flag.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -3419,6 +3420,7 @@ def _slim_order(order: dict[str, Any]) -> dict[str, Any]:
 
 def _append_trade(record: dict[str, Any]) -> Path:
     stamp_gitbook_log(record)
+    os.makedirs(os.path.dirname(str(TRADE_LOG)), exist_ok=True)
     TRADE_LOG.parent.mkdir(parents=True, exist_ok=True)
     with _LOG_LOCK:
         if TRADE_LOG.exists():

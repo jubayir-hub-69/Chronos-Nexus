@@ -7,6 +7,7 @@ repeat an identical failed setup. Not a vector store: a JSON ring buffer.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -479,6 +480,7 @@ def _read_payload(path: Path) -> dict[str, Any]:
 
 
 def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(str(path)), exist_ok=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
