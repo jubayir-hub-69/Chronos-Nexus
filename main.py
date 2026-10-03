@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 import sys
 import time
+import threading
+import http.server
 from typing import Any
 
 if sys.platform == "win32":
@@ -1173,6 +1175,18 @@ def _main() -> int:
     )
     TelegramCommandLoop(notifier, command_desk).start()
     TerminalCommandLoop(command_desk, printer=lambda msg: console.print(msg)).start()
+
+    class DummyHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        def log_message(self, format, *args):
+            pass
+
+    port = int(os.environ.get("PORT", 8080))
+    server = http.server.HTTPServer(("0.0.0.0", port), DummyHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
 
     while True:
         try:
