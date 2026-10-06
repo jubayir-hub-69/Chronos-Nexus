@@ -19,6 +19,8 @@ data/logs/*
 !data/logs/.gitkeep
 data/history.json
 data/history.json.tmp
+data/spot_paper_wallet.json
+data/spot_paper_wallet.json.tmp
 *.log
 
 # OS / IDE

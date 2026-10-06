@@ -112,7 +112,11 @@ TAKER_FEE_RATE = 0.0006
 SWAP_LEVERAGE = 5.0
 
 TRADE_LOG = PROJECT_ROOT / "data" / "logs" / "trades.json"
+# Demo spot fills debit the quote and often never credit the base. This file
+# stores only the legs the exchange balance did not move. /balance adds it on read.
+SPOT_PAPER_WALLET = PROJECT_ROOT / "data" / "spot_paper_wallet.json"
 _LOG_LOCK = threading.Lock()
+_WALLET_LOCK = threading.Lock()
 
 _SYMBOL_CANDIDATES = (
     "rNVDA/USDT",
@@ -165,6 +169,79 @@ def _futures_params() -> dict[str, Any]:
 def _spot_params() -> dict[str, Any]:
     """Classic Spot wallet. uta=False keeps this read off the unified account."""
     return {"type": "spot", "uta": False}
+
+
+def _leg_moved(expected: float, actual: float) -> bool:
+    """True when the exchange balance already moved at least half of this leg.
+
+    Fee-sized differences count as settled. A flat read does not.
+    """
+    if abs(expected) <= 1e-8:
+        return False
+    if expected > 0:
+        return actual >= expected * 0.5
+    return actual <= expected * 0.5
+
+
+def _leg_shortfall(expected: float, actual: float) -> float:
+    """Balance still owed on one leg. Zero when the exchange already settled it."""
+    if abs(expected) <= 1e-8 or _leg_moved(expected, actual):
+        return 0.0
+    return round(expected - actual, 8)
+
+
+def _matching_amt(book: dict[str, Any] | None, name: str) -> float | None:
+    if not isinstance(book, dict):
+        return None
+    found = False
+    total = 0.0
+    wanted = str(name or "").upper()
+    for key, value in book.items():
+        if str(key).upper() != wanted:
+            continue
+        found = True
+        total += _coin_amt(value)
+    return total if found else None
+
+
+def _totals_from_balance(raw: dict[str, Any] | None) -> dict[str, float] | None:
+    """Uppercase coin → total. None when the ledger payload itself is unusable."""
+    books = _books_from_balance(raw)
+    if books is None:
+        return None
+    return books["total"]
+
+
+def _books_from_balance(raw: dict[str, Any] | None) -> dict[str, dict[str, float]] | None:
+    """Uppercase coin maps for total and free. None when the payload is unusable.
+
+    A demo market buy often drops free USDT (and total) without raising the base
+    coin. Callers compare both cells so a free-only debit still counts as the
+    quote leg of a fill.
+    """
+    if not isinstance(raw, dict):
+        return None
+    if "total" not in raw and "free" not in raw:
+        return None
+    totals = raw.get("total") if isinstance(raw.get("total"), dict) else {}
+    frees = raw.get("free") if isinstance(raw.get("free"), dict) else {}
+    names = {str(key).upper() for key in list(totals) + list(frees) if str(key).strip()}
+    total_out: dict[str, float] = {}
+    free_out: dict[str, float] = {}
+    for name in names:
+        measured = _matching_amt(totals, name)
+        if measured is None:
+            measured = _matching_amt(frees, name)
+        total_out[name] = measured if measured is not None else 0.0
+        free_measured = _matching_amt(frees, name)
+        free_out[name] = free_measured if free_measured is not None else total_out[name]
+    return {"total": total_out, "free": free_out}
+
+
+def _book_delta(before: dict[str, float] | None, after: dict[str, float] | None, coin: str) -> float:
+    prior = before if isinstance(before, dict) else {}
+    later = after if isinstance(after, dict) else {}
+    return float(later.get(coin, 0.0)) - float(prior.get(coin, 0.0))
 
 
 def _to_contract_symbol(symbol: str) -> str:
@@ -436,6 +513,7 @@ class BitgetPaperConnector:
         exchange.set_sandbox_mode(True)
         self.exchange = exchange
         self._order_lock = threading.RLock()
+        self.spot_wallet_path: Path = SPOT_PAPER_WALLET
         self.bgb_fee_deduct: dict[str, Any] = {"ok": False, "deduct": "off", "via": None}
         # Public mainnet feed — no keys, never sandbox. Spot + swap catalogs.
         self.public = ccxt.bitget(
@@ -755,7 +833,7 @@ class BitgetPaperConnector:
         return hits[0] if hits else None
 
     def fetch_spot_usdt_free(self) -> float:
-        """Spot wallet free USDT via fetch_balance(type=spot)."""
+        """Spot wallet free USDT via fetch_balance(type=spot), plus paper overlay."""
         try:
             raw = self._ccxt(
                 lambda: self.exchange.fetch_balance(_spot_params()),
@@ -765,9 +843,199 @@ class BitgetPaperConnector:
             return 0.0
         frees = raw.get("free") or {}
         try:
-            return max(0.0, float(frees.get("USDT") or 0.0))
+            free = max(0.0, float(frees.get("USDT") or 0.0))
         except (TypeError, ValueError):
-            return 0.0
+            free = 0.0
+        return max(0.0, round(free + self._paper_amount("USDT"), 8))
+
+    def _wallet_path(self) -> Path | None:
+        raw = getattr(self, "spot_wallet_path", None)
+        if raw is None:
+            return None
+        return Path(raw)
+
+    def _paper_balances(self) -> dict[str, float]:
+        """Persisted spot legs the demo ledger did not book. Empty when unset."""
+        path = self._wallet_path()
+        if path is None or not path.exists():
+            return {}
+        with _WALLET_LOCK:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return {}
+        balances = payload.get("balances") if isinstance(payload, dict) else None
+        if not isinstance(balances, dict):
+            return {}
+        out: dict[str, float] = {}
+        for coin, value in balances.items():
+            name = str(coin or "").upper()
+            if not name:
+                continue
+            try:
+                amount = round(float(value), 8)
+            except (TypeError, ValueError):
+                continue
+            if abs(amount) > 1e-12:
+                out[name] = amount
+        return out
+
+    def _paper_amount(self, coin: str) -> float:
+        return float(self._paper_balances().get(str(coin or "").upper(), 0.0))
+
+    def _apply_paper_deltas(self, order_key: str, deltas: dict[str, float]) -> dict[str, float]:
+        """Add deltas once per order key. Returns the deltas actually stored."""
+        clean: dict[str, float] = {}
+        for coin, delta in deltas.items():
+            name = str(coin or "").upper()
+            try:
+                amount = round(float(delta), 8)
+            except (TypeError, ValueError):
+                continue
+            if not name or abs(amount) <= 1e-8:
+                continue
+            clean[name] = round(clean.get(name, 0.0) + amount, 8)
+        clean = {name: amount for name, amount in clean.items() if abs(amount) > 1e-8}
+        if not clean:
+            return {}
+        path = self._wallet_path()
+        if path is None:
+            return {}
+        key = str(order_key or "").strip() or str(uuid.uuid4())
+        with _WALLET_LOCK:
+            payload: dict[str, Any] = {"balances": {}, "booked_orders": []}
+            if path.exists():
+                try:
+                    loaded = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    loaded = {}
+                if isinstance(loaded, dict):
+                    payload = loaded
+            booked = payload.get("booked_orders")
+            if not isinstance(booked, list):
+                booked = []
+            if key in booked:
+                return {}
+            balances = payload.get("balances")
+            if not isinstance(balances, dict):
+                balances = {}
+            for name, amount in clean.items():
+                try:
+                    current = float(balances.get(name) or 0.0)
+                except (TypeError, ValueError):
+                    current = 0.0
+                updated = round(current + amount, 8)
+                if abs(updated) <= 1e-8:
+                    balances.pop(name, None)
+                else:
+                    balances[name] = updated
+            booked.append(key)
+            payload["balances"] = balances
+            payload["booked_orders"] = booked[-500:]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        parts = " ".join(f"{name} {amount:+.8f}" for name, amount in sorted(clean.items()))
+        print(f"[BITGET] spot paper wallet {parts}", flush=True)
+        return clean
+
+    def _read_spot_books(self) -> dict[str, dict[str, float]] | None:
+        """Spot totals and frees. None when the ledger cannot be read."""
+        try:
+            raw = self._ccxt(
+                lambda: self.exchange.fetch_balance(_spot_params()),
+                label="bitget.balance.spot.totals",
+            )
+        except Exception:
+            return None
+        return _books_from_balance(raw if isinstance(raw, dict) else None)
+
+    def _book_spot_fill(
+        self,
+        *,
+        order_key: str,
+        side: str,
+        base: str,
+        quote: str,
+        exchange_qty: float,
+        paper_qty: float,
+        cost: float,
+        fill: float,
+        before: dict[str, dict[str, float]] | None,
+        after: dict[str, dict[str, float]] | None,
+        paper_only: bool,
+    ) -> dict[str, float]:
+        """Book spot legs the demo wallet skipped.
+
+        A buy whose quote debit landed and whose base credit did not is the
+        demo bug: USDT falls, SOL stays put. The missing base is stored here.
+        A read that moved neither leg is left alone so a stale snapshot cannot
+        mint a second fill. Paper-only legs (no exchange order) are booked whole.
+        """
+        deltas: dict[str, float] = {}
+        fill_px = fill if fill > 0 else 0.0
+        if paper_qty > 0:
+            if side == "buy":
+                deltas[base] = deltas.get(base, 0.0) + paper_qty
+                deltas[quote] = deltas.get(quote, 0.0) - float(cost)
+            else:
+                deltas[base] = deltas.get(base, 0.0) - paper_qty
+                deltas[quote] = deltas.get(quote, 0.0) + round(paper_qty * fill_px, 8)
+        before_total = (before or {}).get("total") if isinstance(before, dict) else None
+        after_total = (after or {}).get("total") if isinstance(after, dict) else None
+        before_free = (before or {}).get("free") if isinstance(before, dict) else None
+        after_free = (after or {}).get("free") if isinstance(after, dict) else None
+        if (
+            not paper_only
+            and exchange_qty > 0
+            and isinstance(before_total, dict)
+            and isinstance(after_total, dict)
+        ):
+            actual_base = _book_delta(before_total, after_total, base)
+            actual_quote_total = _book_delta(before_total, after_total, quote)
+            actual_quote_free = _book_delta(
+                before_free if isinstance(before_free, dict) else before_total,
+                after_free if isinstance(after_free, dict) else after_total,
+                quote,
+            )
+            actual_base_free = _book_delta(
+                before_free if isinstance(before_free, dict) else before_total,
+                after_free if isinstance(after_free, dict) else after_total,
+                base,
+            )
+            if side == "buy":
+                exp_base = float(exchange_qty)
+                exp_quote = -float(cost)
+            else:
+                exp_base = -float(exchange_qty)
+                exp_quote = round(float(exchange_qty) * fill_px, 8)
+            base_hit = _leg_moved(exp_base, actual_base) or _leg_moved(exp_base, actual_base_free)
+            quote_hit = _leg_moved(exp_quote, actual_quote_total) or _leg_moved(exp_quote, actual_quote_free)
+            if quote_hit and not base_hit:
+                short = _leg_shortfall(exp_base, actual_base)
+                if abs(short) > 1e-8:
+                    deltas[base] = deltas.get(base, 0.0) + short
+            if base_hit and not quote_hit:
+                # Prefer the total gap. Fall back to the free gap when total did not move.
+                short = _leg_shortfall(exp_quote, actual_quote_total)
+                if abs(short) <= 1e-8:
+                    short = _leg_shortfall(exp_quote, actual_quote_free)
+                if abs(short) > 1e-8:
+                    deltas[quote] = deltas.get(quote, 0.0) + short
+        return self._apply_paper_deltas(order_key, deltas)
+
+    @staticmethod
+    def _pair_coins(symbol: str, market: dict[str, Any] | None) -> tuple[str, str]:
+        row = market if isinstance(market, dict) else {}
+        base = str(row.get("base") or "").upper()
+        quote = str(row.get("quote") or "").upper()
+        parts = str(symbol or "").split(":")[0].split("/")
+        if not base and parts:
+            base = parts[0].upper()
+        if not quote:
+            quote = parts[1].upper() if len(parts) > 1 else "USDT"
+        return base or "BASE", quote or "USDT"
 
     def fetch_spot_quote(self, symbol: str, side: str = "buy") -> dict[str, Any]:
         """Live mainnet Spot BBO. Isolated from the swap defaultType used by the AI desk."""
@@ -865,7 +1133,11 @@ class BitgetPaperConnector:
                 total_f = float(totals.get(key) if totals.get(key) is not None else 0.0)
             except (TypeError, ValueError):
                 total_f = 0.0
-            assets[key] = {"free": max(0.0, free_f), "total": max(0.0, total_f)}
+            paper = self._paper_amount(key)
+            assets[key] = {
+                "free": max(0.0, round(free_f + paper, 8)),
+                "total": max(0.0, round(total_f + paper, 8)),
+            }
         return {"ok": True, "assets": assets, "error": None}
 
     def fetch_asset_balance(self, coin: str) -> dict[str, Any]:
@@ -1010,6 +1282,9 @@ class BitgetPaperConnector:
             "side": side_n,
             "notional_usdt": round(cost, 6),
         }
+        base_coin, quote_coin = self._pair_coins(resolved, market if isinstance(market, dict) else {})
+        record["base_coin"] = base_coin
+        record["quote_coin"] = quote_coin
         try:
             quote = self.fetch_spot_quote(resolved, side=side_n)
             last = coerce_price(quote.get("peg"), quote.get("last"), quote.get("ask"), quote.get("bid"))
@@ -1030,6 +1305,7 @@ class BitgetPaperConnector:
             record["price"] = last
             record["entry_price"] = last
             _stamp_bbo(record, quote)
+            before_map = self._read_spot_books()
             free = self.fetch_spot_usdt_free()
             record["account_balance_before"] = free
             if side_n == "buy" and free + 1e-9 < cost:
@@ -1044,11 +1320,74 @@ class BitgetPaperConnector:
                     }
                 )
                 return self._finish_spot_record(record)
-            order = self._submit_spot_order(resolved, side_n, qty, cost)
-            after = self.fetch_spot_usdt_free()
+            exchange_qty = float(qty)
+            paper_qty = 0.0
+            paper_only = False
+            before_totals = before_map.get("total") if isinstance(before_map, dict) else None
+            if side_n == "sell" and isinstance(before_totals, dict):
+                exch_base = max(0.0, before_totals.get(base_coin, 0.0))
+                paper_base = max(0.0, self._paper_amount(base_coin))
+                held = exch_base + paper_base
+                if held + 1e-9 < qty:
+                    record.update(
+                        {
+                            "ok": False,
+                            "status": "INSUFFICIENT_MARGIN",
+                            "error": f"Spot {base_coin} free {held:.4f} < {qty:.4f} required.",
+                            "account_balance_change": 0.0,
+                            "account_balance_change_source": "spot_demo",
+                            "account_balance_after": free,
+                        }
+                    )
+                    return self._finish_spot_record(record)
+                # Sell the demo-missing credit before touching coins the exchange holds.
+                paper_qty = min(paper_base, qty)
+                exchange_qty = round(qty - paper_qty, 8)
+            elif side_n == "buy" and isinstance(before_totals, dict):
+                exch_quote = max(0.0, before_totals.get(quote_coin, 0.0))
+                if exch_quote + 1e-9 < cost:
+                    paper_only = True
+                    exchange_qty = 0.0
+                    paper_qty = float(qty)
+            if exchange_qty > 0 and not paper_only:
+                submit_amount = qty if side_n == "buy" else exchange_qty
+                order = self._submit_spot_order(resolved, side_n, submit_amount, cost)
+            else:
+                order = {
+                    "id": None,
+                    "status": "closed",
+                    "filled": qty,
+                    "amount": qty,
+                    "average": last,
+                    "price": last,
+                    "symbol": resolved,
+                }
             demo_fill = coerce_price(order.get("average"), order.get("price"))
             fill = last if last > 0 else demo_fill
-            filled_qty = coerce_price(order.get("filled"), order.get("amount"), qty)
+            after_map = self._read_spot_books()
+            try:
+                booked = self._book_spot_fill(
+                    order_key=str(record["id"]),
+                    side=side_n,
+                    base=base_coin,
+                    quote=quote_coin,
+                    exchange_qty=0.0 if paper_only else exchange_qty,
+                    paper_qty=qty if paper_only else paper_qty,
+                    cost=cost,
+                    fill=fill,
+                    before=before_map,
+                    after=after_map,
+                    paper_only=paper_only,
+                )
+            except Exception as exc:
+                booked = {}
+                record["paper_wallet_error"] = str(exc)[:200]
+            after = self.fetch_spot_usdt_free()
+            if paper_qty > 0 or paper_only:
+                filled_qty = qty
+            else:
+                filled_qty = coerce_price(order.get("filled"), order.get("amount"), qty)
+            quote_booked = abs(float(booked.get(quote_coin, 0.0))) > 1e-8
             record.update(
                 {
                     "ok": True,
@@ -1063,7 +1402,9 @@ class BitgetPaperConnector:
                     "notional_usdt": round(abs(fill * filled_qty), 6) if fill and filled_qty else round(cost, 6),
                     "account_balance_after": after,
                     "account_balance_change": round(after - free, 8),
-                    "account_balance_change_source": "spot_demo",
+                    "account_balance_change_source": "spot_paper" if quote_booked or paper_only else "spot_demo",
+                    "paper_base_delta": round(float(booked.get(base_coin, 0.0)), 8),
+                    "paper_quote_delta": round(float(booked.get(quote_coin, 0.0)), 8),
                 }
             )
             _stamp_bbo(record, quote)
@@ -1172,11 +1513,18 @@ class BitgetPaperConnector:
                 used_sum += _coin_amt(useds.get(key))
             if used_sum <= 0 and total_sum > free_sum:
                 used_sum = total_sum - free_sum
+            if name == "spot":
+                paper = self._paper_amount(wanted)
+                if abs(paper) > 1e-12:
+                    free_sum = max(0.0, free_sum + paper)
+                    total_sum = max(0.0, total_sum + paper)
+                    if free_sum > 1e-12 or total_sum > 1e-12:
+                        found = True
             legs[name] = {
                 "ok": True,
-                "free": max(0.0, free_sum),
-                "used": max(0.0, used_sum),
-                "total": max(0.0, total_sum),
+                "free": max(0.0, round(free_sum, 8)),
+                "used": max(0.0, round(used_sum, 8)),
+                "total": max(0.0, round(total_sum, 8)),
                 "found": found,
             }
         return {
@@ -1202,13 +1550,19 @@ class BitgetPaperConnector:
         if not isinstance(raw, dict):
             return []
         totals = raw.get("total") if isinstance(raw.get("total"), dict) else {}
-        rows: list[dict[str, Any]] = []
-        skip = {"USDT", "USDC", "USD", "EUR", "DAI", "BUSD"}
+        combined: dict[str, float] = {}
         for coin, total in totals.items():
             name = str(coin or "").upper()
+            if name:
+                combined[name] = combined.get(name, 0.0) + _coin_amt(total)
+        for coin, delta in self._paper_balances().items():
+            combined[coin] = combined.get(coin, 0.0) + float(delta)
+        rows: list[dict[str, Any]] = []
+        skip = {"USDT", "USDC", "USD", "EUR", "DAI", "BUSD"}
+        for name, total in combined.items():
             if not name or name in skip:
                 continue
-            qty = _coin_amt(total)
+            qty = max(0.0, float(total))
             if qty <= 1e-8:
                 continue
             symbol = f"{name}/USDT"
@@ -1272,12 +1626,12 @@ class BitgetPaperConnector:
                 "pnl_usdt": 0.0,
                 "pnl_pct": 0.0,
             }
-        totals = raw.get("total") if isinstance(raw, dict) and isinstance(raw.get("total"), dict) else {}
-        qty = 0.0
-        for key, total in totals.items():
-            if str(key).upper() == base.upper():
-                qty = _coin_amt(total)
-                break
+        before_map = _books_from_balance(raw if isinstance(raw, dict) else None) or {"total": {}, "free": {}}
+        base_coin = base.upper()
+        quote_coin = str((market or {}).get("quote") or "USDT").upper() or "USDT"
+        exch_qty = max(0.0, float((before_map.get("total") or {}).get(base_coin, 0.0)))
+        paper_qty = max(0.0, self._paper_amount(base_coin))
+        qty = exch_qty + paper_qty
         quote = self.fetch_spot_quote(resolved, side="sell")
         last = coerce_price(quote.get("peg"), quote.get("bid"), quote.get("last"))
         if qty <= 0:
@@ -1304,8 +1658,25 @@ class BitgetPaperConnector:
         if isinstance(options, dict):
             options["defaultType"] = "spot"
         before = self.fetch_spot_usdt_free()
+        order: dict[str, Any] = {
+            "id": None,
+            "status": "closed",
+            "filled": qty,
+            "amount": qty,
+            "average": last,
+            "price": last,
+            "symbol": resolved,
+        }
+        exchange_sent = False
         try:
-            order = self._submit_spot_order(resolved, "sell", qty, qty * last if last > 0 else qty)
+            if exch_qty > 0:
+                order = self._submit_spot_order(
+                    resolved,
+                    "sell",
+                    exch_qty,
+                    exch_qty * last if last > 0 else exch_qty,
+                )
+                exchange_sent = True
         except Exception as exc:
             return {
                 "ok": False,
@@ -1318,8 +1689,22 @@ class BitgetPaperConnector:
         finally:
             if isinstance(options, dict):
                 options["defaultType"] = prev or "swap"
-        after = self.fetch_spot_usdt_free()
         fill = coerce_price(order.get("average"), order.get("price"), last)
+        after_map = self._read_spot_books() if exchange_sent else before_map
+        self._book_spot_fill(
+            order_key=str(order.get("id") or uuid.uuid4()),
+            side="sell",
+            base=base_coin,
+            quote=quote_coin,
+            exchange_qty=exch_qty if exchange_sent else 0.0,
+            paper_qty=paper_qty,
+            cost=exch_qty * fill if fill > 0 else exch_qty,
+            fill=fill if fill > 0 else last,
+            before=before_map,
+            after=after_map if after_map is not None else before_map,
+            paper_only=not exchange_sent,
+        )
+        after = self.fetch_spot_usdt_free()
         return {
             "ok": True,
             "status": "CLOSED",
@@ -1335,7 +1720,7 @@ class BitgetPaperConnector:
             "account_balance_before": before,
             "account_balance_after": after,
             "account_balance_change": round(after - before, 8),
-            "account_balance_change_source": "spot_demo",
+            "account_balance_change_source": "spot_paper" if paper_qty > 0 and not exchange_sent else "spot_demo",
         }
 
     def fetch_account_equity(self) -> dict[str, Any]:

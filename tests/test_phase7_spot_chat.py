@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
-from unittest.mock import MagicMock
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from connectors.bitget_paper import BitgetPaperConnector, _is_spot_market
 from utils.commands import CommandDesk, parse_command
@@ -641,6 +644,215 @@ class BgbFeeDeductTests(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertEqual(out["deduct"], "off")
         self.assertIsNone(out["via"])
+
+
+class SpotPaperWalletTests(unittest.TestCase):
+    """Demo spot buys debit USDT and omit the base coin. The paper wallet books that leg."""
+
+    def _conn(self, state: dict[str, dict[str, float]], wallet: Path) -> BitgetPaperConnector:
+        conn = BitgetPaperConnector.__new__(BitgetPaperConnector)
+        conn.sandbox = True
+        conn.spot_wallet_path = wallet
+        conn.exchange = MagicMock()
+        conn.exchange.markets = {
+            "SOL/USDT": {"spot": True, "swap": False, "base": "SOL", "quote": "USDT"},
+        }
+        conn.exchange.options = {"defaultType": "swap"}
+        conn.exchange.market = lambda s: conn.exchange.markets[s]
+        conn._ccxt = lambda fn, label="": fn()  # type: ignore[method-assign]
+        conn.resolve_spot_symbol = lambda q: "SOL/USDT"  # type: ignore[method-assign]
+        conn.fetch_spot_quote = lambda s, side="buy": {  # type: ignore[method-assign]
+            "ok": True,
+            "symbol": "SOL/USDT",
+            "last": 121.337,
+            "peg": 121.337,
+            "bid": 121.337,
+            "ask": 121.337,
+        }
+        conn._size_amount = lambda *a, **k: 1.6483  # type: ignore[method-assign]
+
+        def fetch_balance(params):
+            del params
+            return {
+                "free": dict(state["free"]),
+                "used": {coin: 0.0 for coin in state["free"]},
+                "total": dict(state["total"]),
+            }
+
+        conn.exchange.fetch_balance.side_effect = fetch_balance
+        return conn
+
+    def test_buy_credits_base_when_demo_only_debits_quote(self) -> None:
+        state = {
+            "free": {"USDT": 10000.0, "SOL": 90.0},
+            "total": {"USDT": 10000.0, "SOL": 90.0},
+        }
+
+        def buy(*args, **kwargs):
+            del kwargs
+            state["free"]["USDT"] -= float(args[1])
+            state["total"]["USDT"] -= float(args[1])
+            return {
+                "id": "ord-sol",
+                "symbol": "SOL/USDT",
+                "filled": None,
+                "amount": None,
+                "status": None,
+                "average": None,
+                "price": None,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet = Path(tmp) / "spot_paper_wallet.json"
+            log = Path(tmp) / "trades.json"
+            conn = self._conn(state, wallet)
+            conn.exchange.create_market_buy_order_with_cost.side_effect = buy
+            with patch("connectors.bitget_paper.TRADE_LOG", log):
+                out = conn.execute_spot_market("SOL/USDT", "buy", 200.0)
+            self.assertTrue(out["ok"])
+            self.assertAlmostEqual(out["paper_base_delta"], 1.6483, places=6)
+            self.assertAlmostEqual(out["paper_quote_delta"], 0.0, places=6)
+            self.assertAlmostEqual(state["total"]["USDT"], 9800.0, places=4)
+            self.assertAlmostEqual(state["total"]["SOL"], 90.0, places=6)
+            sol = conn.fetch_ledger_balance("SOL")
+            usdt = conn.fetch_ledger_balance("USDT")
+            self.assertAlmostEqual(sol["spot"]["total"], 91.6483, places=4)
+            self.assertAlmostEqual(sol["spot"]["free"], 91.6483, places=4)
+            self.assertTrue(sol["spot"]["found"])
+            self.assertAlmostEqual(usdt["spot"]["total"], 9800.0, places=4)
+            self.assertAlmostEqual(sol["swap"]["total"], 90.0, places=4)
+            stored = json.loads(wallet.read_text(encoding="utf-8"))
+            self.assertAlmostEqual(stored["balances"]["SOL"], 1.6483, places=6)
+            self.assertNotIn("USDT", stored["balances"])
+            conn.exchange.create_order.assert_not_called()
+
+            again = self._conn(state, wallet)
+            again.exchange.fetch_balance.side_effect = conn.exchange.fetch_balance.side_effect
+            desk = CommandDesk(again, PositionDesk())
+            shown = desk.handle("/balance SOL", source="telegram")
+            self.assertTrue(shown.ok)
+            self.assertIn("spot free 91.64830000", shown.plain)
+            self.assertIn("91.64830000", shown.html)
+
+    def test_buy_credits_base_when_only_free_usdt_drops(self) -> None:
+        state = {
+            "free": {"USDT": 10000.0, "SOL": 90.0},
+            "total": {"USDT": 10000.0, "SOL": 90.0},
+        }
+
+        def buy(*args, **kwargs):
+            del kwargs
+            state["free"]["USDT"] -= float(args[1])
+            return {"id": "ord-sol", "symbol": "SOL/USDT", "filled": None, "status": None}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet = Path(tmp) / "spot_paper_wallet.json"
+            conn = self._conn(state, wallet)
+            conn.exchange.create_market_buy_order_with_cost.side_effect = buy
+            with patch("connectors.bitget_paper.TRADE_LOG", Path(tmp) / "trades.json"):
+                out = conn.execute_spot_market("SOL", "buy", 200.0)
+            self.assertTrue(out["ok"])
+            sol = conn.fetch_ledger_balance("SOL")
+            self.assertAlmostEqual(sol["spot"]["total"], 91.6483, places=4)
+            self.assertAlmostEqual(state["total"]["SOL"], 90.0, places=6)
+
+    def test_sell_debits_paper_base_and_credits_quote(self) -> None:
+        state = {
+            "free": {"USDT": 9800.0, "SOL": 90.0},
+            "total": {"USDT": 9800.0, "SOL": 90.0},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet = Path(tmp) / "spot_paper_wallet.json"
+            wallet.write_text(
+                json.dumps({"balances": {"SOL": 1.6483}, "booked_orders": ["prior"]}),
+                encoding="utf-8",
+            )
+            conn = self._conn(state, wallet)
+            with patch("connectors.bitget_paper.TRADE_LOG", Path(tmp) / "trades.json"):
+                out = conn.execute_spot_market("SOL/USDT", "sell", 200.0)
+            self.assertTrue(out["ok"])
+            self.assertAlmostEqual(out["paper_base_delta"], -1.6483, places=6)
+            self.assertGreater(out["paper_quote_delta"], 0.0)
+            conn.exchange.create_order.assert_not_called()
+            conn.exchange.create_market_buy_order_with_cost.assert_not_called()
+            sol = conn.fetch_ledger_balance("SOL")
+            usdt = conn.fetch_ledger_balance("USDT")
+            self.assertAlmostEqual(sol["spot"]["total"], 90.0, places=4)
+            self.assertAlmostEqual(state["total"]["SOL"], 90.0, places=6)
+            self.assertAlmostEqual(state["total"]["USDT"], 9800.0, places=4)
+            self.assertGreater(usdt["spot"]["total"], 9800.0)
+            stored = json.loads(wallet.read_text(encoding="utf-8"))
+            self.assertNotIn("SOL", stored["balances"])
+            self.assertAlmostEqual(stored["balances"]["USDT"], 1.6483 * 121.337, places=4)
+
+    def test_exchange_settled_buy_is_not_double_credited(self) -> None:
+        state = {
+            "free": {"USDT": 10000.0, "SOL": 90.0},
+            "total": {"USDT": 10000.0, "SOL": 90.0},
+        }
+
+        def buy(*args, **kwargs):
+            del kwargs
+            cost = float(args[1])
+            state["free"]["USDT"] -= cost
+            state["total"]["USDT"] -= cost
+            state["free"]["SOL"] += 1.6483
+            state["total"]["SOL"] += 1.6483
+            return {"id": "ord-sol", "symbol": "SOL/USDT", "status": "closed", "filled": 1.6483}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet = Path(tmp) / "spot_paper_wallet.json"
+            conn = self._conn(state, wallet)
+            conn.exchange.create_market_buy_order_with_cost.side_effect = buy
+            with patch("connectors.bitget_paper.TRADE_LOG", Path(tmp) / "trades.json"):
+                out = conn.execute_spot_market("SOL/USDT", "buy", 200.0)
+            self.assertTrue(out["ok"])
+            self.assertAlmostEqual(out["paper_base_delta"], 0.0, places=8)
+            self.assertFalse(wallet.exists())
+            sol = conn.fetch_ledger_balance("SOL")
+            self.assertAlmostEqual(sol["spot"]["total"], 91.6483, places=4)
+
+    def test_ghost_ack_does_not_mint_base(self) -> None:
+        state = {
+            "free": {"USDT": 10000.0, "SOL": 90.0},
+            "total": {"USDT": 10000.0, "SOL": 90.0},
+        }
+
+        def buy(*args, **kwargs):
+            del args, kwargs
+            return {"id": "ghost", "symbol": "SOL/USDT", "filled": None, "status": None}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet = Path(tmp) / "spot_paper_wallet.json"
+            conn = self._conn(state, wallet)
+            conn.exchange.create_market_buy_order_with_cost.side_effect = buy
+            with patch("connectors.bitget_paper.TRADE_LOG", Path(tmp) / "trades.json"):
+                conn.execute_spot_market("SOL/USDT", "buy", 200.0)
+            self.assertFalse(wallet.exists())
+            sol = conn.fetch_ledger_balance("SOL")
+            self.assertAlmostEqual(sol["spot"]["total"], 90.0, places=6)
+
+    def test_close_paper_holding_credits_quote(self) -> None:
+        state = {
+            "free": {"USDT": 9800.0},
+            "total": {"USDT": 9800.0},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet = Path(tmp) / "spot_paper_wallet.json"
+            wallet.write_text(
+                json.dumps({"balances": {"SOL": 1.6483}, "booked_orders": []}),
+                encoding="utf-8",
+            )
+            conn = self._conn(state, wallet)
+            out = conn.close_spot_holding("SOL/USDT", reason="manual")
+            self.assertTrue(out["ok"])
+            self.assertEqual(out["status"], "CLOSED")
+            conn.exchange.create_order.assert_not_called()
+            sol = conn.fetch_ledger_balance("SOL")
+            usdt = conn.fetch_ledger_balance("USDT")
+            self.assertAlmostEqual(sol["spot"]["total"], 0.0, places=6)
+            self.assertFalse(sol["spot"]["found"])
+            self.assertGreater(usdt["spot"]["total"], 9800.0)
 
 
 if __name__ == "__main__":
