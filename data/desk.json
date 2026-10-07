@@ -1,4 +1,23 @@
 {
-  "positions": {},
-  "updated": "2026-10-07T06:12:13.360637+00:00"
+  "positions": {
+    "BZ/USDT:USDT|buy": {
+      "symbol": "BZ/USDT:USDT",
+      "side": "buy",
+      "entry_price": 101.04,
+      "qty": 0.14,
+      "sl_price": 87.01,
+      "tp_price": 105.99,
+      "thesis": "Geopolitical supply disruption in the Strait of Hormuz and Houthi attacks on Saudi Arabia are driving crude oil higher. BZ (Brent) is the direct listed expression. Overnight session with 24/7 perps trading allows immediate capture of the geopolitical premium before US cash opens.",
+      "opened_at": "2026-10-07T07:38:36.266091+00:00",
+      "order_id": "1491632054414495744",
+      "high_pnl_pct": 0.0,
+      "partial_taken": false,
+      "trail_sl_price": null,
+      "margin_usdt": 3.0,
+      "sl_margin_frac": 0.69,
+      "sl_order_id": "1491632055817498624",
+      "risk_score": 62.0
+    }
+  },
+  "updated": "2026-10-07T07:38:36.266091+00:00"
 }

@@ -55,7 +55,16 @@ Three tape conditions are recorded and do **not** cancel the entry while `RELAX_
 
 If Qwen returns a veto and none of the hard rails below fired, and the measured setup score is at least 40, the desk clears the entry and says so in one line. The model still wrote the thesis and the risk note. Python did not let those three tape notes be the reason the order died.
 
-These still cancel a new entry:
+`DEMO_FORCE_EXECUTE` in `core/ta.py` is **true**. SENTINEL still scores every rail below and prints the note, including an opposing order-book wall or a setup under 40. Those notes do not cancel a USDT-M entry (`BASE/QUOTE:USDT`) when ORACLE has a buy or sell and the desk has a live price. CHAIRMAN locks `EXECUTE`, sizes the quantity from the futures notional, and logs `qty`, margin, stop, and target on the `[RISK]` and `[DEMO]` lines.
+
+These do **not** send an order:
+
+- ORACLE stands down (`side=none` or conviction 0). The desk does not invent a trade.
+- There is no live price to size against.
+- That contract already has an open position.
+- The symbol is spot (no `:USDT` settle). Spot stays on the operator Telegram path.
+
+Set `DEMO_FORCE_EXECUTE` to false to make these scored rails block a new entry again:
 
 | Rail | Rule |
 |---|---|

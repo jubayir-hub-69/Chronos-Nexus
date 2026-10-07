@@ -180,6 +180,17 @@ class ChopHaltTests(unittest.TestCase):
 
 
 class SentinelDailyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import core.ta as ta
+
+        self._force = ta.DEMO_FORCE_EXECUTE
+        ta.DEMO_FORCE_EXECUTE = False
+
+    def tearDown(self) -> None:
+        import core.ta as ta
+
+        ta.DEMO_FORCE_EXECUTE = self._force
+
     def _eval(self, **kwargs):
         agent = RiskManagerAgent(DummyCortex())  # type: ignore[arg-type]
         defaults = dict(
@@ -214,6 +225,17 @@ class SentinelDailyTests(unittest.TestCase):
 
 
 class ChairmanDailyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import core.ta as ta
+
+        self._force = ta.DEMO_FORCE_EXECUTE
+        ta.DEMO_FORCE_EXECUTE = False
+
+    def tearDown(self) -> None:
+        import core.ta as ta
+
+        ta.DEMO_FORCE_EXECUTE = self._force
+
     def test_cannot_override_win_streak(self) -> None:
         agent = ExecutiveAgent(DummyCortex())  # type: ignore[arg-type]
         risk = RiskReport(

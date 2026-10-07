@@ -26,6 +26,9 @@ Models
   Higher-timeframe conflict, a candle break against the news side, and a
   choppy/downtrend halt are scored. While RELAX_TAPE_VETOES is set they do
   not block a new entry.
+  DEMO_FORCE_EXECUTE records every remaining rail (walls, volume, RSI,
+  spread, setup, daily budget) and does not let it cancel a USDT-M entry.
+  Spot symbols are never released by that switch.
 """
 
 from __future__ import annotations
@@ -50,8 +53,12 @@ MTF_FRAMES = ("15m", "1h", "4h")
 VETO_REASON_SETUP = "VETO: Setup confidence below 40 — wait for a cleaner TA tape"
 # Demo-cycle profile. These three tape notes stay on the report and do not
 # cancel an entry. RSI, spread, mark divergence, walls, fakeouts, news fights,
-# and the daily budget still do.
+# and the daily budget still do — unless DEMO_FORCE_EXECUTE is on.
 RELAX_TAPE_VETOES = True
+# Temporary demo switch. SENTINEL still scores and logs every hard rail.
+# A directional USDT-M brief is not blocked by them. Spot stays refused.
+# Callers must read this through demo_force_execute() so tests can flip it.
+DEMO_FORCE_EXECUTE = True
 VETO_REASON_WALL = "VETO: Opposing order-book wall"
 VETO_REASON_MTF = "VETO: Higher-timeframe trend disagrees"
 VETO_REASON_EXTENSION = "VETO: Price extended — waiting for pullback"
@@ -460,6 +467,17 @@ def analyze_candles(rows: Sequence[Any]) -> dict[str, Any]:
         "last_low": last["l"],
         "error": None,
     }
+
+
+def demo_force_execute() -> bool:
+    """True when a USDT-M entry should ignore SENTINEL hard vetoes."""
+    return bool(DEMO_FORCE_EXECUTE)
+
+
+def is_usdt_m_symbol(symbol: str | None) -> bool:
+    """True for a USDT-margined contract. Cash spot (`BASE/USDT`) is false."""
+    raw = str(symbol or "").strip().upper()
+    return "/" in raw and raw.endswith(":USDT")
 
 
 def tape_veto_blocks(reason: str) -> bool:

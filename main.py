@@ -68,6 +68,7 @@ from core.ta import (
     bbo_peg_price,
     candle_veto,
     confluence_veto,
+    demo_force_execute,
     rsi_zone,
     tape_veto_blocks,
 )
@@ -738,6 +739,12 @@ def _run_trading_cycle(
             ta_verdict="SKIPPED",
         )
     else:
+        if demo_force_execute():
+            console.print(
+                "[bold green]DEMO FORCE[/]  SENTINEL still scores walls, volume, RSI, "
+                "spread, and the setup. Those notes do not block this USDT-M entry. "
+                "Spot orders stay on Telegram."
+            )
         console.print("[dim]SENTINEL is stress-testing rumor quality, L2 spread, RSI confluence, and black-swan flags…[/]")
         try:
             risk = sentinel.evaluate(

@@ -10,11 +10,32 @@ from agents.analyst import is_idle_brief
 from core.llm import API_QUOTA_VETO, API_TIMEOUT_VETO, QwenCortex
 from core.memory import BoardMemory, build_engine_snapshot, daily_block_reason
 from core.schemas import AnalystBrief, AttestationResult, BoardDecision, RiskReport
-from core.ta import candle_veto, confluence_veto, tape_veto_blocks
+from core.ta import candle_veto, confluence_veto, demo_force_execute, is_usdt_m_symbol, tape_veto_blocks
 from connectors.arbitrum import ArbitrumSepolia
 from connectors.bitget_paper import BitgetPaperConnector
 
 CALLSIGN = "CHAIRMAN"
+_SPOT_BLOCK = (
+    "SPOT trading is disabled. Chronos-Nexus executes "
+    "Bitget Demo USDT-M perpetuals only."
+)
+
+
+def _demo_release(brief: AnalystBrief, symbol: str, last_price: float) -> bool:
+    """True when CHAIRMAN should lock a USDT-M entry past a SENTINEL veto."""
+    if not demo_force_execute():
+        return False
+    if is_idle_brief(brief):
+        return False
+    if str(brief.side or "").lower() not in {"buy", "sell"}:
+        return False
+    if not is_usdt_m_symbol(symbol):
+        return False
+    try:
+        px = float(last_price or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return px > 0
 
 _SYSTEM = """You are CHAIRMAN, the Executive Agent on Chronos-Nexus.
 You listen to ORACLE (Analyst) and SENTINEL (Risk). You do not override a VETO.
@@ -27,9 +48,9 @@ Output JSON only with keys:
 - action: EXECUTE | STAND_DOWN
 - consensus: UNANIMOUS | MAJORITY | VETOED
 Hard rules the Python chair will also enforce:
-- VETO → STAND_DOWN / VETOED (including Illiquid Market / High Spread)
-- TA confluence: BUY with RSI >= 70 → STAND_DOWN / VETOED ("VETO: RSI Overbought despite bullish news")
-- TA confluence: SELL with RSI <= 30 → STAND_DOWN / VETOED ("VETO: RSI Oversold despite bearish news")
+- VETO → STAND_DOWN / VETOED (including Illiquid Market / High Spread), unless the locked action is already EXECUTE
+- TA confluence: BUY with RSI >= 70 → STAND_DOWN / VETOED ("VETO: RSI Overbought despite bullish news"), unless the locked action is already EXECUTE
+- TA confluence: SELL with RSI <= 30 → STAND_DOWN / VETOED ("VETO: RSI Oversold despite bearish news"), unless the locked action is already EXECUTE
 - Candle structure BREAK against the news side is context. It does not force STAND_DOWN.
 - Higher-timeframe disagreement and a choppy tape are context. They do not force STAND_DOWN.
 - Occupied book (position already open) is never a new entry. SENTINEL/Python already stripped it.
@@ -38,6 +59,7 @@ Hard rules the Python chair will also enforce:
 - No live last price → STAND_DOWN / DEGRADED
 - Last price is the live Bitget MAINNET BBO peg (BUY=best ask, SELL=best bid), never a sandbox mid.
 - CLEAR or REDUCE → EXECUTE (REDUCE already cut size; it is not a veto)
+- A spot symbol (no :USDT settle) is never EXECUTE. Spot belongs to the operator Telegram path.
 - NEVER invent NVDA or a BUY when ORACLE stood down.
 - The Demo symbol may be a proxy (e.g. BTC/USDT) when rTokens are not listed on Bitget Demo. That is a venue constraint, not a reason to stand down.
 """
@@ -76,7 +98,13 @@ class ExecutiveAgent:
         day_reason = str(risk.daily_halt or "").strip()
         if not day_reason and self.memory is not None:
             day_reason = daily_block_reason(self.memory.daily_state())
-        if idle or risk.verdict == "VETO" or no_price or ta_reason or day_reason:
+        force = _demo_release(brief, tradable_symbol, last_price)
+        if force:
+            # Rails stay on the SENTINEL report. They do not lock this entry.
+            candle_reason = ""
+            ta_reason = ""
+            day_reason = ""
+        if idle or (risk.verdict == "VETO" and not force) or no_price or ta_reason or day_reason:
             locked = "STAND_DOWN"
         else:
             locked = "EXECUTE"
@@ -135,7 +163,7 @@ class ExecutiveAgent:
         if idle:
             action = "STAND_DOWN"
             consensus = "DEGRADED"
-        elif risk.verdict == "VETO" or ta_reason or day_reason:
+        elif (risk.verdict == "VETO" and not force) or ta_reason or day_reason:
             action = "STAND_DOWN"
             consensus = "VETOED"
         elif no_price:
@@ -147,15 +175,31 @@ class ExecutiveAgent:
 
         notional = 0.0
         amount = 0.0
-        if action == "EXECUTE":
-            notional = max(1.0, float(risk.max_notional_usdt) * float(risk.size_multiplier))
+        spot_block = False
+        if action == "EXECUTE" and not is_usdt_m_symbol(tradable_symbol):
+            action = "STAND_DOWN"
+            consensus = "VETOED"
+            spot_block = True
+        elif action == "EXECUTE":
+            mult = float(risk.size_multiplier or 0.0)
+            cap = float(risk.max_notional_usdt or 0.0)
+            notional = max(1.0, cap * mult) if mult > 0 else max(1.0, cap or 15.0)
             amount = notional / last_price
 
         reasoning = str(payload.get("reasoning") or fallback["reasoning"])
+        if spot_block and _SPOT_BLOCK not in reasoning:
+            reasoning = f"{_SPOT_BLOCK} {reasoning}"
         if ta_reason and ta_reason not in reasoning:
             reasoning = f"{ta_reason} (RSI={rsi_bit} {risk.rsi_timeframe or ''}). {reasoning}"
         if day_reason and day_reason not in reasoning:
             reasoning = f"{day_reason}. {reasoning}"
+        if force and action == "EXECUTE":
+            print(
+                f"[DEMO] CHAIRMAN EXECUTE  {tradable_symbol}  {brief.side}  "
+                f"qty={amount:.8f}  notional={notional:.4f}  "
+                f"sl={risk.sl_price}  tp={risk.tp_price}  margin={risk.margin_usdt}",
+                flush=True,
+            )
         decision = BoardDecision(
             action=action,
             consensus=consensus,
@@ -183,7 +227,8 @@ class ExecutiveAgent:
         attestation: AttestationResult | None = None
         order: dict[str, Any] | None = None
 
-        if decision.action == "EXECUTE" and self.memory is not None:
+        force = _demo_release(brief, decision.symbol, last_price)
+        if decision.action == "EXECUTE" and self.memory is not None and not force:
             allowed, block = self.memory.can_enter()
             if not allowed:
                 decision.action = "STAND_DOWN"

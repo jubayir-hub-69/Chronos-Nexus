@@ -145,6 +145,17 @@ class ConfluenceRuleTests(unittest.TestCase):
 
 
 class SentinelTaTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import core.ta as ta
+
+        self._force = ta.DEMO_FORCE_EXECUTE
+        ta.DEMO_FORCE_EXECUTE = False
+
+    def tearDown(self) -> None:
+        import core.ta as ta
+
+        ta.DEMO_FORCE_EXECUTE = self._force
+
     def _eval(self, side: str, rsi: float | None) -> RiskReport:
         agent = RiskManagerAgent(DummyCortex())  # type: ignore[arg-type]
         return agent.evaluate(
@@ -189,6 +200,17 @@ class SentinelTaTests(unittest.TestCase):
 
 
 class ChairmanTaTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import core.ta as ta
+
+        self._force = ta.DEMO_FORCE_EXECUTE
+        ta.DEMO_FORCE_EXECUTE = False
+
+    def tearDown(self) -> None:
+        import core.ta as ta
+
+        ta.DEMO_FORCE_EXECUTE = self._force
+
     def _chair(self, side: str, rsi: float | None, verdict: str = "CLEAR") -> tuple:
         agent = ExecutiveAgent(DummyCortex())  # type: ignore[arg-type]
         risk = RiskReport(

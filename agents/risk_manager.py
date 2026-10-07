@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agents.analyst import session_clock
+from agents.analyst import is_idle_brief, session_clock
 from core.llm import API_QUOTA_VETO, API_TIMEOUT_VETO, QwenCortex
 from core.schemas import AnalystBrief, RiskReport
 from connectors.bitget_paper import SWAP_LEVERAGE, protective_prices
@@ -22,6 +22,8 @@ from core.ta import (
     RELAX_TAPE_VETOES,
     SETUP_THRESHOLD,
     VETO_REASON_MARK,
+    demo_force_execute,
+    is_usdt_m_symbol,
     bbo_peg_price,
     bbo_sane_vs_mark,
     candle_veto,
@@ -75,9 +77,14 @@ Evaluate:
     + 24h high/low + VWAP. Composite must be >= 40 or VETO
     "VETO: Setup confidence below 40 — wait for a cleaner TA tape".
     Higher-timeframe disagreement is context, not a hard veto.
-    News is context. TA is the primary edge. Opposing book walls still veto.
+    News is context. TA is the primary edge.
     Do not VETO only because the higher timeframe disagrees, the candle
     structure fights the headline, or the tape looks choppy.
+12. DEMO FORCE: while Python's DEMO_FORCE_EXECUTE switch is on, walls, thin
+    volume, a setup under 40, RSI extremes, spread, and the daily ledger are
+    notes. They do not block a USDT-M perp when ORACLE has buy or sell.
+    Return CLEAR for that contract and describe the risk in the rationale.
+    Never clear a spot symbol. Spot is the operator's Telegram path.
 
 Verdicts:
 - CLEAR: trade may proceed at requested size
@@ -397,10 +404,25 @@ class RiskManagerAgent:
                 flush=True,
             )
 
+        force = _demo_release(brief, tradable_symbol)
+        if force and verdict == "VETO":
+            noted = [str(flag) for flag in flags if str(flag).strip()]
+            print(
+                f"[DEMO] SENTINEL notes only — USDT-M entry cleared  "
+                f"{tradable_symbol}  side={brief.side}  "
+                f"notes={'; '.join(noted) or 'model veto'}",
+                flush=True,
+            )
+            verdict = "CLEAR"
+            multiplier = 1.0
+            rationale = (
+                "DEMO FORCE: SENTINEL risk notes were recorded and do not block "
+                f"this USDT-M entry. {rationale}"
+            )
         if verdict == "VETO":
             multiplier = 0.0
         cap = _cap(payload.get("max_notional_usdt"), paper_cap_usdt)
-        leverage = 1.0 if fund.get("is_swap") is False else SWAP_LEVERAGE
+        leverage = SWAP_LEVERAGE if is_usdt_m_symbol(tradable_symbol) else 1.0
         if verdict != "VETO":
             requested = max(1.0, float(cap) * float(multiplier))
             sized, budget_reason = clip_notional_to_daily_budget(
@@ -409,7 +431,7 @@ class RiskManagerAgent:
                 requested_notional=requested,
                 leverage=leverage,
             )
-            if budget_reason:
+            if budget_reason and not force:
                 python_hard = True
                 verdict = "VETO"
                 multiplier = 0.0
@@ -417,6 +439,17 @@ class RiskManagerAgent:
                     flags.append(budget_reason)
                 rationale = f"{budget_reason}. {rationale}"
                 print(f"[DAILY] {budget_reason}", flush=True)
+            elif budget_reason and force:
+                floor = max(1.0, min(float(paper_cap_usdt), float(requested)))
+                cap = float(sized) if sized and float(sized) >= 1.0 else floor
+                multiplier = 1.0
+                if budget_reason not in flags:
+                    flags.append(budget_reason)
+                print(
+                    f"[DEMO] daily budget noted ({budget_reason}); "
+                    f"notional={cap} USDT  equity={equity_usdt}",
+                    flush=True,
+                )
             else:
                 cap = sized
                 multiplier = 1.0
@@ -443,9 +476,21 @@ class RiskManagerAgent:
             llm_score=payload.get("asset_risk_score"),
             daily=daily,
             equity_usdt=equity_usdt,
-            daily_halt=chop or day_reason or "",
+            daily_halt="" if force else (chop or day_reason or ""),
             setup=setup,
+            leverage=leverage,
         )
+
+
+def _demo_release(brief: AnalystBrief, symbol: str) -> bool:
+    """True when this cycle may clear a SENTINEL veto on a USDT-M contract."""
+    if not demo_force_execute():
+        return False
+    if is_idle_brief(brief):
+        return False
+    if str(brief.side or "").lower() not in {"buy", "sell"}:
+        return False
+    return is_usdt_m_symbol(symbol)
 
 
 def _stamp_report(
@@ -469,6 +514,7 @@ def _stamp_report(
     equity_usdt: float | None = None,
     daily_halt: str = "",
     setup: dict[str, Any] | None = None,
+    leverage: float | None = None,
 ) -> RiskReport:
     rsi = ta_snap.get("rsi")
     py_score = score_asset_risk(
@@ -496,10 +542,16 @@ def _stamp_report(
         score = py_score
     frac = sl_margin_frac(score)
     notional = 0.0 if verdict == "VETO" else max(1.0, float(cap) * float(multiplier))
-    leverage = 1.0 if fund.get("is_swap") is False else SWAP_LEVERAGE
+    if leverage is None:
+        leverage = 1.0 if fund.get("is_swap") is False else SWAP_LEVERAGE
+    else:
+        leverage = max(1.0, float(leverage))
     margin = (notional / leverage) if notional > 0 else None
     sl_px = None
     tp_px = None
+    qty = None
+    # +25% PnL is a price move of that fraction divided by leverage (5x → +5%).
+    tp_price_frac = (SCALE_OUT_PCT / leverage) if leverage else SCALE_OUT_PCT
     if last_px and last_px > 0 and margin and margin > 0 and verdict != "VETO":
         qty = notional / last_px
         sl_px, tp_px = protective_prices(
@@ -509,7 +561,7 @@ def _stamp_report(
             qty=qty,
             sl_margin_frac=frac,
             leverage=leverage,
-            take_profit_pct=SCALE_OUT_PCT,
+            take_profit_pct=tp_price_frac,
         )
     print(
         f"[RISK] score={score:.1f}  sl_margin={frac:.0%}  "
@@ -518,6 +570,15 @@ def _stamp_report(
         f"structure={ta_snap.get('structure') or 'n/a'}",
         flush=True,
     )
+    if qty is not None and sl_px and tp_px and last_px:
+        print(
+            f"[RISK] qty={qty:.8f}  notional={notional:.4f}  "
+            f"margin={float(margin):.4f}  lev={leverage:.1f}  "
+            f"px={float(last_px):.8f}  sl={float(sl_px):.8f}  "
+            f"tp={float(tp_px):.8f}  sl_frac={frac:.2%} of margin  "
+            f"tp_pnl=+{SCALE_OUT_PCT:.0%}  side={brief.side}",
+            flush=True,
+        )
     return RiskReport(
         verdict=verdict,  # type: ignore[arg-type]
         fake_news_risk=fake_news,  # type: ignore[arg-type]
