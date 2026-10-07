@@ -10,7 +10,7 @@ from agents.analyst import is_idle_brief
 from core.llm import API_QUOTA_VETO, API_TIMEOUT_VETO, QwenCortex
 from core.memory import BoardMemory, build_engine_snapshot, daily_block_reason
 from core.schemas import AnalystBrief, AttestationResult, BoardDecision, RiskReport
-from core.ta import candle_veto, confluence_veto
+from core.ta import candle_veto, confluence_veto, tape_veto_blocks
 from connectors.arbitrum import ArbitrumSepolia
 from connectors.bitget_paper import BitgetPaperConnector
 
@@ -30,9 +30,10 @@ Hard rules the Python chair will also enforce:
 - VETO → STAND_DOWN / VETOED (including Illiquid Market / High Spread)
 - TA confluence: BUY with RSI >= 70 → STAND_DOWN / VETOED ("VETO: RSI Overbought despite bullish news")
 - TA confluence: SELL with RSI <= 30 → STAND_DOWN / VETOED ("VETO: RSI Oversold despite bearish news")
-- Candle structure BREAK against the news side → STAND_DOWN / VETOED
+- Candle structure BREAK against the news side is context. It does not force STAND_DOWN.
+- Higher-timeframe disagreement and a choppy tape are context. They do not force STAND_DOWN.
 - Occupied book (position already open) is never a new entry. SENTINEL/Python already stripped it.
-- Daily hard stand-down (4 entries, 3 wins, any SL, chop/downtrend, 6% equity cap) → STAND_DOWN / VETOED
+- Daily hard stand-down (4 entries, 3 wins, any SL, 6% equity cap) → STAND_DOWN / VETOED
 - ORACLE idle (primary_symbol=NONE, side=none, conviction=0, or Qwen timeout) → STAND_DOWN
 - No live last price → STAND_DOWN / DEGRADED
 - Last price is the live Bitget MAINNET BBO peg (BUY=best ask, SELL=best bid), never a sandbox mid.
@@ -57,7 +58,7 @@ class ExecutiveAgent:
     ) -> BoardDecision:
         idle = is_idle_brief(brief)
         no_price = (not idle) and last_price <= 0
-        ta_reason = confluence_veto(brief.side, risk.rsi) or candle_veto(
+        candle_reason = candle_veto(
             brief.side,
             {
                 "structure_break": str(risk.candle_structure or "").startswith("BREAK_"),
@@ -69,6 +70,9 @@ class ExecutiveAgent:
                 "structure": risk.candle_structure,
             },
         )
+        if not tape_veto_blocks(candle_reason):
+            candle_reason = ""
+        ta_reason = confluence_veto(brief.side, risk.rsi) or candle_reason
         day_reason = str(risk.daily_halt or "").strip()
         if not day_reason and self.memory is not None:
             day_reason = daily_block_reason(self.memory.daily_state())

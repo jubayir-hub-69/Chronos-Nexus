@@ -286,6 +286,12 @@ class TelegramTimeoutTests(unittest.TestCase):
         self.assertNotIn("ABCDEF", line)
         self.assertNotIn("getUpdates", line)
 
+    def test_getupdates_conflict_is_silent(self) -> None:
+        line = _telegram_fault(
+            RuntimeError("Conflict: terminated by other getUpdates request")
+        )
+        self.assertEqual(line, "")
+
 
 if __name__ == "__main__":
     unittest.main()

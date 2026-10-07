@@ -116,11 +116,12 @@ Primary edge is TECHNICAL, not a news essay:
   structure (engulfing / hammer / marubozu / break), 15m entry vs 1h/4h regime.
 - News is CONTEXT. A slightly mixed wire is not a reason to sit out if a
   listed name maps cleanly. Toxic tape (fraud, crash, lawsuit) is stay_away.
-- SENTINEL's Python rail requires a 75+ TA setup (volume + candles + book +
-  MTF) during the regular US cash session. On a NEUTRAL wire, or when the
+- SENTINEL's Python rail requires a 40+ TA setup (volume + candles + book +
+  MTF). Higher-timeframe disagreement, a candle break against the headline,
+  and a choppy tape are not reasons to emit NONE. On a NEUTRAL wire, or when the
   session clock says PRE-MARKET, OVERNIGHT, WEEKEND, or AFTER-HOURS, a listed
-  name with strong 24h volume and a clean TA score of 70+ is a valid paper
-  trade. Do not emit NONE for the whole quiet session when that tape exists.
+  name with strong 24h volume and a clean TA score of 70+ is a valid trade.
+  Do not emit NONE for the whole quiet session when that tape exists.
   You pick the name; SENTINEL confirms the tape.
 
 Rules:
@@ -200,7 +201,7 @@ class AnalystAgent:
             f"PYTHON WIRE SENTIMENT (source-weighted, 0-100): {wire_score.get('sentiment')} "
             f"cred={wire_score.get('credibility')} conflict={wire_score.get('conflict')} "
             f"impact={wire_score.get('impact')} n={wire_score.get('n')}. "
-            "Neutral (~50) is not an automatic stand-down — SENTINEL will score TA at 75+. "
+            "Neutral (~50) is not an automatic stand-down — SENTINEL will score TA at 40+. "
             "Only stand down if the wire is toxic/conflicted AND no listed name maps.\n"
             "Act as an active day trader. Produce the JSON brief now. Do not invent catalysts."
         )

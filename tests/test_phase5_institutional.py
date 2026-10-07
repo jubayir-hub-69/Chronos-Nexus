@@ -235,8 +235,9 @@ class SentinelCandleTests(unittest.TestCase):
             equity_usdt=10_000.0,
             daily={"entries": 0, "wins": 0, "sl_hits": 0, "deployed_usdt": 0.0, "halt": ""},
         )
-        self.assertEqual(risk.verdict, "VETO")
-        self.assertIn(VETO_REASON_CANDLE, risk.black_swan_flags)
+        self.assertEqual(risk.verdict, "CLEAR")
+        self.assertNotIn(VETO_REASON_CANDLE, risk.black_swan_flags)
+        self.assertTrue(structure_break_against("buy", ta))
 
     def test_clear_sets_margin_stop(self) -> None:
         agent = RiskManagerAgent(DummyCortex())  # type: ignore[arg-type]

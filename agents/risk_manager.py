@@ -19,6 +19,7 @@ from core.ta import (
     RSI_OVERSOLD,
     RSI_PERIOD,
     SCALE_OUT_PCT,
+    RELAX_TAPE_VETOES,
     SETUP_THRESHOLD,
     VETO_REASON_MARK,
     bbo_peg_price,
@@ -33,6 +34,7 @@ from core.ta import (
     snapshot_fundamentals,
     snapshot_ta,
     ta_verdict,
+    tape_veto_blocks,
 )
 
 CALLSIGN = "SENTINEL"
@@ -62,17 +64,20 @@ Evaluate:
    Unmeasured RSI does not veto. Do not invent an RSI reading.
 8. MULTI-FACTOR: combine news + fundamentals (mcap, supply, last, 24h volume)
    + live candle structure/volatility. A structure BREAK against the news side
-   is a hard Python veto ("VETO: Candle structure contradicts news thesis").
+   is context. It is not a hard veto on this desk.
 9. Return asset_risk_score 0-100. Python maps it onto a margin stop:
    high risk → 50% of invested margin; low risk → up to 100% of invested margin.
 10. DAILY CAPITAL (Python-enforced): max 4 entries per UTC day; 3 winning
-    closes → hard stand-down; any stop-loss → hard stand-down; live OHLCV
-    chop/downtrend → hard stand-down. Deployed margin across the day cannot
-    exceed 6% of live fetch_balance equity (5–6% band). Do not use the whole book.
+    closes → hard stand-down; any stop-loss → hard stand-down. A choppy or
+    downtrending tape is context, not a hard stand-down. Deployed margin across
+    the day cannot exceed 6% of live fetch_balance equity (5–6% band).
 11. SETUP SCORE (Python, TA-weighted): 15m/1h/4h candles + volume + L2 walls
-    + 24h high/low + VWAP. Composite must be >= 75 or VETO
-    "VETO: Setup confidence below 75 — wait for a cleaner TA tape".
+    + 24h high/low + VWAP. Composite must be >= 40 or VETO
+    "VETO: Setup confidence below 40 — wait for a cleaner TA tape".
+    Higher-timeframe disagreement is context, not a hard veto.
     News is context. TA is the primary edge. Opposing book walls still veto.
+    Do not VETO only because the higher timeframe disagrees, the candle
+    structure fights the headline, or the tape looks choppy.
 
 Verdicts:
 - CLEAR: trade may proceed at requested size
@@ -140,9 +145,11 @@ class RiskManagerAgent:
             f"with reason '{VETO_REASON_SPREAD}'.\n"
             f"HARD RSI RULE: BUY only if RSI < {RSI_OVERBOUGHT:.0f}; "
             f"SELL only if RSI > {RSI_OVERSOLD:.0f}. "
-            "HARD CANDLE RULE: structure BREAK against the news side is a VETO.\n"
+            "CANDLE / HTF / CHOP: structure breaks, higher-timeframe disagreement, "
+            "and a choppy tape are context. They are not a VETO.\n"
             f"DAILY LIMITS: max {DAILY_MAX_ENTRIES} entries, win-streak 3, SL halt, "
             f"{DAILY_RISK_PCT:.0%} equity cap. Live equity USDT={equity_usdt} daily={daily}.\n"
+            f"SETUP FLOOR: composite score must be >= {SETUP_THRESHOLD:.0f}.\n"
             "Python enforces the exact VETO reason strings.\n"
             "Produce the JSON risk report now."
         )
@@ -187,8 +194,10 @@ class RiskManagerAgent:
         multiplier = _mult(payload.get("size_multiplier"), 0.5 if verdict == "REDUCE" else 1.0)
         flags = _flags(payload.get("black_swan_flags"))
         rationale = str(payload.get("rationale") or fallback["rationale"])
+        python_hard = False
 
         if illiquid:
+            python_hard = True
             verdict = "VETO"
             multiplier = 0.0
             if VETO_REASON_SPREAD not in flags:
@@ -200,6 +209,7 @@ class RiskManagerAgent:
 
         is_contract = ":" in str(tradable_symbol or "") or bool(fund.get("is_swap"))
         if peg_px and not bbo_sane_vs_mark(peg=peg_px, mark=mark_px, is_contract=is_contract):
+            python_hard = True
             verdict = "VETO"
             multiplier = 0.0
             if VETO_REASON_MARK not in flags:
@@ -210,6 +220,7 @@ class RiskManagerAgent:
 
         rsi_reason = confluence_veto(brief.side, rsi)
         if rsi_reason:
+            python_hard = True
             verdict = "VETO"
             multiplier = 0.0
             if rsi_reason not in flags:
@@ -235,7 +246,8 @@ class RiskManagerAgent:
             )
 
         candle_reason = candle_veto(brief.side, ta_snap)
-        if candle_reason:
+        if candle_reason and tape_veto_blocks(candle_reason):
+            python_hard = True
             verdict = "VETO"
             multiplier = 0.0
             if candle_reason not in flags:
@@ -246,6 +258,12 @@ class RiskManagerAgent:
             )
             print(
                 f"[TA] {candle_reason}  {ta_snap.get('structure')}  "
+                f"{tradable_symbol}  side={brief.side}",
+                flush=True,
+            )
+        elif candle_reason:
+            print(
+                f"[TA] note  candle structure vs thesis  {ta_snap.get('structure')}  "
                 f"{tradable_symbol}  side={brief.side}",
                 flush=True,
             )
@@ -286,7 +304,15 @@ class RiskManagerAgent:
             volume_24h=fund.get("volume_24h_usdt"),
             session=session_name,
         )
+        if setup_reason and not tape_veto_blocks(setup_reason):
+            print(
+                f"[SETUP] note  higher-timeframe  score={setup.get('score')}  "
+                f"mtf={setup.get('align')}  {tradable_symbol}",
+                flush=True,
+            )
+            setup_reason = ""
         if setup_reason:
+            python_hard = True
             already = verdict == "VETO"
             verdict = "VETO"
             multiplier = 0.0
@@ -315,27 +341,61 @@ class RiskManagerAgent:
                 print(
                     f"[SETUP] SKIPPED  HTF unmeasured  "
                     f"score={setup.get('score')}  {tradable_symbol}  "
-                    f"(75% rail waits for 1h/4h)",
+                    f"({SETUP_THRESHOLD:.0f} rail waits for 1h/4h)",
                     flush=True,
                 )
 
         chop = severe_tape_halt(ta_snap)
-        if chop:
+        if chop and tape_veto_blocks(chop):
+            python_hard = True
             verdict = "VETO"
             multiplier = 0.0
             if chop not in flags:
                 flags.append(chop)
             rationale = f"{chop} (structure={ta_snap.get('structure')} vol={ta_snap.get('volatility')}). {rationale}"
             print(f"[DAILY] {chop}", flush=True)
+        elif chop:
+            print(
+                f"[DAILY] note  tape  structure={ta_snap.get('structure')}  "
+                f"vol={ta_snap.get('volatility')}",
+                flush=True,
+            )
+            chop = ""
 
         day_reason = daily_block_reason(daily)
         if day_reason:
+            python_hard = True
             verdict = "VETO"
             multiplier = 0.0
             if day_reason not in flags:
                 flags.append(day_reason)
             rationale = f"{day_reason}. {rationale}"
             print(f"[DAILY] {day_reason}", flush=True)
+
+        if RELAX_TAPE_VETOES:
+            flags = [flag for flag in flags if tape_veto_blocks(flag)]
+        try:
+            setup_score = float(setup.get("score") or 0.0)
+        except (TypeError, ValueError):
+            setup_score = 0.0
+        measurable = bool(setup.get("measurable"))
+        clears_floor = (not measurable) or setup_score >= SETUP_THRESHOLD
+        if RELAX_TAPE_VETOES and verdict == "VETO" and not python_hard and clears_floor:
+            verdict = "CLEAR"
+            multiplier = 1.0
+            shown = f"{setup_score:.2f}" if measurable else "unmeasured"
+            align = setup.get("align") or "n/a"
+            rationale = (
+                f"CLEAR. Setup {shown} clears the {SETUP_THRESHOLD:.0f} floor "
+                f"(mtf={align}). RSI, spread, mark, and the daily budget did not veto. "
+                "Higher-timeframe disagreement, candle-structure conflict, and choppy tape "
+                "are advisory on this desk."
+            )
+            print(
+                f"[SETUP] PASS  score={shown}  mtf={align}  floor={SETUP_THRESHOLD:.0f}  "
+                f"{tradable_symbol}",
+                flush=True,
+            )
 
         if verdict == "VETO":
             multiplier = 0.0
@@ -350,6 +410,7 @@ class RiskManagerAgent:
                 leverage=leverage,
             )
             if budget_reason:
+                python_hard = True
                 verdict = "VETO"
                 multiplier = 0.0
                 if budget_reason not in flags:

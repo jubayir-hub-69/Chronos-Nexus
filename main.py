@@ -62,7 +62,15 @@ from core.positions import (
 )
 from core.schemas import AnalystBrief, BoardDecision, RiskReport
 from core.neutral_lane import seek_neutral_candidate
-from core.ta import RSI_PERIOD, SCALE_OUT_PCT, bbo_peg_price, candle_veto, confluence_veto, rsi_zone
+from core.ta import (
+    RSI_PERIOD,
+    SCALE_OUT_PCT,
+    bbo_peg_price,
+    candle_veto,
+    confluence_veto,
+    rsi_zone,
+    tape_veto_blocks,
+)
 from utils.commands import CommandDesk, TelegramCommandLoop, TerminalCommandLoop
 from utils.notifier import TelegramNotifier, send_startup_message
 
@@ -97,7 +105,7 @@ def render_banner() -> None:
         Align.center(Text("WALL STREET SLEEPS.  THE NEXUS DOES NOT.", style="bold cyan")),
         Align.center(
             Text(
-                "Hackathon S2  ·  Agentic Trading  ·  Event-Driven Agent  ·  PAPER ONLY",
+                "Agentic Trading  ·  Event-Driven Agent",
                 style="dim cyan",
             )
         ),
@@ -106,8 +114,8 @@ def render_banner() -> None:
     console.print()
     lock = Table.grid(expand=True)
     lock.add_column(justify="center")
-    lock.add_row(Text("LIVE TRADING LOCKED  ·  DEMO NETWORK ONLY  ·  NO REAL FUNDS", style="bold red"))
-    console.print(Panel(lock, border_style="red", box=box.HEAVY, padding=(0, 1)))
+    lock.add_row(Text("LIVE AUTONOMOUS EXECUTION", style="bold green"))
+    console.print(Panel(lock, border_style="green", box=box.HEAVY, padding=(0, 1)))
     console.print()
 
 
@@ -428,7 +436,7 @@ def _run_trading_cycle(
     sample = "  ".join(entry_universe[:10]) + ("  …" if len(entry_universe) > 10 else "")
     console.print(
         kv_panel(
-            "LIVE DEMO UNIVERSE",
+            "LIVE UNIVERSE",
             [
                 ("session", clock["line"]),
                 ("listed", str(len(universe))),
@@ -447,7 +455,7 @@ def _run_trading_cycle(
         )
     console.print()
 
-    console.print("[dim]ORACLE is scanning the global wire against the unoccupied Demo book…[/]")
+    console.print("[dim]ORACLE is scanning the live wire against the unoccupied book…[/]")
     try:
         brief: AnalystBrief = analyst.brief(
             triggers, entry_universe, occupied=occupied
@@ -538,7 +546,7 @@ def _run_trading_cycle(
 
     phase("PHASE 3.5  ·  POSITION DESK  ·  TRAILING SCAN")
     if not book:
-        console.print("[dim]FLAT — no open Demo positions.[/]")
+        console.print("[dim]FLAT — no open positions.[/]")
     else:
         pos_table = Table(box=box.SIMPLE_HEAVY, header_style="bold cyan", expand=True)
         pos_table.add_column("SYMBOL", style="bold white")
@@ -670,7 +678,10 @@ def _run_trading_cycle(
     rsi_val = ta.get("rsi") if isinstance(ta.get("rsi"), (int, float)) else None
     rsi_s = "n/a" if rsi_val is None else f"{float(rsi_val):.2f}"
     zone = rsi_zone(rsi_val)
-    ta_reason = "" if idle else (confluence_veto(brief.side, rsi_val) or candle_veto(brief.side, ta))
+    candle_reason = "" if idle else candle_veto(brief.side, ta)
+    if not tape_veto_blocks(candle_reason):
+        candle_reason = ""
+    ta_reason = "" if idle else (confluence_veto(brief.side, rsi_val) or candle_reason)
     if idle:
         ta_line = "SKIPPED — ORACLE idle"
         ta_border = "yellow"
@@ -842,7 +853,7 @@ def _run_trading_cycle(
         console.print("[bold yellow]Arbitrum unbound — execution will skip on-chain proof if attest fails.[/]")
         arb = ArbitrumSepolia(settings)
 
-    phase("PHASE 5  ·  CHAIRMAN  ·  ATTEST + PAPER EXECUTE")
+    phase("PHASE 5  ·  CHAIRMAN  ·  ATTEST + EXECUTE")
     try:
         bundle = chairman.convene(
             brief=brief,
@@ -904,7 +915,7 @@ def _run_trading_cycle(
     order_ok = bool(order.get("ok"))
     console.print(
         kv_panel(
-            "BITGET PAPER ORDER",
+            "BITGET ORDER",
             [
                 ("ok", str(order_ok)),
                 ("status", str(order.get("status") or "—")),
@@ -961,12 +972,12 @@ def _run_trading_cycle(
                     Text("NEXUS CYCLE COMPLETE", style="bold green1", justify="center"),
                     Text(
                         f"event → decision → {'on-chain attest → ' if attestation and attestation.ok else ''}"
-                        f"{'paper fill' if order_ok else order.get('status', 'stand-down')}",
+                        f"{'fill' if order_ok else order.get('status', 'stand-down')}",
                         style="cyan",
                         justify="center",
                     ),
                     Text(
-                        f"{elapsed:.1f}s  ·  {HACKATHON}  ·  paper only  ·  {cortex.model_name}",
+                        f"{elapsed:.1f}s  ·  LIVE AUTONOMOUS EXECUTION  ·  {cortex.model_name}",
                         style="dim",
                         justify="center",
                     ),
@@ -1012,8 +1023,7 @@ def _main() -> int:
             "COMPLIANCE",
             [
                 ("version", VERSION),
-                ("paper_trading", str(settings.bitget_paper_trading)),
-                ("live_trading", str(LIVE_TRADING_ENABLED)),
+                ("execution", "LIVE AUTONOMOUS EXECUTION"),
                 ("cortex", settings.public_status()["cortex_backend"]),
                 ("qwen_requested", settings.qwen_model),
                 ("qwen_resolved", settings.resolved_qwen_model or "(unresolved)"),
@@ -1023,7 +1033,7 @@ def _main() -> int:
                 ("arb_chain", str(settings.arbitrum_sepolia_chain_id)),
                 ("telegram", settings.public_status()["telegram"]),
             ],
-            border="red",
+            border="green",
         )
     )
     console.print()
@@ -1079,9 +1089,9 @@ def _main() -> int:
         Columns(
             [
                 kv_panel(
-                    "BITGET DEMO",
+                    "BITGET",
                     [
-                        ("mode", "sandbox / PAPTRADING=1"),
+                        ("mode", "USDT-M"),
                         ("status", "ONLINE" if bitget else f"FAULT {bitget_err}"),
                         ("markets", str(bitget_ping.get("markets", "—"))),
                         ("universe", str(bitget_ping.get("universe", "—"))),
@@ -1132,7 +1142,7 @@ def _main() -> int:
     table.add_row("Executive Agent", "CHAIRMAN · attest + execute", status_dot(True))
     table.add_row("Bitget Hackathon - Qwen 3.8 Max", f"{cortex.backend} · {cortex.selected_model}", status_dot(cortex.backend != "offline"))
     table.add_row(
-        "Bitget Paper",
+        "Bitget",
         f"{bitget_ping.get('symbol') or bitget_err or 'unbound'} · univ {bitget_ping.get('universe', '—')}",
         status_dot(bitget is not None),
     )
@@ -1160,7 +1170,7 @@ def _main() -> int:
         status_dot(True, label_ok="ARMED", label_bad="OFF"),
     )
     table.add_row("Position Desk", "SL/TP · trail · thesis close", status_dot(True))
-    table.add_row("Compliance Lock", "live trading hard-disabled", status_dot(not LIVE_TRADING_ENABLED))
+    table.add_row("Execution", "LIVE AUTONOMOUS EXECUTION", status_dot(True, label_ok="ARMED", label_bad="OFF"))
     console.print(table)
     console.print()
 

@@ -201,10 +201,11 @@ class SentinelDailyTests(unittest.TestCase):
         self.assertEqual(risk.verdict, "VETO")
         self.assertIn(VETO_REASON_WIN_STREAK, risk.black_swan_flags)
 
-    def test_chop_veto(self) -> None:
+    def test_chop_is_advisory(self) -> None:
         risk = self._eval(ta={"ok": True, "rsi": 48.0, "structure": "DOWNTREND", "volatility": "HIGH", "timeframe": "15m", "period": 14})
-        self.assertEqual(risk.verdict, "VETO")
-        self.assertTrue(any("Choppy" in f or "chop" in f.lower() for f in risk.black_swan_flags) or VETO_REASON_CHOP in risk.rationale)
+        self.assertEqual(risk.verdict, "CLEAR")
+        self.assertNotIn(VETO_REASON_CHOP, risk.black_swan_flags)
+        self.assertNotIn(VETO_REASON_CHOP, risk.rationale)
 
     def test_sizes_inside_six_percent(self) -> None:
         risk = self._eval(equity_usdt=100.0, paper_cap_usdt=15.0)

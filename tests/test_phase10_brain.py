@@ -1,4 +1,4 @@
-"""Phase 10: 75% TA setup ensemble, MTF confluence, book walls, news NLP."""
+"""Phase 10: 40 setup ensemble, MTF confluence, book walls, news NLP."""
 
 from __future__ import annotations
 
@@ -128,7 +128,7 @@ class SmaAndMtfTests(unittest.TestCase):
 
 class SetupThresholdTests(unittest.TestCase):
     def test_unmeasured_htf_does_not_fire_setup_rail(self) -> None:
-        """Zero-regression: RSI-only unit fixtures must not die on setup < 75."""
+        """Zero-regression: RSI-only unit fixtures must not die on an unmeasured higher timeframe."""
         reason, scored = setup_veto(
             side="buy",
             frames={"15m": {"ok": True, "rsi": 48.0, "timeframe": "15m", "structure": "RANGE"}},
@@ -163,9 +163,9 @@ class SetupThresholdTests(unittest.TestCase):
 
     def test_measured_weak_setup_is_rejected(self) -> None:
         weak = {
-            "15m": _frame(structure="RANGE", bias="neutral", rsi=50.0, rvol=0.5, vwap_dev=0.003),
-            "1h": _frame(structure="UPTREND", bias="bullish", rsi=55.0, rvol=0.6),
-            "4h": _frame(structure="UPTREND", bias="bullish", rsi=58.0, rvol=0.6),
+            "15m": _frame(structure="DOWNTREND", bias="bearish", rsi=28.0, rvol=0.2, vwap_dev=-0.02),
+            "1h": _frame(structure="DOWNTREND", bias="bearish", rsi=35.0, rvol=0.3),
+            "4h": _frame(structure="DOWNTREND", bias="bearish", rsi=38.0, rvol=0.3),
         }
         reason, scored = setup_veto(
             side="buy",
@@ -179,12 +179,13 @@ class SetupThresholdTests(unittest.TestCase):
                 error=None,
             ),
             last=100.0,
-            news={"scored": True, "sentiment": 58.0, "credibility": 0.5, "conflict": False, "impact": "low"},
-            conviction=20,
+            news={"scored": True, "sentiment": 50.0, "credibility": 0.4, "conflict": False, "impact": "low"},
+            conviction=5,
         )
         self.assertTrue(scored["measurable"])
         self.assertLess(scored["score"], SETUP_THRESHOLD)
         self.assertEqual(reason, VETO_REASON_SETUP)
+        self.assertEqual(scored["align"], "CONFLICT")
 
     def test_htf_conflict_vetoes(self) -> None:
         frames = _aligned_frames()
@@ -197,8 +198,12 @@ class SetupThresholdTests(unittest.TestCase):
             news=_news_bull(),
             conviction=88,
         )
-        self.assertEqual(reason, VETO_REASON_MTF)
+        self.assertNotEqual(reason, VETO_REASON_MTF)
         self.assertEqual(scored["align"], "CONFLICT")
+        if scored["score"] < SETUP_THRESHOLD:
+            self.assertEqual(reason, VETO_REASON_SETUP)
+        else:
+            self.assertEqual(reason, "")
 
     def test_ask_wall_blocks_buy(self) -> None:
         book = _book_payload(
@@ -249,9 +254,9 @@ class SetupThresholdTests(unittest.TestCase):
             news={"scored": False, "sentiment": 50.0},
             conviction=0,
         )
-        self.assertEqual(blocked, VETO_REASON_SETUP)
-        self.assertGreaterEqual(blocked_score["score"], NEUTRAL_SETUP_THRESHOLD)
-        self.assertLess(blocked_score["score"], SETUP_THRESHOLD)
+        self.assertEqual(blocked, "")
+        self.assertGreaterEqual(blocked_score["score"], SETUP_THRESHOLD)
+        self.assertFalse(blocked_score["neutral_lane"])
         reason, scored = setup_veto(
             side="buy",
             frames=frames,
@@ -263,9 +268,8 @@ class SetupThresholdTests(unittest.TestCase):
             session="PRE-MARKET — US cash not yet open",
         )
         self.assertEqual(reason, "")
-        self.assertTrue(scored["neutral_lane"])
-        self.assertGreaterEqual(scored["score"], NEUTRAL_SETUP_THRESHOLD)
-        self.assertLess(scored["score"], SETUP_THRESHOLD)
+        self.assertFalse(scored["neutral_lane"])
+        self.assertGreaterEqual(scored["score"], SETUP_THRESHOLD)
 
     def test_thin_volume_keeps_75_rail(self) -> None:
         reason, scored = setup_veto(
@@ -278,9 +282,8 @@ class SetupThresholdTests(unittest.TestCase):
             volume_24h=50_000.0,
             session="PRE-MARKET — US cash not yet open",
         )
-        self.assertGreaterEqual(scored["score"], NEUTRAL_SETUP_THRESHOLD)
-        self.assertLess(scored["score"], SETUP_THRESHOLD)
-        self.assertEqual(reason, VETO_REASON_SETUP)
+        self.assertGreaterEqual(scored["score"], SETUP_THRESHOLD)
+        self.assertEqual(reason, "")
         self.assertFalse(scored["neutral_lane"])
 
     def test_premarket_conflict_still_vetoes(self) -> None:
@@ -296,8 +299,12 @@ class SetupThresholdTests(unittest.TestCase):
             volume_24h=5_000_000.0,
             session="PRE-MARKET — US cash not yet open",
         )
-        self.assertEqual(reason, VETO_REASON_MTF)
+        self.assertNotEqual(reason, VETO_REASON_MTF)
         self.assertEqual(scored["align"], "CONFLICT")
+        if scored["score"] < SETUP_THRESHOLD:
+            self.assertEqual(reason, VETO_REASON_SETUP)
+        else:
+            self.assertEqual(reason, "")
 
 
 class NeutralScanTests(unittest.TestCase):

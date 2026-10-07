@@ -19,10 +19,13 @@ Models
 * Setup ensemble (only when 1h/4h are measured). TA-weighted active desk:
     0.10·news + 0.22·HTF + 0.18·entry + 0.18·volume
     + 0.16·book + 0.10·extension + 0.06·conviction
-  Score < 75 → VETO. Unmeasured HTF skips the 75% rail (same fail-open as RSI)
-  so daily limits, RSI, spread, Spot chatbox, and Telegram buttons stay intact.
+  Score < 40 → VETO. Unmeasured HTF skips that rail (same fail-open as RSI)
+  so daily limits, RSI, spread, Spot chat, and Telegram buttons stay intact.
   Neutral wire or a quiet US cash session (pre-market, overnight, weekend,
   after-hours) with 24h quote volume ≥ 250k USDT may clear at 70 instead.
+  Higher-timeframe conflict, a candle break against the news side, and a
+  choppy/downtrend halt are scored. While RELAX_TAPE_VETOES is set they do
+  not block a new entry.
 """
 
 from __future__ import annotations
@@ -39,12 +42,16 @@ VETO_REASON_RSI_OVERSOLD = "VETO: RSI Oversold despite bearish news"
 VETO_REASON_CANDLE = "VETO: Candle structure contradicts news thesis"
 VETO_REASON_CHOP = "VETO: Choppy/downtrending tape — daily capital halt"
 SCALE_OUT_PCT = 0.25  # first partial TP at +25% PnL (patience; 25–30% window)
-SETUP_THRESHOLD = 75.0
+SETUP_THRESHOLD = 40.0
 # Neutral wire / pre-market: strong 24h volume + clean TA may trade at 70.
 NEUTRAL_SETUP_THRESHOLD = 70.0
 STRONG_24H_VOLUME_USDT = 250_000.0
 MTF_FRAMES = ("15m", "1h", "4h")
-VETO_REASON_SETUP = "VETO: Setup confidence below 75 — wait for a cleaner TA tape"
+VETO_REASON_SETUP = "VETO: Setup confidence below 40 — wait for a cleaner TA tape"
+# Demo-cycle profile. These three tape notes stay on the report and do not
+# cancel an entry. RSI, spread, mark divergence, walls, fakeouts, news fights,
+# and the daily budget still do.
+RELAX_TAPE_VETOES = True
 VETO_REASON_WALL = "VETO: Opposing order-book wall"
 VETO_REASON_MTF = "VETO: Higher-timeframe trend disagrees"
 VETO_REASON_EXTENSION = "VETO: Price extended — waiting for pullback"
@@ -455,6 +462,31 @@ def analyze_candles(rows: Sequence[Any]) -> dict[str, Any]:
     }
 
 
+def tape_veto_blocks(reason: str) -> bool:
+    """True when this string should cancel an entry.
+
+    Higher-timeframe disagreement, candle-structure contradiction, and the
+    choppy-tape halt are advisory while RELAX_TAPE_VETOES is on.
+    """
+    text = (reason or "").strip()
+    if not text:
+        return False
+    if not RELAX_TAPE_VETOES:
+        return True
+    lowered = text.lower()
+    if text in {VETO_REASON_CANDLE, VETO_REASON_CHOP, VETO_REASON_MTF}:
+        return False
+    if "higher-timeframe trend disagrees" in lowered:
+        return False
+    if "candle structure contradicts" in lowered:
+        return False
+    if "choppy" in lowered and "tape" in lowered:
+        return False
+    if "setup confidence below 75" in lowered or "setup confidence below 70" in lowered:
+        return False
+    return True
+
+
 def severe_tape_halt(ta: dict[str, Any] | None) -> str:
     """Halt new entries for the UTC day when live OHLCV is hostile.
 
@@ -846,8 +878,8 @@ def neutral_lane_allows(
 ) -> bool:
     """70% TA is enough when 24h volume is strong and the session or wire is quiet.
 
-    Hard vetoes (MTF conflict, wall, fakeout, news fight) are decided before this
-    lane. Cash-session directional tapes keep the 75 rail.
+    Hard vetoes (wall, fakeout, news fight) are decided before this
+    lane. A directional cash-session tape keeps the setup floor in SETUP_THRESHOLD.
     """
     try:
         scored = float(score)
@@ -896,7 +928,7 @@ def setup_veto(
     reason = ""
     if n_veto:
         reason = n_veto
-    elif align == "CONFLICT":
+    elif align == "CONFLICT" and not RELAX_TAPE_VETOES:
         reason = VETO_REASON_MTF
     elif fakeout:
         reason = VETO_REASON_FAKEOUT
@@ -952,7 +984,7 @@ def score_setup(
     fakeout: bool,
     entry: dict[str, Any],
 ) -> dict[str, Any]:
-    """Weighted ensemble. Active desk sizes when this clears 75. TA dominates news."""
+    """Weighted ensemble. Active desk sizes when this clears SETUP_THRESHOLD. TA dominates news."""
     news_p = _news_part(side, news)
     htf_p = {"ALIGNED": 100.0, "MIXED": 70.0, "UNMEASURED": 20.0, "CONFLICT": 0.0}.get(align, 20.0)
     entry_p = _entry_part(side, entry)

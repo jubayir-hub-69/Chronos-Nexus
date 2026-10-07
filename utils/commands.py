@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sys
 import threading
@@ -33,6 +34,31 @@ from utils.spot_chat import (
 
 OFFSET_PATH = PROJECT_ROOT / "data" / "telegram_offset.json"
 TELEGRAM_UPDATES = "https://api.telegram.org/bot{token}/getUpdates"
+
+
+class _DropTelegramConflict(logging.Filter):
+    """Never let a second getUpdates poller paint Conflict onto the console."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage().lower()
+        except Exception:
+            return True
+        if "terminated by other getupdates" in message:
+            return False
+        if "conflict" in message and "getupdates" in message:
+            return False
+        return True
+
+
+def _install_telegram_conflict_filter() -> None:
+    drop = _DropTelegramConflict()
+    logging.getLogger().addFilter(drop)
+    for name in ("urllib3", "urllib3.connectionpool", "requests", "httpx", "httpcore"):
+        logging.getLogger(name).addFilter(drop)
+
+
+_install_telegram_conflict_filter()
 TELEGRAM_SET_COMMANDS = "https://api.telegram.org/bot{token}/setMyCommands"
 BOT_MENU = [
     {"command": "menu", "description": "Headless terminal dashboard"},
@@ -867,7 +893,9 @@ class TelegramCommandLoop:
                             flush=True,
                         )
             except Exception as exc:
-                print(f"[TELEGRAM] command loop retry — {_telegram_fault(exc)}", flush=True)
+                fault = _telegram_fault(exc)
+                if fault:
+                    print(f"[TELEGRAM] command loop retry — {fault}", flush=True)
                 time.sleep(2.0)
 
     def _poll(self, offset: int) -> tuple[list[dict[str, Any]], int]:
@@ -1402,8 +1430,21 @@ def register_bot_menu(token: str) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
 
 
+def _telegram_conflict(exc: BaseException) -> bool:
+    """True for Telegram 409 when another process already holds getUpdates."""
+    lowered = str(exc or "").lower()
+    if "terminated by other getupdates" in lowered:
+        return True
+    return "conflict" in lowered and "getupdates" in lowered
+
+
 def _telegram_fault(exc: BaseException) -> str:
-    """Short fault line. Never includes the bot token or the request URL."""
+    """Short fault line. Never includes the bot token or the request URL.
+
+    A getUpdates conflict is swallowed. The loop retries quietly.
+    """
+    if _telegram_conflict(exc):
+        return ""
     text = str(exc or "")
     lowered = text.lower()
     if "timed out" in lowered or "timeout" in lowered or "connecttimeout" in lowered:

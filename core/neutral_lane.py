@@ -1,9 +1,10 @@
 """Paper entry when ORACLE is idle on a neutral wire or a quiet cash session.
 
-The 75% rail stays in force for a directional cash-session tape. This scan
+The cash-session floor is SETUP_THRESHOLD in core/ta.py. This scan
 only runs after a non-degraded stand-down, and only promotes a listed name
 whose live 24h volume clears the floor and whose TA score clears 70 with no
-hard veto (conflict, wall, fakeout, news fight).
+hard veto (wall, fakeout, news fight). Higher-timeframe conflict does not
+block the scan while RELAX_TAPE_VETOES is set.
 """
 
 from __future__ import annotations
